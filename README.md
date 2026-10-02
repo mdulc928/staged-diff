@@ -19,17 +19,18 @@ Proposed work stays out of the workspace until you choose to apply it. The AI ag
 
 ## Quick Installation & Symlinks
 
-Link the command and completions:
+Link the command:
 
 ```bash
 ln -sfn "$(pwd)/scripts/staged" ~/.local/bin/staged
 ln -sfn "$(pwd)/scripts/staged" ~/.local/bin/stage
 ```
 
-Install shell tab-completion:
+Install shell tab-completion (writes completion scripts to `~/.zfunc` / `~/.config/staged/completions` and adds a marked block to your shell rc):
 
 ```bash
 staged --install-completion
+# then restart the shell or: exec zsh
 ```
 
 Configure `/stage` skill and sandbox write permissions for your editor:

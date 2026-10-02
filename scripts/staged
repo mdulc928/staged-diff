@@ -14,9 +14,11 @@ import subprocess
 import re
 import time
 import filecmp
+import textwrap
 from pathlib import Path
 
 HOME = os.path.expanduser("~")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 DEFAULT_STAGING_ROOT = os.path.join(HOME, ".local", "share", "stage")
 LEGACY_CURSOR_ROOT = os.path.join(HOME, ".local", "share", "cursor-artifact-staging")
 LEGACY_ANTIGRAVITY_ROOT = os.path.join(HOME, ".gemini", "antigravity-ide", "brain")
@@ -164,6 +166,65 @@ def is_branch_protected(branch_name, protected_list=None):
 
 # --- Tool Adapters Engine ---
 
+JETBRAINS_CLI_NAMES = ("charm", "pycharm", "idea")
+
+def detect_jetbrains_binary():
+    """Resolve JetBrains IDE CLI (charm / pycharm / idea) when Toolbox scripts are not on PATH."""
+    for name in JETBRAINS_CLI_NAMES:
+        found = shutil.which(name)
+        if found:
+            return found
+    toolbox_dirs = [
+        os.path.join(HOME, "Library", "Application Support", "JetBrains", "Toolbox", "scripts"),
+        os.path.join(HOME, ".local", "share", "JetBrains", "Toolbox", "scripts"),
+    ]
+    for toolbox in toolbox_dirs:
+        if not os.path.isdir(toolbox):
+            continue
+        for name in JETBRAINS_CLI_NAMES:
+            script = os.path.join(toolbox, name)
+            if os.path.isfile(script):
+                return script
+    if sys.platform == "darwin":
+        for pattern in (
+            "/Applications/PyCharm*.app/Contents/MacOS/pycharm",
+            "/Applications/IntelliJ IDEA*.app/Contents/MacOS/idea",
+            "/Applications/WebStorm*.app/Contents/MacOS/webstorm",
+        ):
+            matches = sorted(glob.glob(pattern))
+            if matches:
+                return matches[0]
+    return None
+
+def jetbrains_cli_missing_message():
+    return (
+        "JetBrains command-line launcher not found (tried: charm, pycharm, idea).\n"
+        "In JetBrains Toolbox: Settings → Tools → Generate shell scripts, then ensure "
+        "the scripts directory is on your PATH.\n"
+        "macOS default: ~/Library/Application Support/JetBrains/Toolbox/scripts"
+    )
+
+def run_editor_command(cmd, tool_adapter):
+    exe = cmd[0] if cmd else ""
+    if not exe:
+        print("Error: Empty editor command.", file=sys.stderr)
+        sys.exit(1)
+    missing = not os.path.isfile(exe) and shutil.which(exe) is None
+    if missing:
+        if tool_adapter.tool_id == "pycharm":
+            print(colorize("Error: " + jetbrains_cli_missing_message(), "31"), file=sys.stderr)
+        else:
+            print(f"Error: Editor executable not found: {exe}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        subprocess.run(cmd, check=False)
+    except FileNotFoundError:
+        if tool_adapter.tool_id == "pycharm":
+            print(colorize("Error: " + jetbrains_cli_missing_message(), "31"), file=sys.stderr)
+        else:
+            print(f"Error: Failed to run: {exe}", file=sys.stderr)
+        sys.exit(1)
+
 class ToolAdapter:
     def __init__(self, tool_id, name, default_root, diff_cmd, open_cmd):
         self.tool_id = tool_id
@@ -174,6 +235,10 @@ class ToolAdapter:
 
     def detect_binary(self):
         cmd = self.diff_cmd[0]
+        if self.tool_id == "pycharm":
+            jetbrains = detect_jetbrains_binary()
+            if jetbrains:
+                return jetbrains
         found = shutil.which(cmd)
         if found:
             return found
@@ -273,6 +338,19 @@ TOOL_REGISTRY = {
     ),
 }
 
+TOOL_ALIASES = {
+    "charm": "pycharm",
+    "jetbrains": "pycharm",
+    "idea": "pycharm",
+    "code": "vscode",
+}
+
+def normalize_tool_id(tool_id):
+    if not tool_id:
+        return tool_id
+    key = tool_id.lower()
+    return TOOL_ALIASES.get(key, key)
+
 # --- State Management (Shell Instance + Persistent) ---
 
 def load_json(path):
@@ -299,17 +377,25 @@ def get_global_state():
     return load_json(GLOBAL_STATE_FILE)
 
 def resolve_active_tool(override_tool=None):
-    if override_tool and override_tool.lower() in TOOL_REGISTRY:
-        return TOOL_REGISTRY[override_tool.lower()]
+    if override_tool:
+        override_tool = normalize_tool_id(override_tool)
+        if override_tool in TOOL_REGISTRY:
+            return TOOL_REGISTRY[override_tool]
     env_tool = os.environ.get("STAGED_TOOL") or os.environ.get("STAGE_TOOL")
-    if env_tool and env_tool.lower() in TOOL_REGISTRY:
-        return TOOL_REGISTRY[env_tool.lower()]
+    if env_tool:
+        env_tool = normalize_tool_id(env_tool)
+        if env_tool in TOOL_REGISTRY:
+            return TOOL_REGISTRY[env_tool]
     sh_state, _ = get_shell_state()
-    if sh_state.get("tool") and sh_state["tool"].lower() in TOOL_REGISTRY:
-        return TOOL_REGISTRY[sh_state["tool"].lower()]
+    if sh_state.get("tool"):
+        shell_tool = normalize_tool_id(sh_state["tool"])
+        if shell_tool in TOOL_REGISTRY:
+            return TOOL_REGISTRY[shell_tool]
     g_state = get_global_state()
-    if g_state.get("default_tool") and g_state["default_tool"].lower() in TOOL_REGISTRY:
-        return TOOL_REGISTRY[g_state["default_tool"].lower()]
+    if g_state.get("default_tool"):
+        default_tool = normalize_tool_id(g_state["default_tool"])
+        if default_tool in TOOL_REGISTRY:
+            return TOOL_REGISTRY[default_tool]
     # Auto-detection
     if os.environ.get("CURSOR_AGENT") or os.environ.get("CURSOR_APP") or shutil.which("cursor"):
         return TOOL_REGISTRY["cursor"]
@@ -554,6 +640,7 @@ def print_usage(subcmd=None):
     if subcmd == "diff":
         print(f"{colorize('staged diff', '1;36')} — inspect side-by-side diffs or apply staged changes.\n")
         print("Usage:")
+        print("  staged diff                          List staged files (same as `staged`)")
         print("  staged diff <filename>               Open side-by-side diff in configured IDE")
         print("  staged diff <filename> -a, --apply   Immediately apply this file's staged changes!")
         print("  staged diff all                      Open diff tabs for all modified files")
@@ -588,6 +675,7 @@ def print_usage(subcmd=None):
     print(colorize("Usage:", "1"))
     for line in (
         "  staged                              List staged files for this repository",
+        "  staged diff                         List staged files (same as bare `staged`)",
         "  staged diff <file>                  Open side-by-side diff in IDE (fuzzy match)",
         "  staged diff <file> -a, --apply      Apply staged changes for this specific file",
         "  staged diff all                     Open diff tabs for every modified file",
@@ -600,6 +688,7 @@ def print_usage(subcmd=None):
         "  staged -v, --verbose                Show full absolute paths, mtimes, and sizes",
         "  staged -s, --session <id>           Target a specific session ID or UUID prefix",
         "  staged -R, --all-repos              List staging sessions across all repositories",
+        "  staged --install-completion         Install Zsh/Bash tab completion (persists in shell rc)",
         "  staged install-skill [--tool <IDE>] Install /stage skill and configure IDE sandbox",
         "  staged --help                       Show this help message",
     ):
@@ -631,13 +720,19 @@ def main():
         print_usage(sub)
         return
 
-    # Completion flag
+    # Completion helpers (no staging session required)
+    if len(sys.argv) >= 2 and sys.argv[1] == "--complete-tools":
+        for key in sorted(set(TOOL_REGISTRY.keys()) | set(TOOL_ALIASES.keys())):
+            print(key)
+        return
+
     if len(sys.argv) >= 2 and sys.argv[1] == "--install-completion":
         install_completion()
         return
 
     # Parse global flags: -t/--tool, -s/--session, -v/--verbose, -R/--all-repos
     args = sys.argv[1:]
+    subcmd = next((a for a in args if a in SUBCOMMANDS and a != "help"), None)
     override_tool = None
     override_session = None
     verbose = False
@@ -648,6 +743,14 @@ def main():
     while i < len(args):
         a = args[i]
         if a in ("-t", "--tool"):
+            if subcmd in ("use", "set"):
+                cleaned_args.append(a)
+                if i + 1 < len(args):
+                    cleaned_args.append(args[i + 1])
+                    i += 2
+                else:
+                    i += 1
+                continue
             if i + 1 < len(args):
                 override_tool = args[i + 1]
                 i += 2
@@ -853,6 +956,11 @@ def main():
 
         apply_flag = "-a" in diff_args or "--apply" in diff_args
         file_tokens = [a for a in diff_args if a not in ("-a", "--apply", "--force")]
+
+        if not file_tokens and not apply_flag:
+            render_staged_overview(active_tool, cwd, ws_dir, staging_dir, conv_id, active_session, sessions, staged_files, renames_map, manifest_path, verbose)
+            return
+
         target = file_tokens[0] if file_tokens else "all"
 
         if apply_flag:
@@ -937,11 +1045,11 @@ def execute_diff(active_tool, cwd, ws_dir, staging_dir, staged_files, renames_ma
                     skipped += 1
                     continue
                 cmd = active_tool.build_diff_args(ws_file, staged_abs)
-                subprocess.run(cmd)
+                run_editor_command(cmd, active_tool)
                 count += 1
             else:
                 cmd = active_tool.build_open_args(staged_abs)
-                subprocess.run(cmd)
+                run_editor_command(cmd, active_tool)
                 count += 1
         if skipped > 0:
             print(f"Skipped {skipped} already applied file(s).")
@@ -961,11 +1069,11 @@ def execute_diff(active_tool, cwd, ws_dir, staging_dir, staged_files, renames_ma
             note = " (already applied)" if status == "APPLIED" else ""
             print(f"Opening side-by-side diff [{status}]: {rel}{note}")
             cmd = active_tool.build_diff_args(ws_file, staged_abs)
-            subprocess.run(cmd)
+            run_editor_command(cmd, active_tool)
         else:
             print(f"Opening new staged file: {rel}")
             cmd = active_tool.build_open_args(staged_abs)
-            subprocess.run(cmd)
+            run_editor_command(cmd, active_tool)
 
 def execute_apply(cwd, ws_dir, staging_dir, staged_files, renames_map, target, force=False):
     branch = get_git_branch(ws_dir)
@@ -1046,7 +1154,7 @@ def handle_cross_session_diff(active_tool, args):
 
     print(f"Opening cross-session diff:\n  {s1_id}: {f1}\n  {s2_id}: {f2}")
     cmd = active_tool.build_diff_args(f1, f2)
-    subprocess.run(cmd)
+    run_editor_command(cmd, active_tool)
 
 def handle_use_command(args):
     sh_state, path = get_shell_state()
@@ -1059,9 +1167,13 @@ def handle_use_command(args):
         print("Cleared shell session binding.")
         return
     if args[0] in ("-t", "--tool") and len(args) >= 2:
-        sh_state["tool"] = args[1]
+        tool_id = normalize_tool_id(args[1])
+        if tool_id not in TOOL_REGISTRY:
+            print(f"Error: Unknown tool '{args[1]}'. Known: {', '.join(sorted(TOOL_REGISTRY))}", file=sys.stderr)
+            sys.exit(1)
+        sh_state["tool"] = tool_id
         save_json(path, sh_state)
-        print(f"Active tool for this shell set to: {args[1]}")
+        print(f"Active tool for this shell set to: {TOOL_REGISTRY[tool_id].name} ({tool_id})")
         return
     sh_state["session"] = args[0]
     save_json(path, sh_state)
@@ -1072,7 +1184,11 @@ def handle_set_command(args):
     if "--tool" in args:
         idx = args.index("--tool")
         if idx + 1 < len(args):
-            g_state["default_tool"] = args[idx + 1]
+            tool_id = normalize_tool_id(args[idx + 1])
+            if tool_id not in TOOL_REGISTRY:
+                print(f"Error: Unknown tool '{args[idx + 1]}'. Known: {', '.join(sorted(TOOL_REGISTRY))}", file=sys.stderr)
+                sys.exit(1)
+            g_state["default_tool"] = tool_id
     if "--default-session" in args:
         idx = args.index("--default-session")
         if idx + 1 < len(args):
@@ -1081,35 +1197,47 @@ def handle_set_command(args):
     print(f"Updated configuration in {GLOBAL_STATE_FILE}")
 
 def run_install_skill(tool_name, is_default=False):
-    tool = TOOL_REGISTRY.get(tool_name.lower())
+    tool = TOOL_REGISTRY.get(normalize_tool_id(tool_name))
     if not tool:
         print(f"Error: Unknown tool '{tool_name}'")
         sys.exit(1)
 
     print(f"Installing /stage skill for {tool.name}...")
-    skill_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "SKILL.md")
+    if tool_name == "cursor":
+        skill_src = os.path.join(REPO_ROOT, "skills", "cursor", "SKILL.md")
+    else:
+        skill_src = os.path.join(REPO_ROOT, "SKILL.md")
+    if not os.path.isfile(skill_src):
+        print(f"Error: Skill source not found: {skill_src}")
+        sys.exit(1)
     if tool_name == "cursor":
         target = os.path.join(HOME, ".cursor", "skills", "stage", "SKILL.md")
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        if os.path.isfile(skill_src):
-            shutil.copy2(skill_src, target)
-            print(f"Installed skill: {target}")
+        shutil.copy2(skill_src, target)
+        print(f"Installed skill: {target}")
         # Sandbox config
         sandbox_path = os.path.join(HOME, ".cursor", "sandbox.json")
         data = load_json(sandbox_path)
         data.setdefault("type", "workspace_readwrite")
         rw = data.setdefault("additionalReadwritePaths", [])
-        stage_root = os.path.realpath(tool.default_root)
-        if stage_root not in rw:
-            rw.append(stage_root)
+        stage_roots = [
+            os.path.realpath(tool.default_root),
+            os.path.realpath(DEFAULT_STAGING_ROOT),
+        ]
+        added = []
+        for stage_root in stage_roots:
+            if stage_root not in rw:
+                rw.append(stage_root)
+                added.append(stage_root)
+        if added:
             save_json(sandbox_path, data)
-            print(f"Added {stage_root} to ~/.cursor/sandbox.json")
+            for stage_root in added:
+                print(f"Added {stage_root} to ~/.cursor/sandbox.json")
     elif tool_name == "antigravity":
         target = os.path.join(HOME, ".gemini", "config", "skills", "stage", "SKILL.md")
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        if os.path.isfile(skill_src):
-            shutil.copy2(skill_src, target)
-            print(f"Installed skill: {target}")
+        shutil.copy2(skill_src, target)
+        print(f"Installed skill: {target}")
 
     if is_default:
         g = get_global_state()
@@ -1136,14 +1264,336 @@ def list_all_repositories():
     if found == 0:
         print("No staging sessions found.")
 
+COMPLETION_MARKER_START = "# >>> staged completions >>>"
+COMPLETION_MARKER_END = "# <<< staged completions <<<"
+
+def embedded_zsh_completion():
+    return textwrap.dedent("""\
+        #compdef staged stage staged-diff
+        # Generated by staged --install-completion — do not edit; re-run install to refresh.
+
+        _staged() {
+          local curcontext="$curcontext" state line
+          typeset -A opt_args
+
+          local -a tools subcmds
+          tools=("${(@f)$(command staged --complete-tools 2>/dev/null)}")
+          (( ${#tools} )) || tools=(cursor antigravity windsurf vscode pycharm charm zed claudecode codex cli)
+
+          subcmds=(
+            'diff:Side-by-side diff or apply staged changes'
+            'apply:Copy staged files into the workspace'
+            'clean:Remove staged files or purge the session'
+            'path:Print absolute staged or workspace paths'
+            'use:Bind a session or IDE tool to this shell'
+            'set:Update global staged configuration'
+            'install-skill:Install the /stage agent skill'
+            '--sessions:List staging sessions for this repository'
+            '--install-completion:Install tab completion into your shell'
+          )
+
+          _arguments -C -S -s \\
+            '(-h --help)'{-h,--help}'[Show help]' \\
+            '(-v --verbose)'{-v,--verbose}'[Verbose file listing]' \\
+            '(-R --all-repos)'{-R,--all-repos}'[List sessions across all repositories]' \\
+            '(-t --tool)'{-t,--tool}'[IDE / diff launcher]:tool:($tools)' \\
+            '(-s --session --conv)'{-s,--session,--conv}'[Staging session ID]:session:_staged_sessions' \\
+            '1: :->command' \\
+            '*:: :->rest' && return 0
+
+          case $state in
+            command)
+              if (( CURRENT == 2 )); then
+                _alternative \\
+                  'commands:command:_describe -t commands subcmds' \\
+                  'files:staged file:_staged_files'
+              else
+                _describe -t commands subcmds
+              fi
+              ;;
+            rest)
+              _staged_after_command
+              ;;
+          esac
+        }
+
+        _staged_after_command() {
+          local cmd="${words[1]}"
+          case $cmd in
+            diff) _staged_diff ;;
+            apply) _staged_apply ;;
+            clean) _staged_clean ;;
+            path) _staged_path ;;
+            use) _staged_use ;;
+            set) _staged_set ;;
+            install-skill) _staged_install_skill ;;
+            *) _staged_files ;;
+          esac
+        }
+
+        _staged_diff() {
+          _arguments -C -S \\
+            '(-a --apply)'{-a,--apply}'[Apply staged changes]' \\
+            '--force[Apply on protected branches]' \\
+            '--between[Diff file across two sessions]' \\
+            '*: :_staged_diff_target'
+        }
+
+        _staged_diff_target() {
+          if (( ${#words[@]} >= 3 && words[CURRENT-1] == --between )); then
+            _staged_sessions
+            return
+          fi
+          if (( CURRENT == 3 && ${#words[@]} == 3 )); then
+            _alternative 'all:target:(all)' 'files:staged file:_staged_files' 'sessions:session ID:_staged_sessions'
+            return
+          fi
+          if (( ${#words[@]} >= 4 && words[2] == --between )); then
+            if (( CURRENT <= 5 )); then
+              _staged_sessions
+            else
+              _staged_files
+            fi
+            return
+          fi
+          _staged_files
+        }
+
+        _staged_apply() {
+          _arguments -C -S '--force[Apply on protected branches]' '*: :_staged_apply_target'
+        }
+
+        _staged_apply_target() {
+          if (( CURRENT == 3 )); then
+            _alternative 'all:target:(all)' 'files:staged file:_staged_files'
+          else
+            _staged_files
+          fi
+        }
+
+        _staged_clean() {
+          _arguments -C -S \\
+            '(-f --file)'{-f,--file}'[Remove one staged file]:file:_staged_files' \\
+            '(-y --yes)'{-y,--yes}'[Skip confirmation when purging session]'
+        }
+
+        _staged_path() {
+          _arguments -C -S \\
+            '(-w --workspace)'{-w,--workspace}'[Print workspace original path]' \\
+            '*:file:_staged_files'
+        }
+
+        _staged_use() {
+          _arguments -C -S \\
+            '(-t --tool)'{-t,--tool}'[Set IDE for this shell]:tool:($(command staged --complete-tools 2>/dev/null))' \\
+            '(-c --clear)'{-c,--clear}'[Clear shell session binding]' \\
+            '*:session ID:_staged_sessions'
+        }
+
+        _staged_set() {
+          local -a tools
+          tools=("${(@f)$(command staged --complete-tools 2>/dev/null)}")
+          _arguments -C -S \\
+            '--tool[Default IDE tool]:tool:($tools)' \\
+            '--default-session[Default session ID]:session:_staged_sessions'
+        }
+
+        _staged_install_skill() {
+          local -a tools
+          tools=("${(@f)$(command staged --complete-tools 2>/dev/null)}")
+          _arguments -C -S \\
+            '--default[Mark installed skill as default]' \\
+            '(-t --tool)'{-t,--tool}'[Target IDE]:tool:($tools)'
+        }
+
+        _staged_files() {
+          local -a items desc line key val
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            key="${line%%:*}"
+            val="${line#*:}"
+            items+=("$key")
+            desc+=("$val")
+          done < <(command staged --complete 2>/dev/null)
+          (( ${#items} )) && _describe -t files 'staged file' items desc
+        }
+
+        _staged_sessions() {
+          local -a ids desc line id rest
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            id="${line%%:*}"
+            rest="${line#*:}"
+            ids+=("$id")
+            desc+=("$rest")
+          done < <(command staged --complete-sessions 2>/dev/null)
+          (( ${#ids} )) && _describe -t sessions 'staging session' ids desc
+        }
+        """)
+
+def embedded_bash_completion():
+    return textwrap.dedent("""\
+        # Generated by staged --install-completion — do not edit; re-run install to refresh.
+
+        _staged_complete_files() {
+          local IFS=$'\\n'
+          COMPREPLY=( $(compgen -W "$(command staged --complete 2>/dev/null | cut -d: -f1)" -- "$cur") )
+        }
+
+        _staged_complete_sessions() {
+          local IFS=$'\\n'
+          COMPREPLY=( $(compgen -W "$(command staged --complete-sessions 2>/dev/null | cut -d: -f1)" -- "$cur") )
+        }
+
+        _staged_complete_tools() {
+          local IFS=$'\\n'
+          COMPREPLY=( $(compgen -W "$(command staged --complete-tools 2>/dev/null)" -- "$cur") )
+        }
+
+        _staged() {
+          local cur="${COMP_WORDS[COMP_CWORD]}"
+          local prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+          if (( COMP_CWORD == 1 )); then
+            COMPREPLY=( $(compgen -W "diff apply clean path use set install-skill --sessions --install-completion" -- "$cur") )
+            return
+          fi
+
+          case "${COMP_WORDS[1]}" in
+            -t|--tool)
+              (( COMP_CWORD == 2 )) && _staged_complete_tools
+              return ;;
+            -s|--session|--conv)
+              (( COMP_CWORD == 2 )) && _staged_complete_sessions
+              return ;;
+          esac
+
+          case "${COMP_WORDS[1]}" in
+            diff)
+              case "$prev" in
+                --between) _staged_complete_sessions ;;
+                diff)
+                  COMPREPLY=( $(compgen -W "all --between -a --apply --force" -- "$cur") )
+                  _staged_complete_files ;;
+                *)
+                  if [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "-a --apply --force --between" -- "$cur") )
+                  else
+                    COMPREPLY=( $(compgen -W "all" -- "$cur") )
+                    _staged_complete_files
+                  fi ;;
+              esac ;;
+            apply)
+              if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--force" -- "$cur") )
+              else
+                COMPREPLY=( $(compgen -W "all" -- "$cur") )
+                _staged_complete_files
+              fi ;;
+            clean)
+              COMPREPLY=( $(compgen -W "-f --file -y --yes" -- "$cur") )
+              [[ "$prev" == "-f" || "$prev" == "--file" ]] && _staged_complete_files ;;
+            path)
+              COMPREPLY=( $(compgen -W "-w --workspace" -- "$cur") )
+              [[ "$cur" != -* ]] && _staged_complete_files ;;
+            use)
+              COMPREPLY=( $(compgen -W "-t --tool -c --clear" -- "$cur") )
+              if [[ "$prev" == "-t" || "$prev" == "--tool" ]]; then
+                _staged_complete_tools
+              elif [[ "$cur" != -* ]]; then
+                _staged_complete_sessions
+              fi ;;
+            set)
+              COMPREPLY=( $(compgen -W "--tool --default-session" -- "$cur") )
+              [[ "$prev" == "--tool" ]] && _staged_complete_tools
+              [[ "$prev" == "--default-session" ]] && _staged_complete_sessions ;;
+            install-skill)
+              COMPREPLY=( $(compgen -W "--default -t --tool" -- "$cur") )
+              [[ "$prev" == "-t" || "$prev" == "--tool" ]] && _staged_complete_tools ;;
+            *)
+              _staged_complete_files ;;
+          esac
+        }
+
+        complete -F _staged staged stage staged-diff
+        """)
+
+def write_text_file(path, content):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+        if not content.endswith("\n"):
+            f.write("\n")
+
+def upsert_shell_block(path, block, insert_before_compinit=False):
+    block = block.strip() + "\n"
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        pattern = re.compile(
+            re.escape(COMPLETION_MARKER_START) + r".*?" + re.escape(COMPLETION_MARKER_END),
+            re.DOTALL,
+        )
+        if pattern.search(content):
+            content = pattern.sub(block.strip(), content)
+        elif insert_before_compinit:
+            lines = content.splitlines(keepends=True)
+            insert_at = None
+            for idx, line in enumerate(lines):
+                if re.search(r"\bcompinit\b", line) and not line.lstrip().startswith("#"):
+                    insert_at = idx
+                    break
+            if insert_at is not None:
+                lines.insert(insert_at, block)
+                content = "".join(lines)
+            else:
+                content = block + ("\n" if content and not content.startswith("\n") else "") + content
+        else:
+            if content and not content.endswith("\n"):
+                content += "\n"
+            content += "\n" + block
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(block)
+
 def install_completion():
     zfunc = os.path.join(HOME, ".zfunc")
-    os.makedirs(zfunc, exist_ok=True)
-    comp_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "completions", "_staged")
-    if os.path.isfile(comp_src):
-        shutil.copy2(comp_src, os.path.join(zfunc, "_staged"))
-        shutil.copy2(comp_src, os.path.join(zfunc, "_stage"))
-        print(f"Copied zsh completions to {zfunc}/_staged and _stage")
+    bash_dir = os.path.join(CONFIG_DIR, "completions")
+    zsh_body = embedded_zsh_completion()
+    bash_body = embedded_bash_completion()
+
+    zsh_dest = os.path.join(zfunc, "_staged")
+    stage_dest = os.path.join(zfunc, "_stage")
+    bash_dest = os.path.join(bash_dir, "staged.bash")
+    write_text_file(zsh_dest, zsh_body)
+    write_text_file(stage_dest, zsh_body)
+    write_text_file(bash_dest, bash_body)
+
+    zsh_block = f"""{COMPLETION_MARKER_START}
+# Tab completion for staged / stage (managed by staged --install-completion)
+[[ -d "{zfunc}" ]] && fpath=("{zfunc}" $fpath)
+{COMPLETION_MARKER_END}
+"""
+
+    bash_block = f"""{COMPLETION_MARKER_START}
+# Tab completion for staged / stage (managed by staged --install-completion)
+[[ -f "{bash_dest}" ]] && source "{bash_dest}"
+{COMPLETION_MARKER_END}"""
+
+    zshrc = os.path.join(HOME, ".zshrc")
+    upsert_shell_block(zshrc, zsh_block, insert_before_compinit=True)
+
+    for bash_rc in (os.path.join(HOME, ".bashrc"), os.path.join(HOME, ".bash_profile")):
+        upsert_shell_block(bash_rc, bash_block)
+
+    print("Installed shell tab completion:")
+    print(f"  Zsh:  {zsh_dest} (+ symlink name _stage)")
+    print(f"        fpath hook appended to {zshrc}")
+    print(f"  Bash: {bash_dest}")
+    print("        source hook appended to ~/.bashrc and ~/.bash_profile (if present)")
+    print("\nStart a new shell (or run: exec zsh / exec bash), then try: staged <TAB>")
 
 if __name__ == "__main__":
     main()
