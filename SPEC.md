@@ -8,9 +8,37 @@
 
 ---
 
-## 1. Executive Summary & Motivation
+## 1. 60-Second Developer Onboarding Guide
 
-### 1.1 Background & Design Nomenclature
+```bash
+# 1. Clone repository
+git clone https://github.com/melchi-shared-useful.git
+cd melchi-shared-useful/packages/staged
+
+# 2. Link CLI to user PATH
+ln -sfn "$(pwd)/scripts/staged" ~/.local/bin/staged
+ln -sfn "$(pwd)/scripts/staged" ~/.local/bin/stage
+
+# 3. Install completion
+staged --install-completion
+
+# 4. Install /stage skill for your IDE (e.g. Cursor)
+staged install-skill --tool cursor --default
+
+# 5. Tell your AI Assistant:
+# "Use /stage to stage changes in an isolated sandbox first."
+
+# 6. Review & Apply:
+# staged                          # List staged files
+# staged diff Player.svelte       # Inspect diff in IDE
+# staged diff Player.svelte -a    # Apply staged changes!
+```
+
+---
+
+## 2. Executive Summary & Motivation
+
+### 2.1 Background & Design Nomenclature
 
 The **Staging Workflow** isolates AI agent code changes, refactors, and file generation outside of the active Git working tree. Instead of polluting working repositories or requiring heavy Git worktree lifecycle management, proposed edits are staged as real files on disk within an isolated session directory.
 
@@ -19,7 +47,7 @@ To ensure crystal-clear mental models, version 2.0 formalizes the semantic disti
 - **`staged` (CLI Script)**: Represents the inspection and management tool for everything that is currently _staged_ on disk (e.g. `staged`, `staged diff <file>`, `staged clean`). A symlink `stage` is also provided for convenience.
 - **`/stage` (Agent Skill)**: Represents the imperative action / slash command instructing the AI assistant to perform the staging operation (e.g. _"Use `/stage` to prepare these refactors"_).
 
-### 1.2 Pain Points Addressed
+### 2.2 Pain Points Addressed
 
 1. **Split Tooling**: Earlier versions maintained separate scripts (`staged-diff` and `staged-diff-cursor`), causing maintenance overhead and fragmented configurations.
 2. **Applying Changes Ergonomics**: Developers inspecting a diff often want to apply that specific file's changes immediately without switching mental contexts or typing separate verbose subcommands:
@@ -32,7 +60,7 @@ To ensure crystal-clear mental models, version 2.0 formalizes the semantic disti
 6. **Command CLI Ergonomics**: Running `staged [command] --help` (e.g., `staged clean --help`) executed the command or triggered validation failures rather than rendering subcommand help. Additionally, `clean` lacked the ability to selectively purge a single staged file (`-f`).
 7. **Tool Expansion Friction**: Developers using VS Code, Windsurf, PyCharm/IntelliJ, Zed, Codex, or Claude Code lacked an out-of-the-box adapter interface.
 
-### 1.3 Mission & Design Principles
+### 2.3 Mission & Design Principles
 
 - **Canonical Script & Command**: **`staged`** (with optional alias `stage` and backward-compatible `staged-diff`).
 - **Canonical Agent Skill**: **`/stage`**.
@@ -62,33 +90,33 @@ To ensure crystal-clear mental models, version 2.0 formalizes the semantic disti
 
 ---
 
-## 2. System Architecture & Multi-Tool Adapter Engine
+## 3. System Architecture & Multi-Tool Adapter Engine
 
 ```mermaid
 flowchart TD
-    User([Developer / AI Agent]) -->|staged [args]| CLI[Unified Python 3 CLI Dispatcher]
+    User(["Developer / AI Agent"]) -->|"staged [args]"| CLI["Unified Python 3 CLI Dispatcher"]
 
-    subgraph State & Context Engine
-        CLI --> StateManager[State Manager<br/>~/.staged-diff & Shell Session Env]
-        CLI --> Detector[Environment & Platform Detector<br/>OS: macOS/Linux/Win32/WSL | Shell: zsh/bash/cmd]
-        CLI --> GitGuard[Git Branch Guard<br/>Protected Branch & Drift Detector]
+    subgraph stateEngine ["State & Context Engine"]
+        CLI --> StateManager["State Manager<br/>~/.staged-diff & Shell Session Env"]
+        CLI --> Detector["Environment & Platform Detector<br/>OS: macOS/Linux/Win32/WSL | Shell: zsh/bash/cmd"]
+        CLI --> GitGuard["Git Branch Guard<br/>Protected Branch & Drift Detector"]
     end
 
-    subgraph Tool Adapter Registry
-        StateManager --> ActiveTool{Active Tool Adapter}
-        ActiveTool -->|cursor| AdaptCursor[Cursor<br/>cursor -r --diff]
-        ActiveTool -->|antigravity| AdaptAGY[Antigravity IDE<br/>antigravity-ide -r -d]
-        ActiveTool -->|windsurf| AdaptWindsurf[Windsurf<br/>windsurf -r --diff]
-        ActiveTool -->|vscode| AdaptVSCode[VS Code<br/>code -r -d]
-        ActiveTool -->|pycharm| AdaptJB[JetBrains / PyCharm<br/>charm / idea diff]
-        ActiveTool -->|zed| AdaptZed[Zed<br/>zed --diff]
-        ActiveTool -->|claudecode| AdaptClaude[Claude Code<br/>Tool & Diff Hook]
-        ActiveTool -->|codex| AdaptCodex[Codex<br/>CLI Hook]
-        ActiveTool -->|cli| AdaptCLI[Terminal Fallback<br/>difft / git diff --no-index]
-        ActiveTool -->|custom| AdaptCustom[Custom Registered Tool<br/>staged set-tool ...]
+    subgraph toolRegistry ["Tool Adapter Registry"]
+        StateManager --> ActiveTool{"Active Tool Adapter"}
+        ActiveTool -->|cursor| AdaptCursor["Cursor<br/>cursor -r --diff"]
+        ActiveTool -->|antigravity| AdaptAGY["Antigravity IDE<br/>antigravity-ide -r -d"]
+        ActiveTool -->|windsurf| AdaptWindsurf["Windsurf<br/>windsurf -r --diff"]
+        ActiveTool -->|vscode| AdaptVSCode["VS Code<br/>code -r -d"]
+        ActiveTool -->|pycharm| AdaptJB["JetBrains / PyCharm<br/>charm / idea diff"]
+        ActiveTool -->|zed| AdaptZed["Zed<br/>zed --diff"]
+        ActiveTool -->|claudecode| AdaptClaude["Claude Code<br/>Tool & Diff Hook"]
+        ActiveTool -->|codex| AdaptCodex["Codex<br/>CLI Hook"]
+        ActiveTool -->|cli| AdaptCLI["Terminal Fallback<br/>difft / git diff --no-index"]
+        ActiveTool -->|custom| AdaptCustom["Custom Registered Tool<br/>staged set-tool ..."]
     end
 
-    subgraph Operations Engine
+    subgraph opsEngine ["Operations Engine"]
         CLI --> OpDiff["Diff Launcher<br/>staged diff &lt;file&gt;"]
         CLI --> OpApply["Apply Engine (-a / --apply)<br/>staged diff &lt;file&gt; -a"]
         CLI --> OpCrossDiff["Cross-Session Diff<br/>staged diff --between &lt;s1&gt; &lt;s2&gt;"]
@@ -99,7 +127,7 @@ flowchart TD
     end
 ```
 
-### 2.1 The Adapter Contract
+### 3.1 The Adapter Contract
 
 Every supported tool implements a clean Python class interface:
 
@@ -130,7 +158,7 @@ class ToolAdapter:
         pass
 ```
 
-### 2.2 Built-In Tool Configurations
+### 3.2 Built-In Tool Configurations
 
 | Tool ID           | Display Name       | Default Staging Root                                       | Diff Command Template                            | Binary Search Hierarchy                                                                                      |
 | :---------------- | :----------------- | :--------------------------------------------------------- | :----------------------------------------------- | :----------------------------------------------------------------------------------------------------------- |
@@ -144,7 +172,7 @@ class ToolAdapter:
 | **`codex`**       | OpenAI Codex CLI   | `~/.local/share/stage/<conv_id>/staging`                   | `difft {orig} {staged}` or system editor         | `codex` on `PATH`                                                                                            |
 | **`cli`**         | Terminal Fallback  | `~/.local/share/stage/<conv_id>/staging`                   | `difft {orig} {staged}` or `git diff --no-index` | `difft` (difftastic) &rarr; `git` &rarr; `diff -u`                                                           |
 
-### 2.3 First-Run Write Path Permissioning
+### 3.3 First-Run Write Path Permissioning
 
 On first execution (or via `staged init` / `staged install-skill`):
 
@@ -155,7 +183,7 @@ On first execution (or via `staged init` / `staged install-skill`):
    - **Windsurf:** Updates Windsurf configuration allowlists where applicable.
 3. **Brain Extension Philosophy:** By establishing this allowlist upfront, the staging path is permanently recognized as safe, eliminating approval popups during agent turns while strictly keeping the actual Git repository write-protected.
 
-### 2.4 User and Agent Extensibility
+### 3.4 User and Agent Extensibility
 
 Developers or AI agents can register additional tools dynamically:
 
@@ -173,13 +201,13 @@ staged set --tool cursor --default
 
 ---
 
-## 3. Shell Instance State Tracking (NVM-Style)
+## 4. Shell Instance State Tracking (NVM-Style)
 
-### 3.1 Motivation
+### 4.1 Motivation
 
 Frequently having to type `-s <UUID>` or `--tool <IDE>` across dozens of commands is tedious. Developers need the ability to lock a terminal shell to a specific session or tool—exactly how `nvm use <version>` works for Node.
 
-### 3.2 State Management Hierarchy
+### 4.2 State Management Hierarchy
 
 ```
 Precedence Order (Highest to Lowest):
@@ -191,7 +219,7 @@ Precedence Order (Highest to Lowest):
 6. Automatic Detection      (Most recently modified session for current Git repo)
 ```
 
-### 3.3 Shell Session Commands
+### 4.3 Shell Session Commands
 
 ```bash
 # Set active session for the current shell instance
@@ -210,14 +238,14 @@ staged set --default --tool cursor
 
 ---
 
-## 4. Renamed Skill: `/stage` & Conversation ID Integration
+## 5. Renamed Skill: `/stage` & Conversation ID Integration
 
-### 4.1 Renaming Specification
+### 5.1 Renaming Specification
 
 - **Skill Name:** Standardized strictly to **`/stage`** (directory: `stage`, YAML frontmatter: `name: stage`).
 - **Slash Command:** Triggers via `/stage` in Antigravity, Cursor, Windsurf, Claude Code, and Codex.
 
-### 4.2 Mandatory Conversation ID Output in `/stage`
+### 5.2 Mandatory Conversation ID Output in `/stage`
 
 To ensure easy switching and cross-conversation operations:
 
@@ -235,7 +263,7 @@ To ensure easy switching and cross-conversation operations:
   Quick Apply: `staged diff Player.svelte -a`
   ```
 
-### 4.3 Automated Skill Installation (`staged install-skill`)
+### 5.3 Automated Skill Installation (`staged install-skill`)
 
 ```bash
 # Install /stage skill for default or active tool
@@ -252,16 +280,16 @@ staged install-skill --tool claude
 
 ---
 
-## 5. CLI Command Specification & Usage Reference
+## 6. CLI Command Specification & Usage Reference
 
-### 5.1 Invocation Syntax
+### 6.1 Invocation Syntax
 
 ```
 staged [command] [options] [arguments]
 stage [command] [options] [arguments]
 ```
 
-### 5.2 Global Options
+### 6.2 Global Options
 
 - `-s, --session <UUID>`: Override target session (supports UUID prefixes).
 - `-t, --tool <IDE>`: Override active tool for this run (`cursor`, `windsurf`, `antigravity`, etc.).
@@ -271,7 +299,7 @@ stage [command] [options] [arguments]
 
 ---
 
-### 5.3 Subcommand Specifications
+### 6.3 Subcommand Specifications
 
 #### 1. Listing Staged Files (Default)
 
@@ -362,7 +390,7 @@ staged apply all [--force]
 ```
 
 - Standard apply command (equivalent to `staged diff <file> -a` and `staged diff all -a`).
-- **Branch Protection Check:** Blocks applying directly to protected branches (see Section 7).
+- **Branch Protection Check:** Blocks applying directly to protected branches (see Section 8).
 
 #### 7. Inter-Session Migration (`staged migrate`)
 
@@ -396,9 +424,9 @@ staged set-tool <id> --name <name> --diff-cmd <cmd> --open-cmd <cmd> [--root <pa
 
 ---
 
-## 6. Cross-Platform & Cross-Shell Engineering
+## 7. Cross-Platform & Cross-Shell Engineering
 
-### 6.1 Operating System & Shell Matrix
+### 7.1 Operating System & Shell Matrix
 
 | Environment        | Supported Shells                     | Path Handling                                           | Binary Launch Technique                                   |
 | :----------------- | :----------------------------------- | :------------------------------------------------------ | :-------------------------------------------------------- |
@@ -407,13 +435,13 @@ staged set-tool <id> --name <name> --diff-cmd <cmd> --open-cmd <cmd> [--root <pa
 | **Windows Native** | CMD (`cmd.exe`), PowerShell (`pwsh`) | Windows paths (`C:\...`, `%LOCALAPPDATA%`, `%APPDATA%`) | `subprocess.run(shell=True)` for `.cmd` / `.bat` / `.exe` |
 | **WSL**            | Bash, Zsh                            | Translates Linux &harr; Windows paths                   | Invokes host Windows IDE binaries or Linux native         |
 
-### 6.2 Pure Python 3 Core (Zero Dependencies)
+### 7.2 Pure Python 3 Core (Zero Dependencies)
 
 - Uses only Python standard library: `os`, `sys`, `json`, `shutil`, `subprocess`, `re`, `pathlib`, `argparse`, `filecmp`.
 - Runs immediately on any machine with Python 3.8+.
 - Path normalization via `pathlib.Path` and `os.path.normpath` prevents mixed slash or escaping issues on Windows CMD.
 
-### 6.3 Shell Completions & Binary Symlinks
+### 7.3 Shell Completions & Binary Symlinks
 
 - The install script links `staged` (and `stage`) into `~/.local/bin` (or user PATH).
 - Unified tab-completion scripts generated for:
@@ -424,9 +452,9 @@ staged set-tool <id> --name <name> --diff-cmd <cmd> --open-cmd <cmd> [--root <pa
 
 ---
 
-## 7. Branch Protection & Git Safety Rules
+## 8. Branch Protection & Git Safety Rules
 
-### 7.1 Protected Branch Policy
+### 8.1 Protected Branch Policy
 
 To prevent accidental application of agent changes directly to trunk branches:
 
@@ -448,16 +476,16 @@ flowchart TD
     PromptMismatch --> SafeApply
 ```
 
-### 7.2 Safety Behaviors
+### 8.2 Safety Behaviors
 
 1. **Protected Branch Halt:** If current branch matches a protected pattern, applying changes immediately aborts unless `--force` is explicitly provided.
 2. **Branch Drift Warning:** If the developer switched branches after the session was created, a mismatch notice requires confirmation before applying.
 
 ---
 
-## 8. Enhanced Fuzzy Matching & Indexing
+## 9. Enhanced Fuzzy Matching & Indexing
 
-### 8.1 Multi-Stage Match Pipeline
+### 9.1 Multi-Stage Match Pipeline
 
 Queries for `staged diff <file>`, `staged clean -f <file>`, and `staged apply <file>` match via:
 
@@ -466,15 +494,15 @@ Queries for `staged diff <file>`, `staged clean -f <file>`, and `staged apply <f
 3. Subsequence / FZF-style characters (e.g. `pysv` &rarr; `Player.svelte`).
 4. Levenshtein edit distance for typo tolerance.
 
-### 8.2 Session Index Cache (`.index.json`)
+### 9.2 Session Index Cache (`.index.json`)
 
 Maintains a small, lightweight `.index.json` inside each session root containing relative paths, basenames, tokenized fragments, and mtimes for instant (<5ms) lookups.
 
 ---
 
-## 9. Backward Compatibility & Migration Plan
+## 10. Backward Compatibility & Migration Plan
 
-### 9.1 Compatibility Aliases
+### 10.1 Compatibility Aliases
 
 - `staged-diff` and `staged-diff-cursor` are maintained as transparent wrappers:
   ```bash
@@ -483,7 +511,7 @@ Maintains a small, lightweight `.index.json` inside each session root containing
   ```
 - Existing staging directories under `~/.cursor/artifact-staging` and `~/.gemini/antigravity-ide/brain` continue to be discovered and indexed.
 
-### 9.2 Implementation Phases
+### 10.2 Implementation Phases
 
 1. **Phase 1: Core CLI Refactoring (Python 3)**
    - Introduce `staged` dispatcher (with `stage` symlink).
@@ -502,31 +530,3 @@ Maintains a small, lightweight `.index.json` inside each session root containing
    - Package under `@melchi/staged`.
    - Distribute `/stage` skill with automated installer (`staged install-skill`).
    - Generate shell completions for Zsh, Bash, CMD, and PowerShell.
-
----
-
-## 10. 60-Second Developer Onboarding Guide
-
-```bash
-# 1. Clone repository
-git clone https://github.com/melchi-shared-useful.git
-cd melchi-shared-useful/packages/staged
-
-# 2. Link CLI to user PATH
-ln -sfn "$(pwd)/scripts/staged" ~/.local/bin/staged
-ln -sfn "$(pwd)/scripts/staged" ~/.local/bin/stage
-
-# 3. Install completion
-staged --install-completion
-
-# 4. Install /stage skill for your IDE (e.g. Cursor)
-staged install-skill --tool cursor --default
-
-# 5. Tell your AI Assistant:
-# "Use /stage to stage changes in an isolated sandbox first."
-
-# 6. Review & Apply:
-# staged                          # List staged files
-# staged diff Player.svelte       # Inspect diff in IDE
-# staged diff Player.svelte -a    # Apply staged changes!
-```
