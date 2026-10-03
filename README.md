@@ -1,6 +1,8 @@
 # @melchi/staged
 
-Unified staging engine and `/stage` agent workflow for Cursor, Antigravity IDE, Windsurf, VS Code, JetBrains, Zed, and CLI.
+A staging engine and `/stage` agent skill for different harnesses like Cursor, Antigravity IDE, Windsurf, VS Code, JetBrains, Zed, and CLI. The idea is derived from how we learned to program: 
+1. You have a puzzle.
+2. You try to do the puzzle yourself
 
 ## Overview
 
@@ -9,28 +11,26 @@ Proposed work stays out of the workspace until you choose to apply it. The AI ag
 - **CLI Tool (**`staged`**):** Inspects, compares, and applies changes that are currently *staged*.
 - **Agent Skill (**`/stage`**):** The slash command instructing AI assistants to prepare changes in staging.
 
-| Host | Staging root | Skill Path | Diff Command |
-| --- | --- | --- | --- |
-| **Cursor** | `~/.local/share/stage/<conv_id>/staging/` | `skills/cursor/SKILL.md` | `cursor -r --diff <orig> <staged>` |
-| **Antigravity** | `~/.gemini/antigravity-ide/brain/<conv_id>/staging/` | `SKILL.md` | `antigravity-ide -r -d <orig> <staged>` |
-| **Windsurf** | `~/.local/share/stage/<conv_id>/staging/` | `SKILL.md` | `windsurf -r --diff <orig> <staged>` |
-| **VS Code** | `~/.local/share/stage/<conv_id>/staging/` | `SKILL.md` | `code -r -d <orig> <staged>` |
-| **PyCharm** | `~/.local/share/stage/<conv_id>/staging/` | `SKILL.md` | `charm diff <orig> <staged>` |
-
 ## Quick Installation & Symlinks
 
-Link the command:
+1. Clone the Repo:
+```bash
+git clone https://github.com/mdulc928/staged-diff.git
+cd staged-diff
+```
+
+2. Link the command:
 
 ```bash
 ln -sfn "$(pwd)/scripts/staged" ~/.local/bin/staged
 ln -sfn "$(pwd)/scripts/staged" ~/.local/bin/stage
 ```
 
-Install shell tab-completion (writes completion scripts to `~/.zfunc` / `~/.config/staged/completions` and adds a marked block to your shell rc):
+3. Install shell tab-completion (writes completion scripts to `~/.zfunc` / `~/.config/staged/completions` and adds a marked block to your shell rc):
 
 ```bash
 staged --install-completion
-# then restart the shell or: exec zsh
+# then restart the shell
 ```
 
 Configure `/stage` skill and sandbox write permissions for your editor:
