@@ -454,6 +454,8 @@ PowerShell installation also links to the bundled completion script and prints a
 
 On Windows, PowerShell installation also writes a `staged.cmd` launcher and prints the directory to add to PATH. Bash, Zsh and PowerShell completion match filenames case-insensitively while preserving their actual spelling.
 
+After `-f` / `--file`, completion matches any literal substring of the relative path, ignoring case. For example, `_sta`, `pletions/_sta`, or `staged` can complete to `completions/_staged`. If several paths match, completion offers all of them so you can choose a full relative path.
+
 ## Command reference
 
 Syntax below uses `<value>` for a required value, `[value]` for an optional argument, and `|` for alternatives. Replace placeholders rather than typing the angle brackets. Quote paths with spaces and patterns containing shell wildcards.

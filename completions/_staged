@@ -11,7 +11,17 @@ _staged() {
     --session|-s|--from|--to|--between|--compare-session|use)
       candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}") ;;
     --file|-f)
-      candidates=("${(@f)$(command staged "$file_helper" 2>/dev/null)}") ;;
+      candidates=("${(@f)$(command staged "$file_helper" 2>/dev/null)}")
+      local candidate query="${words[CURRENT]:l}"
+      local -a matches=()
+      for candidate in "${candidates[@]}"; do
+        if [[ "${candidate:l}" == *"$query"* ]]; then
+          matches+=("$candidate")
+        fi
+      done
+      # Matching is already done; allow insertion of a full path for a substring query.
+      compadd -U -- "${matches[@]}"
+      return ;;
     --shell)
       candidates=(bash zsh powershell) ;;
     install-completion)
