@@ -1,11 +1,22 @@
 #compdef staged
 _staged() {
   local -a candidates
+  local file_helper=--list
+  if (( ${words[(Ie)open]} )); then
+    file_helper=--complete-open
+    if (( ${words[(Ie)--meta]} )); then file_helper=--complete-meta; fi
+  fi
   case "${words[CURRENT-1]}" in
     --tool|-t) candidates=("${(@f)$(command staged --complete-tools 2>/dev/null)}") ;;
     --session|-s|--from|--to|--between|--compare-session|use)
       candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}") ;;
-    *) candidates=(init diff apply clean path use set set-tool migrate install-skill all --help --session --tool --root --force --yes --file --apply --between --compare-session "${(@f)$(command staged --list 2>/dev/null)}") ;;
+    --file|-f)
+      candidates=("${(@f)$(command staged "$file_helper" 2>/dev/null)}") ;;
+    --shell)
+      candidates=(bash zsh powershell) ;;
+    install-completion)
+      candidates=(--shell) ;;
+    *) candidates=(init diff apply clean path open use set set-tool migrate install-skill install-completion --all --meta --help -h --session -s --tool -t --root --force --yes -y --clear --file -f --apply -a --clean -c --between --compare-session) ;;
   esac
   compadd -M 'm:{a-zA-Z}={A-Za-z}' -- "${candidates[@]}"
 }
