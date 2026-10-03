@@ -21,3 +21,6 @@ env/
 # Staging runtime
 .workspace
 renames.json
+
+# Local documentation
+IMPLEMENTATION.md
