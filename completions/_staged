@@ -1,0 +1,12 @@
+#compdef staged
+_staged() {
+  local -a candidates
+  case "${words[CURRENT-1]}" in
+    --tool|-t) candidates=("${(@f)$(command staged --complete-tools 2>/dev/null)}") ;;
+    --session|-s|--from|--to|--between|--compare-session|use)
+      candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}") ;;
+    *) candidates=(init diff apply clean path use set set-tool migrate install-skill all --help --session --tool --root --force --yes --file --apply --between --compare-session "${(@f)$(command staged --list 2>/dev/null)}") ;;
+  esac
+  compadd -M 'm:{a-zA-Z}={A-Za-z}' -- "${candidates[@]}"
+}
+_staged "$@"

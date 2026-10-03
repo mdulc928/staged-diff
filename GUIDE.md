@@ -40,17 +40,17 @@ If the last command is not found, add `~/.local/bin` to PATH in your shell confi
 
 #### Windows launcher
 
-Windows uses a `staged.cmd` launcher in place of the Unix symlink. A symlink to the extensionless Python script alone does not provide the same command-launching behavior. The launcher works in both PowerShell and CMD and does not require creating a Windows symbolic link.
+Windows uses a `staged.cmd` launcher in place of the Unix symlink. A symlink to the extensionless Python script alone does not provide the same command-launching behavior. PowerShell is the supported Windows shell. The installer creates this launcher and a PowerShell completion script; no Windows symbolic link is needed.
 
-From PowerShell or CMD, clone the repository and generate the launcher:
+From PowerShell, clone the repository and generate the launcher:
 
 ```powershell
 git clone https://github.com/mdulc928/staged-diff.git
 cd staged-diff
-py -3 .\staged --install-completion --shell cmd
+py -3 .\staged --install-completion --shell powershell
 ```
 
-If you already cloned the repository, start from its directory and run only the last command. If `py` is unavailable but Python 3.8+ is installed as `python`, use `python .\staged --install-completion --shell cmd`.
+If you already cloned the repository, start from its directory and run only the last command. If `py` is unavailable but Python 3.8+ is installed as `python`, use `python .\staged --install-completion --shell powershell`.
 
 The command prints the launcher's directory, normally `%APPDATA%\staged\bin`. Make it available in future terminals:
 
@@ -65,16 +65,11 @@ $env:Path += ";$env:APPDATA\staged\bin"
 staged --help
 ```
 
-The equivalent temporary PATH update in CMD is:
+The temporary PATH update affects only the current terminal; use the user PATH steps above for future terminals. If the installer printed a different directory, substitute that path.
 
-```bat
-set "PATH=%PATH%;%APPDATA%\staged\bin"
-staged --help
-```
+Load the completion script using the source command printed by the installer. Add that command to `$PROFILE` to load it in future PowerShell sessions. Completion matches filenames regardless of capitalization, so `rea<Tab>` can select `README.md`.
 
-These temporary updates affect only the current terminal; use the user PATH steps above for future terminals. If the installer printed a different directory, substitute that path.
-
-Keep the checkout and Python installation in place: the generated launcher references their absolute paths. Re-run the generator from the new location if you move the checkout or change Python installations. Despite the `--install-completion` option name, `--shell cmd` creates the launcher; for PowerShell tab completion, separately run `staged --install-completion --shell powershell` and follow its printed loading instructions.
+Keep the checkout and Python installation in place: the generated launcher references their absolute paths. Re-run the installer from the new location if you move the checkout or change Python installations.
 
 #### npm launcher alternative
 
@@ -123,7 +118,7 @@ staged install-skill --tool zed --target-dir /absolute/path/to/skills/stage
 
 The installer prints the staging root. Your agent needs permission to write there.
 
-For Cursor, `--configure-sandbox` merges that root into the supported sandbox and CLI permission settings, preserving unrelated settings. It is optional. Other harnesses report that automatic configuration is unavailable; add the printed root through their own writable-directory settings.
+For Cursor, `--configure-sandbox` merges that root into the supported sandbox and CLI permission settings, preserving unrelated settings. It is optional. Automatic configuration currently writes `~/.cursor/sandbox.json` and `~/.cursor/cli-config.json`; if you use `CURSOR_CONFIG_DIR` or Linux/BSD `XDG_CONFIG_HOME`, configure permissions in the active CLI config yourself (see [Cursor configuration](https://prod.cursor.com/docs/cli/reference/configuration)). Other harnesses report that automatic configuration is unavailable; add the printed root through their own writable-directory settings.
 
 Installing a skill does not grant filesystem access by itself, and `staged` does not enforce a read-only workspace. The skill instructs the agent to keep proposals isolated; your harness controls actual permissions.
 
@@ -211,6 +206,8 @@ staged diff src/example.py
 staged diff all                  # skip already-applied files
 staged diff src/example.py --tool cli
 ```
+
+The overview uses color for statuses, the active session, and the Git branch in an interactive terminal. Set `NO_COLOR=1` to disable color, or `FORCE_COLOR=1` to retain it when capturing output. Raw path and completion output stays uncolored.
 
 `diff` opens the configured editor, or terminal review when you select `cli`. It does not apply anything unless you add `-a` / `--apply`. New files and deletions are compared with an empty review file. Terminal diffs try `difft`, then Git, then `diff`.
 
@@ -364,6 +361,33 @@ staged diff src/example.py --tool pycharm # one-command override
 
 Built-in IDs are `cursor`, `antigravity`, `windsurf`, `vscode`, `pycharm`, `zed`, `codex`, `claudecode`, and `cli`. Graphical adapters need their editor launcher installed. If detection fails, install that launcher on PATH or use `--tool cli`.
 
+### Editor compatibility
+
+We recommend using an editor with a command-line launcher that accepts two file paths and opens a diff. Your agent and review editor can be chosen independently:
+
+```bash
+staged install-skill --tool claudecode
+staged set --tool pycharm --default
+staged diff src/example.py --tool pycharm
+```
+
+Claude Code supports [inline review of its proposed edits in VS Code](https://code.claude.com/docs/en/vs-code). Its [CLI reference](https://code.claude.com/docs/en/cli-reference) does not document a general two-file diff launcher. The `claudecode` adapter in `staged` uses terminal review (`difft`, then `git diff --no-index`, then `diff`); it does not invoke Claude's inline review UI. The `codex` and `cli` adapters use the same terminal fallback.
+
+The following audit distinguishes documented commands from integrations that still need verification. Commands show the two file arguments as `original` and `proposal`.
+
+| Adapter | Diff command | Evidence / status |
+| --- | --- | --- |
+| `vscode` | `code -r -d original proposal` | [Official CLI reference](https://code.visualstudio.com/docs/configure/command-line) |
+| `pycharm` | `pycharm diff original proposal` | [Official diff reference](https://www.jetbrains.com/help/pycharm/command-line-differences-viewer.html); Windows also uses `pycharm64.exe` or `pycharm.bat`, Linux `pycharm.sh` |
+| `zed` | `zed --diff original proposal` | [Official CLI reference](https://zed.dev/docs/reference/cli) |
+| `cursor` | `cursor -r --diff original proposal` | Confirmed `diff` and `reuse-window` options in the locally installed vendor CLI parser (Cursor 3.23.12) |
+| `antigravity` | `antigravity-ide -r -d original proposal` | Confirmed the same options in the installed IDE CLI parser (app package version 1.107.0); this is the IDE launcher |
+| `windsurf` | `windsurf -r --diff original proposal` | Existing adapter retained; command syntax has not been independently verified against vendor documentation or an installed launcher |
+
+Audit date: October 3, 2026. Local parser checks used each application's `Contents/Resources/app/out/cli.js`; these verify accepted options, not an end-to-end graphical launch. Native Windows and WSL editor launches still need testing. WSL path conversion exists for Windows launchers, but `.cmd`/`.bat` launchers are not currently routed through `cmd.exe` from WSL; use a native launcher or `--tool cli` there. For Windsurf, check `windsurf --help` for the flags above before relying on the adapter.
+
+For PyCharm, follow JetBrains' [launcher setup](https://www.jetbrains.com/help/pycharm/working-with-the-ide-features-from-command-line.html). `staged` prefers `pycharm`, checks the platform-specific names above and standard Toolbox script directories, and checks macOS PyCharm application bundles. Linux Snap launchers `pycharm-professional` and `pycharm-community` are also recognized. It does not substitute IntelliJ IDEA or WebStorm for PyCharm. A custom Toolbox launcher name needs a custom adapter.
+
 For another editor, register its actual command syntax:
 
 ```bash
@@ -408,14 +432,15 @@ Run the command for your shell:
 staged --install-completion --shell bash
 staged --install-completion --shell zsh
 staged --install-completion --shell powershell
-staged --install-completion --shell cmd
 ```
 
-Bash and Zsh installation adds a managed block to the corresponding rc files. Open a new shell afterward. Re-running updates the block rather than adding duplicates.
+Bash and Zsh installation symlinks the scripts from `completions/` in your checkout (or installed package) into the staging configuration directory and adds a managed block to the corresponding rc files. Updating the source scripts updates the installed links automatically. Keep the checkout in place; reinstall completion if you move it. Re-running installation replaces older copied scripts with links and updates the rc block rather than adding duplicates.
 
-PowerShell installation writes a completion script and prints a command to load it. Add that source command to `$PROFILE` if you want it loaded in future sessions.
+An open shell may already have the old function in memory. After an update, run `source ~/.zshrc` for Zsh, source the installed Bash completion script, or open a new terminal. The installer prints the appropriate activation command.
 
-CMD installation writes a `staged.cmd` launcher and prints the directory to add to PATH. CMD has filesystem completion, not the dynamic argument completion provided by Bash, Zsh, or PowerShell.
+PowerShell installation also links to the bundled completion script and prints a command to load it. If Windows denies symlink creation, it installs a small loader that reads the bundled script instead of copying its contents. Add that source command to `$PROFILE` if you want it loaded in future sessions.
+
+On Windows, PowerShell installation also writes a `staged.cmd` launcher and prints the directory to add to PATH. Bash, Zsh and PowerShell completion match filenames case-insensitively while preserving their actual spelling.
 
 ## Command reference
 
@@ -590,7 +615,7 @@ Installation reports its destination and staging root. Reinstallation replaces t
 ### Install completion
 
 ```text
-staged --install-completion [--shell bash|zsh|powershell|cmd]
+staged --install-completion [--shell bash|zsh|powershell]
 ```
 
 This is a top-level operation. Omit `--shell` to use the detected POSIX shell, or PowerShell on Windows. See [shell completion](#shell-completion) for installed files and activation steps.

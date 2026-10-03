@@ -2,6 +2,8 @@
 
 `staged` keeps an agent's proposed edits in real files outside your working tree. Review the differences in your editor, then apply the changes you choose. `/stage` is the accompanying agent skill; neither changes Git's index.
 
+We recommend pairing `staged` with an editor that can open a two-file diff from the command line, such as VS Code, PyCharm, or Zed. See [editor setup](GUIDE.md#editor-compatibility).
+
 ## Install
 
 Requires **Python 3.8+**. First, clone the repository:
@@ -20,13 +22,13 @@ ln -s "$(pwd)/staged" ~/.local/bin/staged
 
 Ensure `~/.local/bin` is on PATH.
 
-On **Windows** (PowerShell or CMD), create the command launcher instead of a symlink:
+On **Windows**, using PowerShell, create the command launcher instead of a symlink:
 
 ```powershell
-py -3 .\staged --install-completion --shell cmd
+py -3 .\staged --install-completion --shell powershell
 ```
 
-Add the printed directory (normally `%APPDATA%\staged\bin`) to your **user PATH**, then open a new terminal and run `staged --help`. See [Windows setup](GUIDE.md#windows-launcher) for the steps. Alternatively, `npm install -g .` installs a cross-platform launcher; Python is still required.
+Add the printed directory (normally `%APPDATA%\staged\bin`) to your **user PATH**, then open a new terminal and run `staged --help`. Load the completion script using the command printed by the installer. See [Windows setup](GUIDE.md#windows-launcher) for the steps. Alternatively, `npm install -g .` installs a cross-platform launcher; Python is still required.
 
 Install the agent skill, using Cursor as an example:
 
