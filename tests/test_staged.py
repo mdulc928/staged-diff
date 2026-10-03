@@ -211,7 +211,7 @@ class CLI(unittest.TestCase):
         self.run_cli('use', '--session', 'session-a')
         self.run_cli('set', '--repo', '--default-session', 'session-a')
         self.assertEqual(json.loads((self.repo / '.staged.json').read_text()).get('default_session'), 'session-a')
-        shell_file = self.home / '.config/staged/shell_sessions/test-shell.json'
+        shell_file = self.config / 'shell_sessions/test-shell.json'
         self.assertTrue(shell_file.exists())
         self.assertEqual(json.loads(shell_file.read_text()).get('session'), 'session-a')
 
