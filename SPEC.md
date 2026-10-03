@@ -1,50 +1,87 @@
-# Unified staging engine and `/stage` skill
+# Unified staging engine and `/stage` skill specification
 
 Version 2.0.0 · revised October 3, 2026 · package `@melchi/staged`
 
-This revision incorporates the decision to remove old command aliases and implicit editor-specific storage. It preserves the core product promise: proposed changes are real, inspectable files outside the working tree, and enter the workspace only through an explicit apply operation. [IMPLEMENTATION.md](IMPLEMENTATION.md) records the original gaps and remaining release verification separately from the requirements below.
+This specification defines the architectural and behavioral contract of `staged` and the `/stage` skill.
 
-## 1. Product contract
+**Core Contract**: Proposed edits reside in isolated, inspectable files outside the Git working tree. The workspace remains unchanged until an explicit apply operation is executed.
 
-The developer can attempt a solution independently, then compare it with an agent's proposal. The tool must support this sequence:
+---
 
-1. Initialize an isolated conversation session associated with a workspace and Git branch.
-2. Have the agent create complete proposal files without modifying workspace originals.
-3. Inspect statuses, absolute paths and editor or terminal diffs.
-4. Compare approaches across sessions or migrate selected staged changes.
-5. Explicitly apply selected files or all staged changes, subject to branch guards.
-6. Discard staged files without reverting or modifying workspace files.
+## 1. Product Contract
 
-`staged` is the CLI; `/stage` is the skill. They do not stage Git's index, commit changes, or manage worktrees. The Python engine has no third-party dependencies and requires Python 3.8+. An optional npm launcher provides cross-platform command shims.
+`staged` enables a developer to work on a problem independently while an agent stages a proposal in parallel.
 
-## 2. Storage and ownership
+### Operational Lifecycle
 
-All built-in editors share a staging root. Defaults:
+1. **Initialize Session**: Create an isolated staging directory bound to a workspace path and Git branch.
+2. **Stage Complete Files**: The agent writes complete proposed files outside the working tree.
+3. **Inspect Changes**: View statuses, extract absolute paths, and open visual diffs in editor or terminal.
+4. **Compare & Migrate**: Compare approaches across sessions; cherry-pick staged files between sessions.
+5. **Apply Changes**: Explicitly copy selected files into the workspace, guarded by Git branch checks.
+6. **Clean Up**: Discard staged proposals without modifying workspace files.
 
-| Data                | macOS / Linux / WSL                                                           | Windows native                |
+### Explicit Non-Goals
+
+- **No Git Index Staging**: Does not interact with `git add` or the Git staging area.
+- **No Git Worktrees**: Does not create, modify, or manage Git worktrees.
+- **No Auto-Commits**: Does not generate or execute Git commits.
+- **No 3-Way Auto-Merge**: Does not attempt automatic resolution of concurrent edits.
+
+### Runtime Requirements
+
+- **Python**: 3.8+ (standard library only; zero external pip dependencies).
+- **Node.js**: 18+ (optional npm wrapper provides cross-platform command shims).
+
+---
+
+## 2. Storage and Ownership
+
+All built-in adapters share a single staging root on disk.
+
+### Default Storage Layout
+
+| Data                | POSIX (macOS / Linux / WSL)                                                   | Windows Native                |
 | ------------------- | ----------------------------------------------------------------------------- | ----------------------------- |
 | Sessions            | `$XDG_DATA_HOME/staged`, otherwise `~/.local/share/staged`                    | `%LOCALAPPDATA%\staged`       |
-| Global state        | `$XDG_CONFIG_HOME/staged/state.json`, otherwise `~/.config/staged/state.json` | `%APPDATA%\staged\state.json` |
-| Shell state         | `shell_sessions/<id>.json` beside global state                                | Same layout                   |
-| Repository settings | `<workspace>/.staged.json`                                                    | Same layout                   |
+| Global State        | `$XDG_CONFIG_HOME/staged/state.json`, otherwise `~/.config/staged/state.json` | `%APPDATA%\staged\state.json` |
+| Shell State         | `shell_sessions/<id>.json` beside global state                                | Same layout                   |
+| Repository Settings | `<workspace>/.staged.json`                                                    | Same layout                   |
 
-Root precedence: `--root`, `STAGED_ROOT`, repository `staging_root`, global `staging_root`, custom adapter root, platform default. Explicit `session_roots` add discovery locations. No transcript inference or implicit discovery of editor-specific staging directories is permitted.
+**Root Precedence**:
+1. `--root <path>` CLI flag
+2. `STAGED_ROOT` environment variable
+3. Repository configuration (`staging_root` in `<workspace>/.staged.json`)
+4. Global configuration (`staging_root` in `state.json`)
+5. Custom adapter root
+6. Platform default directory
+
+Additional discovery roots are configured via `session_roots`. Discovery is explicit; `staged` does not scan or infer staging roots from editor transcripts.
+
+---
+
+### Session Directory Structure
 
 ```text
 <root>/<session-id>/
-  .workspace          # absolute workspace path, plain text
-  session.json        # origin branch, creation time, migration provenance
-  renames.json        # operation manifest
-  staged_changes.md   # agent-maintained review dashboard
-  .index.json         # derived inventory; never authoritative for apply
-  .review/            # retained review-side empty files for GUI launchers
-  staging/            # complete staged files, including dotfiles
+  .workspace          # Absolute workspace path (plain text)
+  session.json        # Origin branch, creation timestamp, migration provenance
+  renames.json        # Operation manifest (renames, relocations, deletions)
+  staged_changes.md   # Agent-maintained review dashboard
+  .index.json         # Derived file inventory (not authoritative for apply)
+  .review/            # Empty placeholder files for GUI diff viewers
+  staging/            # Complete staged files, including dotfiles
     src/example.py
 ```
 
-`staged init <id> --json` returns `session`, `workspace`, `directory`, `staging` and `branch`. Omit the ID to generate a UUID. Existing IDs can be reused only for the same workspace; initialization must not reset the origin branch. The staging root must be outside the workspace. Empty and deletion-only sessions must remain selectable.
+- `staged init [id] --json` outputs `session`, `workspace`, `directory`, `staging`, and `branch`.
+- Reusing an existing session ID is valid only within the same workspace and preserves the origin branch.
+- The staging root must reside outside the workspace.
+- Empty sessions and deletion-only sessions remain fully selectable.
 
-The manifest maps destination paths to original paths, plus an optional deletion list:
+---
+
+### Operation Manifest (`renames.json`)
 
 ```json
 {
@@ -53,112 +90,147 @@ The manifest maps destination paths to original paths, plus an optional deletion
 }
 ```
 
-Paths must be normalized relative paths using forward slashes. Filesystem symlinks, Git metadata, traversal, absolute paths, conflicting file/directory destinations, duplicate rename sources and overlapping rename chains are rejected. Session metadata stays outside `staging/`. A file cannot be staged for both writing and deletion.
+- **Path Format**: Normalized relative paths with forward slashes only.
+- **Mutual Exclusivity**: A path cannot be staged for writing and listed in `_deletions`.
+- **Validation Constraints**: Symlinks, `.git` metadata, directory traversal (`../`), and overlapping rename chains (`A -> B` and `B -> C` in one batch) are rejected.
+- **Location**: Metadata files must reside outside `staging/`.
 
-## 3. State and session selection
+---
 
-For the tool and active session, highest precedence wins:
+## 3. State and Session Selection
 
-1. Explicit `--tool` / `--session` flags.
-2. `STAGED_TOOL` / `STAGED_SESSION` environment variables.
-3. Shell binding saved by `staged use`.
-4. Repository preferences (`default_tool`, `default_session`).
-5. Global defaults.
-6. Auto-detection: available editor or terminal fallback; newest session for the workspace.
+### Precedence Hierarchy
 
-`staged use --session <id>` selects a session until another `use` or `use --clear` changes the binding. The positional form `staged use <id>` is also accepted; supplying both forms is an error. Shell bindings use the invoking process's parent PID. Set `STAGED_SHELL_ID` to a stable shell-specific identifier when the harness uses fresh subprocesses. Explicit environment or CLI values override a binding; the tool cannot change its parent's environment.
+1. Explicit CLI flags (`--tool`, `--session`)
+2. Environment variables (`STAGED_TOOL`, `STAGED_SESSION`)
+3. Shell binding saved by `staged use`
+4. Repository configuration (`default_tool`, `default_session` in `.staged.json`)
+5. Global defaults (`state.json`)
+6. Auto-detection (newest session for active workspace; available editor)
 
-A session selector resolves an exact ID first, then a unique prefix. Ambiguous prefixes and unknown IDs fail; they must not silently select a different staging session. Sessions are filtered to the current repository root, including when invoked from a subdirectory. Explicit workspace markers also support non-Git directories.
+### Shell Bindings
 
-## 4. Commands and observable behavior
+- `staged use --session <id>` binds to the parent PID of the invoking shell process.
+- The binding persists until explicitly changed or cleared via `staged use --clear`.
+- Setting `STAGED_SHELL_ID` shares bindings across fresh subprocesses spawned by agent runners.
+- Prefix matching resolves exact matches first, then unique prefixes. Ambiguous prefixes list candidate matches and fail safely.
+- Session discovery is strictly scoped to the active repository root.
 
-Global selection options are accepted before or after the subcommand. Listing and completion installation switches are top-level options. `-a` means apply only, and `-R` means list all repositories.
+---
 
-| Command                                                                     | Contract                                                                                                  |
-| --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | --- | ----------------------- | --------------------------------------------- |
-| `staged`, `staged diff`                                                     | Show workspace, session ID, tool, branch and file statuses                                                |
-| `staged -v`                                                                 | Include absolute paths, sizes and modification times                                                      |
-| `staged --sessions`, `staged -R`                                            | List local or all configured sessions                                                                     |
-| `staged init [id] [--json]`                                                 | Create/reuse a session and bind it to this shell                                                          |
-| `staged diff -f <file>`                                                     | Review one uniquely matched file                                                                          |
-| `staged diff --all`                                                         | Review all pending files, additions and deletions                                                         |
-| `staged diff -f <file> -a`                                                  | Apply one selected change                                                                                 |
-| `staged diff --all -a`                                                      | Apply all staged changes                                                                                  |
-| `staged diff -f <file> -c`                                                  | Discard one selected staged change                                                                        |
-| `staged diff --all -c`                                                      | Discard all staged changes                                                                                |
-| `staged apply -f <file>`, `staged apply --all`                              | Apply an explicitly selected file or all staged changes                                                   |
-| `staged path [-s                                                            | --staged                                                                                                  | -w  | --workspace] -f <file>` | Print one raw absolute path, without a banner |
-| `staged open [--meta] -f <file>`                                            | Open one staged file or session file in your editor                                                       |
-| `staged clean -f <file>`, `staged clean --all`, `staged clean --session [<id>]` | Discard one staged change, all staged changes, or an entire session directory; `-y` confirms discard |
-| `staged use --session <id>`, `staged use --tool <id>`, `staged use --clear` | Manage this shell's binding                                                                               |
-| `staged set [--repo] ...`                                                   | Save preferences globally or in the repository                                                            |
-| `staged set-tool <id> --name ... --diff-cmd ... --open-cmd ...`             | Register a custom editor                                                                                  |
-| `staged migrate --from <id> [--to <id>] (--file <query-or-glob> \| --all)`  | Copy explicitly selected staged changes and operation metadata                                            |
-| `staged install-skill [--tool <id>] [--target-dir <dir>]`                   | Install the skill for the selected harness                                                                |
-| `staged install-completion [--shell <shell>]`                               | Install shell completions for bash, zsh, or powershell                                                    |
+## 4. Commands and Observable Behavior
 
-`path -s` is a staged-path switch, while global `-s` selects a session. Use `path --session <id> -s -f <file>` to combine them. Deletions have only a workspace path.
+Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before or after subcommands.
 
-File selection uses `-f` / `--file`; bulk selection uses `--all`. For `clean`, selection may also be `-s` / `--session [<id>]` to discard the entire session directory on disk and unbind shell session bindings and default session preferences. These are mutually exclusive. Positional filenames and positional `all` are rejected. Apply, clean, migration, and diff actions/comparisons require explicit selection. Only bare `staged diff` retains its overview behavior. `path` and `open` require `-f` and operate on one file. `-f all` selects a file literally named `all`.
+### Command Specifications
 
-Apply and clean can be combined: `-ac`, `-ca`, `-a -c`, and `-c -a` (or their long forms) always apply the selected changes first, then clean the same selection. Clean runs only after apply succeeds; an apply failure retains all staged files and tracking.
+| Command | Action | Contract |
+| ------- | ------ | -------- |
+| `staged`, `staged diff` | Overview | Print workspace, session ID, tool, branch, and status summary |
+| `staged -v` | Verbose Overview | Include absolute paths, file sizes, and modification timestamps |
+| `staged --sessions` | Local List | List sessions associated with current workspace |
+| `staged -R` | Global List | List all sessions across all configured workspaces and roots |
+| `init [id]` | Initialize | Create or reuse session; bind to active shell |
+| `diff -f <f>` | File Diff | Open visual diff in configured editor |
+| `diff --all` | Bulk Diff | Open visual diff sequentially for all pending changes |
+| `diff -f <f> -a` | File Apply | Apply single file immediately instead of opening diff |
+| `diff --all -a` | Bulk Apply | Apply all staged additions, edits, and deletions |
+| `diff -f <f> -c` | File Discard | Discard single staged file instead of opening diff |
+| `diff --all -c` | Bulk Discard | Discard all staged files in session |
+| `apply -f <f> \| --all` | Explicit Apply | Copy staged files to workspace (requires `-f` or `--all`) |
+| `path [-s\|-w] -f <f>` | Print Path | Print raw absolute path (`-s` staged, `-w` workspace) |
+| `open [--meta] -f <f>` | Open File | Open staged file (or session root metadata with `--meta`) |
+| `clean -f <f> \| --all` | Discard Changes | Discard staged changes; prompts unless `-y` is passed |
+| `clean --session [<id>]` | Delete Session | Remove session folder from disk and clear shell bindings |
+| `use --session <id>` | Bind Shell | Bind session to current shell process |
+| `migrate --from <id>` | Migrate | Copy staged files and manifest entries between sessions |
+| `set [--repo]` | Save Settings | Store persistent configuration |
+| `set-tool <id>` | Register Tool | Register custom editor CLI adapter |
+| `install-skill` | Install Skill | Copy `SKILL.md` to harness skill directory |
+| `install-completion` | Install Shell Completion | Configure Bash, Zsh, or PowerShell tab-completion |
 
-Open matches only staged files under `staging/` by default. `open --meta` matches only non-hidden files directly in the session directory, including editable metadata and review notes. Metadata aliases apply only in that mode. Opening does not lock files or require branch overrides, and every nonzero editor exit status is an error.
+---
 
-Statuses: `APPLIED`, `MODIFIED`, `NEW FILE`, `RENAMED`, `RELOCATED`, `DELETED`, `MISSING`. A tracked rename without staged contents is `MISSING` and blocks apply until repaired or cleaned. `APPLIED` requires equal bytes and, on POSIX, equal permission bits. A rename remains pending while its original source exists, even if the destination already matches. A deletion is applied when its target is absent.
+### Selection Rules
 
-Every terminal status token uses its shared color wherever emitted: `APPLIED` green, `MODIFIED` yellow, `NEW FILE` cyan, `RENAMED` and `RELOCATED` magenta, `DELETED` red, and `MISSING` bold red. This includes overview rows, review headers, and apply results. Honor `NO_COLOR` and `FORCE_COLOR`; machine-readable output remains plain.
+- **Strict Flags**: File operations require `-f <file>` / `--file <file>`. Bulk operations require `--all`. Session deletion requires `--session [<id>]`.
+- **Positional Rejection**: Positional filenames and positional `all` are rejected.
+- **Combined Flags**: `-ac`, `-ca`, `-a -c`, and `-c -a` apply first, then clean. Clean runs only if apply succeeds.
+- **Path Flag Scope**: In `staged path`, `-s` denotes `--staged`. Session overrides require `--session <id>`.
 
-All subcommands must render help when `-h` or `--help` appears, even with missing required values, without reading configuration or performing mutations. Invalid flags, missing values and malformed JSON must fail clearly. Operational failures return nonzero exit status. Terminal diff exit code 1 means differences, not an error.
+---
 
-### File matching
+### Status Definitions and Terminal Colors
 
-Resolve an exact relative path, then a case-insensitive exact path, then an exact basename, then subsequence matches, then a bounded Levenshtein typo match. Multiple candidates at any stage require an exact path. Apply, path and selective clean never expand an ambiguous query into multiple files. Only `--all` and migration globs deliberately select multiple paths.
+| Status      | Color    | Criteria                                                                    |
+| ----------- | -------- | --------------------------------------------------------------------------- |
+| `MODIFIED`  | Yellow   | Staged file content differs from workspace file                             |
+| `NEW FILE`  | Cyan     | Staged file does not exist in workspace                                     |
+| `RENAMED`   | Magenta  | File is renamed in manifest                                                 |
+| `RELOCATED` | Magenta  | File is moved to a different directory without renaming                     |
+| `DELETED`   | Red      | Manifest specifies deletion of workspace file                               |
+| `APPLIED`   | Green    | Workspace file matches staged file byte-for-byte (and permissions on POSIX) |
+| `MISSING`   | Bold Red | Manifest records rename/move, but staged destination file is missing        |
 
-The inventory records paths, basenames, tokens, sizes, mtimes and directory timestamps in `.index.json`. Unchanged directory timestamps allow inventory reuse; stale or malformed indexes trigger a scan. Mutating operations always rescan the real files, and status checks read current file contents and permissions. The original sub-5ms lookup goal remains a performance target, not a measured guarantee for this release.
+Terminal output respects `NO_COLOR=1` and `FORCE_COLOR=1`. Machine-readable output (`--json`, `path`) remains uncolored.
 
-### Cross-session review and migration
+---
 
-```bash
-staged diff --between session-a session-b -f src/example.py
-staged diff -f src/example.py --session session-a --compare-session session-b
-```
+### File Matching Order
 
-Resolve the same relative path in both sessions, never unrelated files sharing a basename. Require `-f <file>` for one file or `--all` for all common staged files. Comparison cannot be combined with apply or clean. Pending deletions have no staged-file contents to compare.
+1. Exact workspace-relative path
+2. Case-insensitive relative path
+3. Exact basename
+4. Subsequence match
+5. Bounded Levenshtein typo match
 
-Migration preserves the source, merges selected rename/deletion entries, and records provenance including source branch. An omitted destination uses the active session; a new explicit destination ID initializes a session for this workspace. Existing target staged files or source copies older than differing workspace files block migration unless `--force` explicitly permits replacement. Timestamp checks are advisory conflict detection, not a three-way merge or proof of freshness. Contradictory operations must still fail under `--force`.
+If a query matches multiple files at any step, resolution halts and outputs all candidate matches. Mutating operations always bypass the `.index.json` inventory cache to inspect active filesystem state.
 
-## 5. Apply and clean safety
+---
 
-Protected branches are opt-in: the default `protected_branches` list is empty. Configure repository or global patterns with `staged set --protected-branch <pattern>` (repeat for multiple patterns; add `--repo` for repository scope). Repository or global `protected_branches` replaces this list. `branch_protection` is a boolean and can be set through `staged set --branch-protection true|false`; enabling the check does not add any patterns.
+## 5. Apply and Clean Safety
 
-Apply must preflight paths and manifest operations for the whole selected batch before copying any files. It blocks protected branches unless `--force` is supplied and reports the override. Branch drift from the origin branch or branches recorded by migrated staged changes requires interactive confirmation; `--yes` explicitly confirms drift in scripts. `--force` does not confirm branch drift.
+### Git Branch Protections
 
-Each destination copy uses an atomic file replacement, preserving file metadata. Renamed sources are removed after their destination is written. Deletions operate on regular files only. The batch is not a filesystem transaction: an unexpected I/O failure after copying begins may leave earlier files applied. Completed files are reported individually; rerun inspection after a failure.
+- **Protected Branches**: Opt-in (default list is empty). Configured with `staged set --protected-branch <pattern>`. Applying on a matching branch requires `--force`.
+- **Branch Drift**: If the current Git branch differs from the session origin branch, apply pauses for confirmation. In automated scripts, pass `--yes`.
+- `--force` and `--yes` serve distinct functions; neither flag satisfies the other.
 
-Apply is a file replacement operation, not an automatic merge. Review current workspace diffs before applying. An explicit apply can overwrite concurrent edits to that file; source isolation alone cannot prevent that.
+### Apply Guarantees
 
-Clean never modifies the workspace. It confirms discarding pending changes unless `--yes` is passed. Selective clean removes exactly one uniquely resolved file or deletion entry. Cleaning up all staged changes empties the staging folder and manifest but preserves the session identity and origin branch so an empty session can be reused. Session clean (`--session [<id>]`) prompts before discarding (or requires `--yes`), removes the entire session directory on disk, unbinds shell session bindings, and clears default session preferences matching that session.
+- **Atomic Replacement**: Files are replaced atomically, preserving file mode and permissions.
+- **Ordered Rename Operations**: Renamed destinations are written before source files are deleted.
+- **No Multi-File Transaction**: Batch apply does not provide an all-or-nothing filesystem transaction. If an error occurs mid-batch, previously written files remain in the workspace.
 
-## 6. Adapter and installation contract
+### Clean Guarantees
 
-Adapters expose `id`, `name`, `root`, binary detection, diff/open argument construction, skill installation and sandbox configuration capability. Supported diff adapters:
+- `clean` operations **never** modify or revert workspace files.
+- `staged clean -f <file>` removes the staged file and its corresponding manifest entry.
+- `staged clean --all` clears all staged files and manifest entries while preserving the session directory, ID, and origin branch.
+- `staged clean --session [<id>]` removes the session directory from disk, unbinds shell bindings, and clears default session preferences.
 
-| ID                           | Review launcher                                                   |
+---
+
+## 6. Adapter and Installation Contract
+
+### Supported Review Adapters
+
+| Adapter                      | Diff Command Line                                                 |
 | ---------------------------- | ----------------------------------------------------------------- |
-| `cursor`                     | `cursor -r --diff`                                                |
-| `antigravity`                | `antigravity-ide -r -d`                                           |
-| `windsurf`                   | `windsurf -r --diff`                                              |
-| `vscode`                     | `code -r -d`                                                      |
-| `pycharm`                    | `pycharm diff`, with platform-specific PyCharm launcher discovery |
-| `zed`                        | `zed --diff`                                                      |
+| `cursor`                     | `cursor -r --diff original staged`                                |
+| `antigravity`                | `antigravity-ide -r -d original staged`                           |
+| `windsurf`                   | `windsurf -r --diff original staged`                              |
+| `vscode`                     | `code -r -d original staged`                                      |
+| `pycharm`                    | `pycharm diff original staged` (with platform launcher detection) |
+| `zed`                        | `zed --diff original staged`                                      |
 | `codex`, `claudecode`, `cli` | `difft`, then `git diff --no-index`, then `diff -u`               |
 
-Custom templates use `{orig}` and `{staged}` replacements within argument tokens. Open and diff commands resolve their own executables independently. No shell interpolation is performed. GUI additions/deletions use a retained empty review file so asynchronous editor launchers can still read both sides.
+- Templates use `{orig}` and `{staged}` placeholders. Arguments are passed directly as argument vectors without subshell evaluation.
+- GUI additions and deletions use an empty placeholder file in `.review/` so GUI diff viewers can render a two-sided view.
 
-Skill installation uses the selected adapter and reports the actual destination:
+### Harness Skill Directories
 
-| Harness                        | Default skill directory            |
+| Harness                        | Default Destination Directory      |
 | ------------------------------ | ---------------------------------- |
 | Cursor                         | `~/.cursor/skills/stage`           |
 | Codex                          | `~/.agents/skills/stage`           |
@@ -166,26 +238,27 @@ Skill installation uses the selected adapter and reports the actual destination:
 | Windsurf/Cascade               | `~/.codeium/windsurf/skills/stage` |
 | Antigravity                    | `~/.gemini/config/skills/stage`    |
 | Zed                            | `~/.agents/skills/stage`           |
-| Other editor or custom harness | Explicit `--target-dir` required   |
+| Other editor or custom harness | `--target-dir <path>` required     |
 
-`--default` saves the selected tool. Skill installation and sandbox permission changes are distinct capabilities. `--configure-sandbox` opts into merging Cursor staging-root permissions into `sandbox.json` and `cli-config.json`, preserving unrelated settings. Unsupported harnesses must report that automatic permission configuration is unavailable and identify the root needing manual access. No undocumented allowlist files should be invented.
+`--configure-sandbox` configures Cursor permissions (`~/.cursor/sandbox.json` and `cli-config.json`). For other harnesses, `staged` prints the staging root path for manual configuration.
 
-The tool does not enforce a repository read-only sandbox. A harness or administrator may impose additional restrictions; installing the skill cannot override them. A read-only listing must not prompt for or grant new sandbox permissions.
+---
 
-Installation paths and Cursor settings are based on [Cursor skills](https://prod.cursor.com/docs/skills), [Cursor sandbox configuration](https://prod.cursor.com/docs/reference/sandbox), [Cursor CLI permissions](https://prod.cursor.com/docs/cli/reference/permissions), [Codex skills](https://learn.chatgpt.com/docs/build-skills), [Claude Code skills](https://code.claude.com/docs/en/skills), [Cascade skills](https://docs.devin.ai/desktop/cascade/skills), [Antigravity skills](https://antigravity.google/docs/skills?app=antigravity-ide), and [Zed skills](https://zed.dev/docs/ai/skills).
+## 7. Skill Behavior Contract
 
-## 7. Skill behavior
+The bundled `SKILL.md` requires agents to:
+1. Initialize or reuse a staging session and record returned paths.
+2. Write complete proposal files to `staging/`, matching workspace-relative paths.
+3. Record file renames, relocations, and deletions in `renames.json`.
+4. Maintain `staged_changes.md` with session ID, origin branch, file links, and verification output.
+5. Present the proposal and await explicit authorization before applying.
+6. Run tests or formatters against an isolated copy during staging, or in the workspace only after authorization.
 
-The bundled `SKILL.md` initializes or reuses the actual conversation session, uses returned paths, writes complete staged files, and keeps metadata beside `staging/`. It maintains a review file with prominently displayed session ID, origin branch, paths, links to originals/staged files, operation summaries and validation results.
+---
 
-When the user requested review before apply, the agent presents the proposal and awaits authorization. Existing explicit authorization remains valid. Refinements stay in the session. Project checks run in an isolated copy while staging, or in the workspace after authorized apply. The skill must not prescribe a particular project's formatter/test commands for every repository.
+## 8. Shells, Operating Systems, and Distribution
 
-## 8. Shells, operating systems and distribution
-
-`staged install-completion [--shell <shell>]` links versioned completion files from the checkout or installed package. Bash and Zsh use idempotent marked rc blocks. Bash 3.2 is supported. PowerShell links its `Register-ArgumentCompleter` script and prints how to source it from the profile; when Windows denies symlinks, a loader sources the bundled script instead. Open shells must reload previously loaded functions after updates. PowerShell is the supported Windows shell; its installer also creates the Windows `.cmd` launcher. Completion is case-insensitive in Bash, Zsh and PowerShell.
-
-Native executables use argument-list subprocess execution. Windows batch launchers require `cmd.exe`; arguments containing unsafe batch metacharacters are rejected. WSL can translate paths for Windows launchers using `wslpath`; host binaries must be on PATH. Automatic Windows Registry discovery is not implemented.
-
-The npm package contains the engine, skill, documentation and a Node launcher that locates Python 3.8+. Direct Python invocation remains independent of npm. Publishing to the registry is a separate release operation.
-
-Local validation must cover temporary repositories, branch guards, manifest operations, isolated homes, malformed inputs, cross-session comparisons, migration conflicts, custom adapters and generated shell syntax. Native Windows/PowerShell, Linux/WSL and real editor launches require platform acceptance testing before claiming verified support on those surfaces.
+- **Completions**: Bash, Zsh, and PowerShell support case-insensitive substring completion on `-f`.
+- **Subprocesses**: Argument vector execution. Windows batch scripts execute via `cmd.exe` with safe metacharacter quoting. WSL translates paths for Windows binaries via `wslpath`.
+- **Distribution**: Packaged as `@melchi/staged` with a Node binary launcher wrapping the Python engine. The engine runs standalone with Python 3.8+.
+- **Test Suite**: Comprehensive automated test coverage validating branch protections, manifest handling, prefix matching, cross-session diffs, and shell completion parsing.
