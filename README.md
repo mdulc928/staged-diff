@@ -1,8 +1,9 @@
 # @melchi/staged
 
-A staging engine and `/stage` agent skill for different harnesses like Cursor, Antigravity IDE, Windsurf, VS Code, JetBrains, Zed, and CLI. The idea is derived from how we learned to program: 
+A staging engine and `/stage` agent skill for different harnesses and IDEs like Cursor, Claude Code, Codex, Antigravity IDE, Zed, Pycharm and CLI. The idea is derived from how we all learned to program: 
 1. You have a puzzle.
-2. You try to do the puzzle yourself
+2. You try to do the puzzle yourself.
+3. _Then_ you go check the solution.
 
 ## Overview
 
@@ -11,7 +12,7 @@ Proposed work stays out of the workspace until you choose to apply it. The AI ag
 - **CLI Tool (**`staged`**):** Inspects, compares, and applies changes that are currently *staged*.
 - **Agent Skill (**`/stage`**):** The slash command instructing AI assistants to prepare changes in staging.
 
-## Quick Installation & Symlinks
+## Quick Installation Steps
 
 1. Clone the Repo:
 ```bash
@@ -39,11 +40,15 @@ Configure `/stage` skill and sandbox write permissions for your editor:
 # For Cursor:
 staged install-skill --tool cursor --default
 
+# For PyCharm (command-line launcher `charm` must be on PATH):
+staged install-skill --tool pycharm --default
+
+# For Zed IDE:
+staged install-skill --tool zed --default
+
 # For Antigravity IDE:
 staged install-skill --tool antigravity --default
 
-# For PyCharm (command-line launcher `charm` must be on PATH):
-staged install-skill --tool pycharm --default
 ```
 
 ## CLI Usage
@@ -78,4 +83,5 @@ staged clean
 
 # Lock active session for current shell instance:
 staged use <session-id>
+
 ```
