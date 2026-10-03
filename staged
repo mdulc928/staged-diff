@@ -4,6 +4,7 @@ import argparse
 import fnmatch
 import glob
 import json
+import ntpath
 import os
 from pathlib import Path, PureWindowsPath
 import re
@@ -28,6 +29,15 @@ DEFAULT_PROTECTED_BRANCHES = []
 STATUS_COLORS = {'APPLIED': '32', 'MODIFIED': '33', 'NEW FILE': '36', 'RENAMED': '35',
                  'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
 COMMANDS = ['init', 'diff', 'apply', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion']
+
+
+def is_reserved_windows_name(name):
+    """Check for Windows reserved device names without triggering Python 3.13+ DeprecationWarning."""
+    if hasattr(os.path, 'isreserved'):
+        return os.path.isreserved(name)
+    if hasattr(ntpath, 'isreserved'):
+        return ntpath.isreserved(name)
+    return PureWindowsPath(name).is_reserved()
 COMPLETION_MARKER_START = '# >>> staged completions >>>'
 COMPLETION_MARKER_END = '# <<< staged completions <<<'
 
@@ -113,7 +123,7 @@ def safe_path(root, relative):
         raise StagedError('Path must stay inside its root: {}'.format(relative))
     if part.as_posix() != relative:
         raise StagedError('Use a normalized relative path: {}'.format(relative))
-    if os.name == 'nt' and any(PureWindowsPath(p).is_reserved() or ':' in p or p.endswith(('.', ' ')) for p in part.parts):
+    if os.name == 'nt' and any(is_reserved_windows_name(p) or ':' in p or p.endswith(('.', ' ')) for p in part.parts):
         raise StagedError('Unsupported Windows file path: ' + relative)
     if any(p.lower() == '.git' for p in part.parts):
         raise StagedError('Git metadata cannot be staged: {}'.format(relative))
