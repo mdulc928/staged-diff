@@ -323,6 +323,9 @@ staged [-v] [-s <UUID>] [-t <IDE>]
 #### 2. Side-by-Side Diff & Inline Apply (`staged diff <file> [-a]`)
 
 ```bash
+# List staged files (same as bare `staged`):
+staged diff
+
 # Open side-by-side diff in configured IDE (fuzzy matching):
 staged diff <filename>
 
@@ -444,9 +447,9 @@ staged set-tool <id> --name <name> --diff-cmd <cmd> --open-cmd <cmd> [--root <pa
 ### 7.3 Shell Completions & Binary Symlinks
 
 - The install script links `staged` (and `stage`) into `~/.local/bin` (or user PATH).
-- Unified tab-completion scripts generated for:
-  - **Zsh:** `_staged` (aliased to `_stage`)
-  - **Bash:** `staged-completion.bash`
+- `staged --install-completion` writes shell completion scripts (no separate repo files):
+  - **Zsh:** `~/.zfunc/_staged` (and `_stage` for the `stage` symlink)
+  - **Bash:** `~/.config/staged/completions/staged.bash`
   - **Windows CMD:** Doskey macros and batch wrappers (`staged.cmd`, `stage.cmd`)
   - **PowerShell:** `Register-ArgumentCompleter`
 
