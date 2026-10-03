@@ -1,0 +1,29 @@
+{
+  "name": "@melchi/staged",
+  "version": "2.0.0",
+  "description": "Review isolated proposal files before applying them to your workspace.",
+  "bin": {
+    "staged": "bin/staged.cjs"
+  },
+  "files": [
+    "staged",
+    "bin/staged.cjs",
+    "SKILL.md",
+    "SPEC.md",
+    "README.md",
+    "GUIDE.md"
+  ],
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests -v"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mdulc928/staged-diff.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
