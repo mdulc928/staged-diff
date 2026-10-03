@@ -547,6 +547,7 @@ _staged
         import select
         import time
         self.propose(rel='README.md')
+        self.propose(rel='completions/_staged')
         self.run_cli('install-completion', '--shell', 'zsh')
         master, slave = os.openpty()
         env = dict(self.env, PATH=str(SCRIPT.parent) + os.pathsep + self.env['PATH'], TERM='xterm')
@@ -563,13 +564,58 @@ _staged
         try:
             os.write(master, b'''source "$HOME/.zshrc"; PS1='READY> '; bindkey '^I' complete-word; _capture() { print -r -- "CAPTURE:$BUFFER"; zle send-break; }; zle -N _capture; bindkey '^X' _capture; print SETUP_DONE\n''')
             read_until(b'\r\nSETUP_DONE\r\n')
-            for prefix in (b'rea', b'REA'):
+            for prefix, expected in [(b'rea', b'README.md'), (b'REA', b'README.md'),
+                                     (b'_sta', b'completions/_staged'),
+                                     (b'_STA', b'completions/_staged'),
+                                     (b'pletions/_sta', b'completions/_staged'),
+                                     (b'STAGED', b'completions/_staged'),
+                                     (b'completions/_sta', b'completions/_staged')]:
+                read_until(b'READY> ')
                 os.write(master, b'staged diff -f ' + prefix + b'\t\x18')
-                read_until(b'CAPTURE:staged diff -f README.md')
+                read_until(b'CAPTURE:staged diff -f ' + expected)
         finally:
             process.kill()
             process.wait(timeout=5)
             os.close(master)
+
+    @unittest.skipIf(os.name == 'nt', 'Requires POSIX shells')
+    def test_file_completion_matches_path_substrings(self):
+        paths = ['completions/_staged', 'other/_staged', 'docs/Read me.md', 'src/[literal].txt']
+        for path in paths:
+            self.propose(rel=path)
+        env = dict(self.env, PATH=str(SCRIPT.parent) + os.pathsep + self.env['PATH'])
+        scripts = {
+            'bash': ('staged.bash', r'''source "$1"
+COMP_WORDS=(staged diff -f "$2")
+COMP_CWORD=3
+_staged
+printf '%s\n' "${COMPREPLY[@]}"
+! shopt -q nocasematch
+'''),
+            'zsh': ('_staged', r'''words=(staged diff -f "$2")
+CURRENT=4
+compadd() {
+  while [[ "$1" != -- ]]; do shift; done
+  shift
+  print -rl -- "$@"
+}
+source "$1"
+'''),
+        }
+        for shell, (filename, script) in scripts.items():
+            if not shutil.which(shell):
+                continue
+            for query, expected in [('_sta', paths[:2]), ('_STA', paths[:2]),
+                                    ('completions/_sta', paths[:1]), ('read ', [paths[2]]),
+                                    ('PLETIONS/_sta', paths[:1]), ('staged', paths[:2]),
+                                    ('me.md', [paths[2]]), ('rc/[lit', [paths[3]]),
+                                    ('[lit', [paths[3]]), ('missing', []), ('', paths)]:
+                with self.subTest(shell=shell, query=query):
+                    result = subprocess.run([shell, '-f', '-c', script, 'completion-test',
+                                             str(SCRIPT.parent / 'completions' / filename), query],
+                                            env=env, cwd=self.repo, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(sorted(filter(None, result.stdout.splitlines())), sorted(expected))
 
     def test_corrupt_config_and_manifest_are_not_silently_ignored(self):
         self.propose()

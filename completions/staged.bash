@@ -25,7 +25,10 @@ _staged() {
   shopt -q nocasematch || restore_case=1
   shopt -s nocasematch
   for item in "${choices[@]}"; do
-    [[ "$item" == "$cur"* ]] && COMPREPLY+=("$item")
+    if [[ "$item" == "$cur"* ]] ||
+       { [[ "$prev" == --file || "$prev" == -f ]] && [[ "$item" == *"$cur"* ]]; }; then
+      COMPREPLY+=("$item")
+    fi
   done
   if (( restore_case )); then shopt -u nocasematch; fi
 }

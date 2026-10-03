@@ -13,7 +13,11 @@ Register-ArgumentCompleter -Native -CommandName staged -ScriptBlock {
     'install-completion' { '--shell'; break }
     default { 'init','diff','apply','clean','path','open','use','set','set-tool','migrate','install-skill','install-completion','--all','--meta','--help','-h','--session','-s','--tool','-t','--root','--force','--yes','-y','--clear','--file','-f','--apply','-a','--clean','-c','--between','--compare-session' }
   }
-  $choices | Where-Object { $_.StartsWith($wordToComplete, [System.StringComparison]::OrdinalIgnoreCase) } | ForEach-Object {
+  $choices | Where-Object {
+    $_.StartsWith($wordToComplete, [System.StringComparison]::OrdinalIgnoreCase) -or
+      (($previous -in '--file','-f') -and
+        $_.IndexOf($wordToComplete, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+  } | ForEach-Object {
     $quoted = "'" + $_.Replace("'", "''") + "'"
     [System.Management.Automation.CompletionResult]::new($quoted, $_, 'ParameterValue', $_)
   }
