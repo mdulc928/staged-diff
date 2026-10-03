@@ -1,95 +1,70 @@
 ---
 name: stage
-description: >-
-  Safely stage code changes, refactors, and new files directly into an isolated disk directory before applying them to the workspace repository.
-  Supports graphical side-by-side diff review via the 'staged' CLI tool (e.g. 'staged diff <file>', 'staged diff <file> -a').
-  Use when the user asks to stage changes first, preview proposed edits, review a patch without touching the git working tree, or keep the agent in an isolated staging sandbox until explicitly approved.
+description: Prepare proposed code changes as isolated files for review with the staged CLI. Use when the user asks to stage agent changes first, compare a proposal, or keep proposed edits out of the working tree until approval. This is proposal staging, not Git index staging.
 ---
 
-# Staging Workflow (`/stage`)
+# Prepare a proposal with `/stage`
 
-This skill defines a safety-first, non-intrusive development workflow where the **session staging directory serves as the isolated workspace**. All proposed source code modifications, new files, and refactors are physically created and edited inside the staging directory first, allowing full review of real files before anything is applied to the workspace.
+Keep proposed source changes outside the working tree until the user authorizes applying them. Preserve the user's existing authorization: a request to apply is sufficient; do not request it again.
 
----
+## Establish the session
 
-## 1. Core Principles
+From the target workspace, run `staged init <conversation-id> --json`. Use the actual conversation ID when available; otherwise omit it and use the generated session ID. Reuse that session for refinements. The command returns the absolute `directory`, `staging`, and `workspace` paths and records the original Git branch.
 
-- **Isolated Staging Folder as Workspace**: The staging folder acts as the working directory during the staging phase. Real files (`.svelte`, `.ts`, `.js`, `.py`, `.css`, etc.) are created and modified there on disk, mirroring relative project paths.
-  - Antigravity staging path: `<appDataDir>/brain/<conversation-id>/staging/`
-  - Cursor / Generic staging path: `~/.local/share/stage/<conversation-id>/staging/`
-- **No Git Worktree Needed**: The staging directory provides complete file-level isolation without allocating or switching git worktrees. Running dev servers (`npm run dev`, Vite) and editor buffers remain completely undisturbed.
-- **Real Files, Not Markdown Text Diffs**: Never output raw markdown diff blocks (` ```diff `) as a substitute for code changes. Write the actual updated or new source files to the staging directory so they are valid, inspectable files with syntax highlighting and language tooling.
-- **Side-by-Side Review Dashboard (`staged_changes.md`)**: A dedicated review dashboard is maintained with direct clickable links (`file:///`) to both the **staged file** and the **original workspace file**.
-- **Mandatory Conversation ID Output**: Every `/stage` review dashboard (`staged_changes.md`) and summary response **MUST prominently print the active Conversation ID** at the top so the user can easily copy and switch between sessions or use `staged use <session_id>`.
-- **Side-by-Side Graphical Diffing (`staged diff <file>`)**: The user or agent can launch graphical diff tabs directly in their editor with `staged diff <file>` and apply them directly with `staged diff <file> -a`.
-- **Explicit Apply Gating**: No workspace files may be touched until the user explicitly approves or asks to apply.
+Use the returned paths; do not construct editor-specific storage paths. If the harness denies access to the staging root, explain which path needs permission. Installing a skill does not itself grant filesystem access.
 
----
+Run `staged use --session <id>` to select the session for the current working period. Subsequent commands use that binding until you select another session or run `staged use --clear`; you do not need to repeat `--session` on every command.
 
-## 2. Directory Structure
+Keep subsequent commands in the same shell. For an agent harness that starts a fresh shell for each tool call, use the same `STAGED_SHELL_ID` environment value across calls, unique to this conversation. If that is unavailable, run `staged use --session <id>` at the start of each new shell before other staged commands. Explicit `STAGED_SESSION` or `--session` overrides the binding.
 
-Inside the conversation's session directory (e.g. `~/.local/share/stage/<conversation-id>/` or `<appDataDir>/brain/<conversation-id>/`):
+## Write the proposal
 
-```
-<conversation-id>/
-├── staged_changes.md          # Review dashboard summary
-├── .workspace                 # Absolute path to repository root
-├── renames.json               # Optional tracking of moves, renames, and deletions
-└── staging/                   # Staging workspace root (mirrors project paths)
-    ├── src/
-    │   ├── lib/
-    │   │   └── theme.ts       # Staged file on disk
-    │   └── routes/
-    │       └── layout.css     # Staged file on disk
-    └── ...
+Read originals from the workspace. Write complete proposed files under `<staging>/<relative-workspace-path>`, including new files and dotfiles. Preserve executable permissions where relevant. Edit only these copies while preparing or refining the proposal.
+
+Keep metadata beside `staging/`, never inside it:
+
+```text
+<session>/
+  .workspace
+  session.json
+  renames.json
+  staged_changes.md
+  staging/
+    src/example.py
 ```
 
----
+For a rename, write the complete destination file and map its relative destination path to its original path in `renames.json`. For deletion, add the original relative path to `_deletions` without deleting the workspace file:
 
-## 3. Step-by-Step Procedure
+```json
+{
+  "src/new-name.py": "src/old-name.py",
+  "_deletions": ["src/obsolete.py"]
+}
+```
 
-### Step 1: Research & Setup Staging Target
+Preserve unrelated entries when editing the manifest. Use forward-slash relative paths. Symlinks, Git metadata, path traversal and overlapping rename chains are unsupported. A path cannot be both a proposed file and a deletion.
 
-1. Read the target workspace files using read tools (`view_file`, `grep_search`, `list_dir`).
-2. Identify the active conversation session directory:
-   `~/.local/share/stage/<conversation-id>/` (or `<appDataDir>/brain/<conversation-id>/`)
-3. Identify the target paths in the staging directory:
-   `<session-dir>/staging/<relative-workspace-path>`
+Run `staged` to inspect the selected session's proposal. `staged diff <path>` opens review; `--tool cli` requests terminal output. Use exact relative paths when filenames are ambiguous.
 
-### Step 2: Implement Changes in the Staging Workspace
+## Present and refine
 
-1. **Modified Files**: Write the complete updated file to `staging/<relative-path>`. For incremental adjustments, edit only that staged path.
-2. **New Files**: Write the new file directly into `staging/<relative-path>`.
-3. **Renames / Moves**: Update `renames.json` so the new relative path maps to the old workspace path.
-4. **Deletions**: Note pending deletions in `renames.json` under `"_deletions": ["path/..."]`. Do not delete workspace files yet.
+Create or update `<session>/staged_changes.md`. Put the session ID prominently at the top, followed by the origin branch, staging path, changes and validation performed. Link the proposed files and workspace originals using links supported by the host. Include deletions and renames in the review.
 
-### Step 3: Create the Review Dashboard (`staged_changes.md`)
+Include the session ID prominently in the response and offer the concrete review/apply commands:
 
-1. Create or update `staged_changes.md` in `<session-dir>/staged_changes.md`.
-2. Include the mandatory header with the Session ID:
+```text
+staged use --session <id>
+staged
+staged diff <relative-path>
+staged apply all
+```
 
-   ```markdown
-   # Staged Changes Review
+Explain tests that could not run against the isolated proposal. Do not run formatters or generators against the original workspace while staging. If full project validation needs a separate disposable copy, keep it outside the workspace and report where it ran.
 
-   > **Session ID:** `<conversation-id>`  
-   > **Active Branch:** `<branch>`  
-   > **Staging Path:** `<staging-dir>`
+If the user requested review before apply and has not authorized applying, present the proposal and await their decision. Refinements stay in the same staging session.
 
-   Quick Switch: `staged use <conversation-id>`  
-   Quick Apply: `staged diff <filename> -a`
-   ```
+## Apply when authorized
 
-3. Provide a clickable table of all staged files and workspace originals.
+With the intended session selected, run `staged apply <relative-path|all>` for the authorized scope. Do not silently add `--force` or `--yes` when branch protection or a change from the proposal's original Git branch blocks application; explain the concrete branch condition. Existing explicit approval for that condition can be used without asking again.
 
-### Step 4: Await Review & Refine
-
-1. Notify the user that changes are staged, provide the clickable links, and stop.
-2. If refinements are requested, edit files in `staging/` and update `staged_changes.md`.
-3. **Never apply changes to the workspace** until the user explicitly requests it.
-
-### Step 5: Clean Apply
-
-Once approved by the user:
-
-1. Run `staged diff all -a` (or `staged apply all`).
-2. Run project formatting and linting: `npm run format && npm run lint && npm run check`.
+Run the checks appropriate to the project after applying. Report the outcome. Keep the staged proposal until the user requests cleanup; `staged clean` discards proposals and never reverts workspace files.

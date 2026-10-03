@@ -1,87 +1,59 @@
 # @melchi/staged
 
-A staging engine and `/stage` agent skill for different harnesses and IDEs like Cursor, Claude Code, Codex, Antigravity IDE, Zed, Pycharm and CLI. The idea is derived from how we all learned to program: 
-1. You have a puzzle.
-2. You try to do the puzzle yourself.
-3. _Then_ you go check the solution.
+`staged` keeps an agent's proposed edits in real files outside your working tree. Review the differences in your editor, then apply the changes you choose. `/stage` is the accompanying agent skill; neither changes Git's index.
 
-## Overview
+## Install
 
-Proposed work stays out of the workspace until you choose to apply it. The AI agent edits isolated copies on disk, allowing full visual inspection and native side-by-side graphical diffing in your active editor.
+Requires **Python 3.8+**. First, clone the repository:
 
-- **CLI Tool (**`staged`**):** Inspects, compares, and applies changes that are currently *staged*.
-- **Agent Skill (**`/stage`**):** The slash command instructing AI assistants to prepare changes in staging.
-
-## Quick Installation Steps
-
-1. Clone the Repo:
 ```bash
 git clone https://github.com/mdulc928/staged-diff.git
 cd staged-diff
 ```
 
-2. Link the command:
+On **macOS or Linux**, create a symlink:
 
 ```bash
-ln -sfn "$(pwd)/staged" ~/.local/bin/staged
-ln -sfn "$(pwd)/staged" ~/.local/bin/stage
+mkdir -p ~/.local/bin
+ln -s "$(pwd)/staged" ~/.local/bin/staged
 ```
 
-3. Install shell tab-completion (writes completion scripts to `~/.zfunc` / `~/.config/staged/completions` and adds a marked block to your shell rc):
+Ensure `~/.local/bin` is on PATH.
+
+On **Windows** (PowerShell or CMD), create the command launcher instead of a symlink:
+
+```powershell
+py -3 .\staged --install-completion --shell cmd
+```
+
+Add the printed directory (normally `%APPDATA%\staged\bin`) to your **user PATH**, then open a new terminal and run `staged --help`. See [Windows setup](GUIDE.md#windows-launcher) for the steps. Alternatively, `npm install -g .` installs a cross-platform launcher; Python is still required.
+
+Install the agent skill, using Cursor as an example:
 
 ```bash
-staged --install-completion
-# then restart the shell
+staged install-skill --tool cursor --default --configure-sandbox
 ```
 
-Configure `/stage` skill and sandbox write permissions for your editor:
+For other editors and agent harnesses, see [setup in the guide](GUIDE.md#installation-and-agent-setup).
+
+## Review and apply
+
+From your project, ask your agent to **“Use /stage to prepare these changes for review.”** It will create the proposal and report its session ID. Select that session in your terminal:
 
 ```bash
-# For Cursor:
-staged install-skill --tool cursor --default
+staged use --session <id>
+staged                                # see what's proposed
+staged diff src/example.py             # review a file in your editor
+staged diff src/example.py -a          # apply that file when you're ready
+staged diff all                        # review the remaining changes
+staged apply all                       # apply the entire proposal
 
-# For PyCharm (command-line launcher `charm` must be on PATH):
-staged install-skill --tool pycharm --default
-
-# For Zed IDE:
-staged install-skill --tool zed --default
-
-# For Antigravity IDE:
-staged install-skill --tool antigravity --default
-
+# Prefer reviewing in the terminal?
+staged diff src/example.py --tool cli
 ```
 
-## CLI Usage
+Applying to protected branches, or after switching Git branches, requires an explicit override or confirmation; [the guide explains both](GUIDE.md#apply-changes-and-handle-branch-checks).
 
-```bash
-# List all staged files and status ([APPLIED], [MODIFIED], [NEW FILE], [RENAMED], [RELOCATED]):
-staged
+**The tool does more:** compare sessions, migrate proposals, configure editors, clean up files, and more. See [GUIDE.md](GUIDE.md) for detailed instructions, examples, and troubleshooting, or run `staged --help`.
 
-# Open side-by-side diff in your IDE (fuzzy matched):
-staged diff Player.svelte
-
-# Apply a single staged file immediately to your workspace:
-staged diff Player.svelte -a
-
-# Open diffs for all modified files:
-staged diff all
-
-# Apply all staged files:
-staged diff all -a
-
-# Diff the same file between two conversation sessions:
-staged diff --between <session-1> <session-2> Player.svelte
-
-# Print raw absolute path on disk:
-staged path Player.svelte
-
-# Selectively clean only 1 staged file:
-staged clean -f Player.svelte
-
-# Purge the current session's staging directory:
-staged clean
-
-# Lock active session for current shell instance:
-staged use <session-id>
-
-```
+<!-- Add your three thank-you links below. -->
