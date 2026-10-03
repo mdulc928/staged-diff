@@ -23,8 +23,8 @@ cd staged-diff
 2. Link the command:
 
 ```bash
-ln -sfn "$(pwd)/scripts/staged" ~/.local/bin/staged
-ln -sfn "$(pwd)/scripts/staged" ~/.local/bin/stage
+ln -sfn "$(pwd)/staged" ~/.local/bin/staged
+ln -sfn "$(pwd)/staged" ~/.local/bin/stage
 ```
 
 3. Install shell tab-completion (writes completion scripts to `~/.zfunc` / `~/.config/staged/completions` and adds a marked block to your shell rc):

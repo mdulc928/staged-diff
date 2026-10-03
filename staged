@@ -18,7 +18,8 @@ import textwrap
 from pathlib import Path
 
 HOME = os.path.expanduser("~")
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_script_dir = os.path.dirname(os.path.realpath(__file__))
+REPO_ROOT = os.path.dirname(_script_dir) if os.path.basename(_script_dir) == "scripts" else _script_dir
 DEFAULT_STAGING_ROOT = os.path.join(HOME, ".local", "share", "stage")
 LEGACY_CURSOR_ROOT = os.path.join(HOME, ".local", "share", "cursor-artifact-staging")
 LEGACY_ANTIGRAVITY_ROOT = os.path.join(HOME, ".gemini", "antigravity-ide", "brain")
@@ -284,7 +285,7 @@ class ToolAdapter:
 TOOL_REGISTRY = {
     "cursor": ToolAdapter(
         "cursor", "Cursor",
-        "~/.local/share/cursor-artifact-staging",
+        "~/.local/share/stage",
         ["cursor", "-r", "--diff", "{orig}", "{staged}"],
         ["cursor", "-r", "{staged}"]
     ),
@@ -1203,9 +1204,8 @@ def run_install_skill(tool_name, is_default=False):
         sys.exit(1)
 
     print(f"Installing /stage skill for {tool.name}...")
-    if tool_name == "cursor":
-        skill_src = os.path.join(REPO_ROOT, "skills", "cursor", "SKILL.md")
-    else:
+    skill_src = os.path.join(REPO_ROOT, "skills", normalize_tool_id(tool_name), "SKILL.md")
+    if not os.path.isfile(skill_src):
         skill_src = os.path.join(REPO_ROOT, "SKILL.md")
     if not os.path.isfile(skill_src):
         print(f"Error: Skill source not found: {skill_src}")
