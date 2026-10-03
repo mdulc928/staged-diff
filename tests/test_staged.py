@@ -1,0 +1,490 @@
+"""CLI contract tests: every process uses an isolated home, staging root and Git repository."""
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+SCRIPT = Path(__file__).resolve().parents[1] / 'staged'
+loader = importlib.machinery.SourceFileLoader('staged_module', str(SCRIPT))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+staged = importlib.util.module_from_spec(spec)
+loader.exec_module(staged)
+
+
+class CLI(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='staged-test-')
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name).resolve()
+        self.home = self.base / 'home'
+        self.repo = self.base / 'repo'
+        self.root = self.base / 'proposals'
+        self.config = self.home / ('AppData/Roaming/staged' if os.name == 'nt' else '.config/staged')
+        for path in (self.home, self.repo):
+            path.mkdir()
+        self.env = dict(os.environ)
+        for key in list(self.env):
+            if key.startswith(('STAGED_', 'STAGE_', 'GIT_')):
+                self.env.pop(key)
+        self.env.update(HOME=str(self.home), USERPROFILE=str(self.home),
+                        XDG_CONFIG_HOME=str(self.home / '.config'), XDG_DATA_HOME=str(self.home / '.local/share'),
+                        APPDATA=str(self.home / 'AppData/Roaming'), LOCALAPPDATA=str(self.home / 'AppData/Local'),
+                        STAGED_ROOT=str(self.root), STAGED_TOOL='cli', STAGED_SHELL_ID='test-shell',
+                        GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        self.git('init', '-q')
+        self.git('symbolic-ref', 'HEAD', 'refs/heads/feature/test')
+        self.git('config', 'user.name', 'Test')
+        self.git('config', 'user.email', 'test@example.invalid')
+        (self.repo / 'existing.txt').write_text('original\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'initial')
+
+    def git(self, *args):
+        return subprocess.run(['git', '-C', str(self.repo)] + list(args), env=self.env,
+                              capture_output=True, text=True, check=True)
+
+    def run_cli(self, *args, ok=True, cwd=None, env=None):
+        result = subprocess.run([sys.executable, str(SCRIPT)] + list(args), cwd=cwd or self.repo,
+                                env=env or self.env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if ok:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        else:
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def init(self, key='session-a'):
+        result = self.run_cli('init', key, '--json')
+        return Path(json.loads(result.stdout)['staging'])
+
+    def propose(self, key='session-a', rel='existing.txt', text='proposed\n'):
+        path = self.init(key) / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def manifest(self, data, key='session-a'):
+        (self.root / key / 'renames.json').write_text(json.dumps(data))
+
+    def test_init_creates_metadata_outside_workspace(self):
+        self.init()
+        self.assertEqual(self.git('status', '--porcelain').stdout, '')
+        metadata = json.loads((self.root / 'session-a/session.json').read_text())
+        self.assertEqual(metadata['branch'], 'feature/test')
+        self.run_cli('init', '../escape', ok=False)
+        self.run_cli('init', 'unsafe', '--root', str(self.repo / 'proposals'), ok=False)
+
+    def test_help_never_runs_or_requires_arguments(self):
+        self.propose()
+        before = (self.root / 'session-a/staging/existing.txt').read_bytes()
+        for cmd in staged.COMMANDS:
+            self.assertIn('usage:', self.run_cli(cmd, '--help').stdout)
+        self.assertIn('usage:', self.run_cli('clean', '-f', '--help').stdout)
+        self.assertEqual((self.root / 'session-a/staging/existing.txt').read_bytes(), before)
+
+    def test_unknown_and_missing_flags_fail_without_cleaning(self):
+        path = self.propose()
+        for args in [('clean', '-f'), ('clean', '--typo'), ('path',), ('migrate',), ('nonsense',)]:
+            self.run_cli(*args, ok=False)
+            self.assertTrue(path.exists())
+
+    def test_exact_apply_does_not_apply_substrings(self):
+        self.propose(rel='existing.txt')
+        other = self.root / 'session-a/staging/existing.txt.backup'
+        other.write_text('other')
+        self.run_cli('diff', 'existing.txt', '-a')
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'proposed\n')
+        self.assertFalse((self.repo / 'existing.txt.backup').exists())
+
+    def test_ambiguous_apply_and_clean_do_not_mutate(self):
+        self.propose(rel='a/file.txt')
+        self.propose(rel='b/file.txt')
+        for command in [('apply', 'file.txt'), ('clean', '-f', 'file.txt', '-y'), ('path', 'file.txt')]:
+            self.assertIn('Ambiguous', self.run_cli(*command, ok=False).stderr)
+        self.assertFalse((self.repo / 'a').exists())
+        self.assertTrue((self.root / 'session-a/staging/a/file.txt').exists())
+
+    def test_fuzzy_subsequence_and_typo(self):
+        self.propose(rel='src/Player.svelte')
+        for query in ['pysv', 'Playre.svelte']:
+            self.assertEqual(Path(self.run_cli('path', query).stdout.strip()).parts[-2:], ('src', 'Player.svelte'))
+
+    def test_whitespace_and_binary_changes_are_not_applied(self):
+        path = self.propose(text='original\n\n')
+        self.assertIn('MODIFIED', self.run_cli().stdout)
+        path.write_bytes(b'\xff')
+        (self.repo / 'existing.txt').write_bytes(b'\xfe')
+        self.assertIn('MODIFIED', self.run_cli().stdout)
+
+    def test_hidden_files_are_proposals(self):
+        self.propose(rel='.env.example', text='FOO=bar\n')
+        self.run_cli('apply', '.env.example')
+        self.assertEqual((self.repo / '.env.example').read_text(), 'FOO=bar\n')
+
+    def test_deletion_only_session_lists_reviews_and_applies(self):
+        self.init()
+        self.manifest({'_deletions': ['existing.txt']})
+        self.assertIn('DELETED', self.run_cli().stdout)
+        self.assertIn('-original', self.run_cli('diff', 'existing.txt').stdout)
+        self.run_cli('apply', 'existing.txt')
+        self.assertFalse((self.repo / 'existing.txt').exists())
+        self.assertIn('APPLIED', self.run_cli().stdout)
+
+    def test_rename_removes_source_even_when_destination_matches(self):
+        self.propose(rel='renamed.txt')
+        (self.repo / 'renamed.txt').write_text('proposed\n')
+        self.manifest({'renamed.txt': 'existing.txt'})
+        self.assertIn('RENAMED', self.run_cli().stdout)
+        self.run_cli('apply', 'all')
+        self.assertFalse((self.repo / 'existing.txt').exists())
+        self.assertIn('APPLIED', self.run_cli().stdout)
+
+    @unittest.skipIf(os.name == 'nt', 'Symlink privileges depend on host configuration')
+    def test_apply_preflights_entire_batch(self):
+        self.propose()
+        (self.root / 'session-a/staging/zzz').symlink_to(self.repo / 'existing.txt')
+        self.run_cli('apply', 'all', ok=False)
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
+
+    def test_path_traversal_manifest_is_rejected(self):
+        self.propose()
+        outside = self.base / 'outside'
+        outside.write_text('safe')
+        for manifest in [{'existing.txt': '../../outside'}, {'_deletions': ['../../outside']}, {'_deletions': ['/etc/passwd']}]:
+            self.manifest(manifest)
+            self.run_cli('apply', 'all', ok=False)
+            self.assertEqual(outside.read_text(), 'safe')
+
+    @unittest.skipIf(os.name == 'nt', 'Symlink privileges depend on host configuration')
+    def test_workspace_symlink_cannot_be_overwritten(self):
+        self.propose(rel='linked/file.txt')
+        (self.repo / 'linked').symlink_to(self.home, target_is_directory=True)
+        self.run_cli('apply', 'all', ok=False)
+        self.assertFalse((self.home / 'file.txt').exists())
+
+    def test_git_metadata_is_rejected(self):
+        self.propose(rel='.git/config')
+        self.run_cli('apply', 'all', ok=False)
+        self.assertEqual(self.git('config', 'user.name').stdout.strip(), 'Test')
+
+    def test_branch_protection_and_repo_override(self):
+        self.propose()
+        self.git('checkout', '-qb', 'main')
+        self.assertIn('Protected branch', self.run_cli('apply', 'all', ok=False).stderr)
+        self.assertIn('Branch changed', self.run_cli('apply', 'all', '--force', ok=False).stderr)
+        self.run_cli('apply', 'all', '--force', '--yes')
+        self.run_cli('set', '--repo', '--branch-protection', 'false')
+        self.propose(text='next')
+        self.run_cli('apply', 'all', '--yes')
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'next')
+
+    def test_custom_branch_patterns(self):
+        self.propose()
+        self.run_cli('set', '--repo', '--protected-branch', 'feature/*')
+        self.run_cli('apply', 'all', ok=False)
+        self.run_cli('apply', 'all', '--force')
+
+    def test_clean_removes_tracking_not_workspace(self):
+        path = self.propose(rel='renamed.txt')
+        self.manifest({'renamed.txt': 'existing.txt', '_deletions': ['other.txt']})
+        self.run_cli('clean', '-f', 'renamed.txt', ok=False)
+        self.run_cli('clean', '-f', 'renamed.txt', '-y')
+        self.assertFalse(path.exists())
+        self.assertEqual(json.loads((self.root / 'session-a/renames.json').read_text()), {'_deletions': ['other.txt']})
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
+        self.run_cli('clean', '-y')
+        self.assertEqual(json.loads((self.root / 'session-a/renames.json').read_text()), {})
+
+    def test_path_flags_and_subdirectory_workspace(self):
+        path = self.propose()
+        nested = self.repo / 'nested'
+        nested.mkdir()
+        self.assertEqual(self.run_cli('path', '-s', 'existing.txt', cwd=nested).stdout.strip(), str(path))
+        self.assertEqual(self.run_cli('path', '-w', 'existing.txt', cwd=nested).stdout.strip(), str(self.repo / 'existing.txt'))
+        self.assertEqual(self.run_cli('-s', 'session-a', 'path', 'existing.txt', cwd=nested).stdout.strip(), str(path))
+
+    def test_use_session_flag_persists_until_switched_or_cleared(self):
+        self.propose('one', text='one')
+        self.propose('two', text='two')
+        self.run_cli('set', '--default-session', 'two')
+        self.run_cli('use', '--session', 'one')
+        for _ in range(2):
+            self.assertIn('one', Path(self.run_cli('path', 'existing.txt').stdout.strip()).parts)
+        self.run_cli('use', '--session', 'two')
+        self.assertIn('two', Path(self.run_cli('path', 'existing.txt').stdout.strip()).parts)
+        self.run_cli('use', '--session', 'one')
+        self.run_cli('use', '--clear')
+        self.assertIn('two', Path(self.run_cli('path', 'existing.txt').stdout.strip()).parts)
+
+    def test_use_session_conflicts_preserve_binding(self):
+        self.propose('one')
+        self.propose('two')
+        self.run_cli('use', '--session', 'one')
+        for args in [('use', '--session', 'two', '--clear'),
+                     ('use', 'one', '--session', 'two'), ('use', '--session', 'missing')]:
+            self.run_cli(*args, ok=False)
+            self.assertIn('one', Path(self.run_cli('path', 'existing.txt').stdout.strip()).parts)
+
+    def test_state_precedence(self):
+        self.propose('one', text='one')
+        self.propose('two', text='two')
+        env = dict(self.env, STAGED_SESSION='one')
+        self.assertIn('one', Path(self.run_cli('path', 'existing.txt', env=env).stdout.strip()).parts)
+        self.assertIn('two', Path(self.run_cli('path', 'existing.txt', '--session', 'two', env=env).stdout.strip()).parts)
+        self.run_cli('use', '--clear')
+        self.run_cli('set', '--default-session', 'one')
+        self.assertIn('one', Path(self.run_cli('path', 'existing.txt').stdout.strip()).parts)
+        self.run_cli('set', '--repo', '--default-session', 'two')
+        self.assertIn('two', Path(self.run_cli('path', 'existing.txt').stdout.strip()).parts)
+
+    def test_session_prefix_ambiguity_and_exact_match(self):
+        self.propose('abc')
+        self.propose('abcd')
+        self.assertIn('abc', Path(self.run_cli('path', 'existing.txt', '--session', 'abc').stdout.strip()).parts)
+        self.run_cli('path', 'existing.txt', '--session', 'ab', ok=False)
+
+    def test_cross_session_compares_same_relative_file(self):
+        self.propose('one', rel='a/file.txt', text='one\n')
+        self.propose('two', rel='b/file.txt', text='two\n')
+        self.run_cli('diff', '--between', 'one', 'two', 'file.txt', ok=False)
+        self.propose('two', rel='a/file.txt', text='two\n')
+        self.assertIn('-one', self.run_cli('diff', '--between', 'one', 'two', 'a/file.txt').stdout)
+        self.assertIn('+two', self.run_cli('diff', 'a/file.txt', '-s', 'one', '--compare-session', 'two').stdout)
+        self.run_cli('diff', '--between', 'one', 'two', '-a', ok=False)
+
+    def test_migrate_files_renames_deletions_and_metadata(self):
+        self.propose('source', rel='renamed.txt')
+        self.manifest({'renamed.txt': 'existing.txt', '_deletions': ['obsolete.txt']}, 'source')
+        self.run_cli('migrate', '--from', 'source', '--to', 'dest')
+        self.assertTrue((self.root / 'dest/staging/renamed.txt').exists())
+        self.assertEqual(json.loads((self.root / 'dest/renames.json').read_text()),
+                         {'renamed.txt': 'existing.txt', '_deletions': ['obsolete.txt']})
+        self.assertEqual(json.loads((self.root / 'dest/session.json').read_text())['migrated_from'][0]['session'], 'source')
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
+
+    def test_migrate_conflict_and_newer_workspace(self):
+        path = self.propose('source', text='old proposal')
+        self.propose('dest', text='new proposal')
+        self.run_cli('migrate', '--from', 'source', '--to', 'dest', ok=False)
+        self.assertEqual((self.root / 'dest/staging/existing.txt').read_text(), 'new proposal')
+        self.run_cli('migrate', '--from', 'source', '--to', 'dest', '--force')
+        os.utime(path, (1, 1))
+        self.run_cli('migrate', '--from', 'source', '--to', 'fresh', ok=False)
+        self.assertFalse((self.root / 'fresh/staging/existing.txt').exists())
+
+    def test_custom_adapter_templates_and_failures(self):
+        self.propose()
+        recorder = self.base / 'record.py'
+        log = self.base / 'args.json'
+        recorder.write_text('import json,sys\nfrom pathlib import Path\nPath(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))\n')
+        import shlex
+        template = '{} {} {} "left={{orig}}" "right={{staged}}"'.format(
+            shlex.quote(sys.executable), shlex.quote(str(recorder)), shlex.quote(str(log)))
+        self.run_cli('set-tool', 'record', '--name', 'Recorder', '--diff-cmd', template,
+                     '--open-cmd', '{} {}'.format(shlex.quote(sys.executable), '{staged}'))
+        self.run_cli('diff', 'existing.txt', '--tool', 'record')
+        args = json.loads(log.read_text())
+        self.assertEqual(args[0], 'left=' + str(self.repo / 'existing.txt'))
+        self.assertEqual(args[1], 'right=' + str(self.root / 'session-a/staging/existing.txt'))
+        self.run_cli('--tool', 'missing', ok=False)
+
+    def test_supported_skill_installation(self):
+        for tool, path in [('cursor', '.cursor/skills'), ('codex', '.agents/skills'),
+                           ('claudecode', '.claude/skills'), ('windsurf', '.codeium/windsurf/skills'),
+                           ('antigravity', '.gemini/config/skills')]:
+            self.run_cli('install-skill', '--tool', tool)
+            self.assertTrue((self.home / path / 'stage/SKILL.md').is_file())
+        self.run_cli('install-skill', '--tool', 'zed', ok=False)
+        self.run_cli('install-skill', '--tool', 'zed', '--target-dir', str(self.home / 'custom/stage'))
+        self.assertTrue((self.home / 'custom/stage/SKILL.md').is_file())
+
+    def test_cursor_sandbox_merge_preserves_existing_config(self):
+        path = self.home / '.cursor/sandbox.json'
+        path.parent.mkdir()
+        path.write_text(json.dumps({'networkPolicy': {'default': 'deny'}, 'additionalReadwritePaths': ['/existing']}))
+        for _ in range(2):
+            self.run_cli('install-skill', '--tool', 'cursor', '--configure-sandbox')
+        data = json.loads(path.read_text())
+        self.assertEqual(data['networkPolicy'], {'default': 'deny'})
+        self.assertEqual(data['additionalReadwritePaths'], ['/existing', str(self.root)])
+        cli = json.loads((path.parent / 'cli-config.json').read_text())
+        self.assertEqual(len(cli['permissions']['allow']), 2)
+
+    def test_completion_scripts_are_idempotent_and_parse(self):
+        for shell in ['bash', 'zsh', 'powershell', 'cmd']:
+            for _ in range(2):
+                self.run_cli('--install-completion', '--shell', shell)
+        self.assertEqual((self.home / '.bashrc').read_text().count(staged.COMPLETION_MARKER_START), 1)
+        self.assertEqual((self.home / '.zshrc').read_text().count(staged.COMPLETION_MARKER_START), 1)
+        directory = self.config / 'completions'
+        for shell, filename in [('bash', 'staged.bash'), ('zsh', '_staged')]:
+            if os.name != 'nt' and shutil.which(shell):
+                subprocess.run([shell, '-n', str(directory / filename)], check=True, capture_output=True)
+
+    def test_corrupt_config_and_manifest_are_not_silently_ignored(self):
+        self.propose()
+        (self.root / 'session-a/renames.json').write_text('{invalid')
+        self.assertIn('Cannot read', self.run_cli('apply', 'all', ok=False).stderr)
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
+
+    def test_no_implicit_discovery_of_old_roots(self):
+        old = self.home / '.cursor/artifact-staging/old'
+        (old / 'staging').mkdir(parents=True)
+        (old / '.workspace').write_text(str(self.repo))
+        (old / 'staging/existing.txt').write_text('old')
+        self.assertNotIn('old', self.run_cli('--sessions').stdout)
+        self.run_cli('set', '--session-root', str(old.parent))
+        self.assertIn('old', self.run_cli('--sessions').stdout)
+
+    def test_migration_preflights_target_before_copying(self):
+        self.propose('source', rel='aaa.txt')
+        self.propose('source', rel='nested/child.txt')
+        target = self.init('dest')
+        (target / 'nested').write_text('keep')
+        self.run_cli('migrate', '--from', 'source', '--to', 'dest', '--force', ok=False)
+        self.assertFalse((target / 'aaa.txt').exists())
+        self.assertEqual((target / 'nested').read_text(), 'keep')
+
+    def test_migration_glob_transfers_only_selected_files(self):
+        self.propose('source', rel='src/a.py')
+        self.propose('source', rel='src/b.py')
+        self.propose('source', rel='docs.txt')
+        self.run_cli('migrate', '--from', 'source', '--to', 'dest', '--file', 'src/*.py')
+        self.assertEqual(sorted(p.name for p in (self.root / 'dest/staging/src').iterdir()), ['a.py', 'b.py'])
+        self.assertFalse((self.root / 'dest/staging/docs.txt').exists())
+
+    def test_migration_retains_origin_branch_guard(self):
+        self.propose('source')
+        self.git('checkout', '-qb', 'feature/other')
+        self.run_cli('migrate', '--from', 'source', '--to', 'dest')
+        result = self.run_cli('apply', 'all', '--session', 'dest', ok=False)
+        self.assertIn('Branch changed', result.stderr)
+        self.run_cli('apply', 'all', '--session', 'dest', '--yes')
+
+    def test_rename_chain_is_rejected_before_any_copy(self):
+        self.propose(rel='a.txt')
+        self.propose(rel='b.txt')
+        self.manifest({'a.txt': 'existing.txt', 'b.txt': 'a.txt'})
+        self.run_cli('apply', 'all', ok=False)
+        self.run_cli('apply', 'b.txt', ok=False)
+        self.assertFalse((self.repo / 'a.txt').exists())
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
+
+    def test_contradictory_deletion_does_not_modify_workspace(self):
+        self.propose()
+        self.manifest({'_deletions': ['existing.txt']})
+        self.run_cli('apply', 'all', ok=False)
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
+
+    def test_inventory_refreshes_after_external_edits(self):
+        self.propose()
+        self.run_cli()
+        self.propose(rel='added.txt')
+        (self.root / 'session-a/staging/existing.txt').unlink()
+        self.assertEqual(self.run_cli('--list').stdout.strip(), 'added.txt')
+        self.run_cli()
+        records = json.loads((self.root / 'session-a/.index.json').read_text())['files']
+        self.assertEqual([r['path'] for r in records], ['added.txt'])
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX executable bit semantics')
+    def test_permission_changes_are_pending_and_preserved(self):
+        path = self.propose(text='original\n')
+        path.chmod(0o755)
+        self.assertIn('MODIFIED', self.run_cli().stdout)
+        self.run_cli('apply', 'all')
+        self.assertEqual((self.repo / 'existing.txt').stat().st_mode & 0o777, 0o755)
+
+    def test_generated_empty_review_file_survives_editor_launch(self):
+        self.propose(rel='new.txt')
+        self.run_cli('diff', 'new.txt')
+        empty = self.root / 'session-a/.review/empty/new.txt'
+        self.assertTrue(empty.is_file())
+        self.assertEqual(empty.read_bytes(), b'')
+
+    def test_missing_rename_contents_block_apply_but_can_be_cleaned(self):
+        self.propose()
+        self.manifest({'missing.txt': 'original-name.txt'})
+        self.assertIn('MISSING', self.run_cli().stdout)
+        self.run_cli('apply', 'all', ok=False)
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
+        self.run_cli('clean', '-f', 'missing.txt', '--yes')
+        self.assertEqual(json.loads((self.root / 'session-a/renames.json').read_text()), {})
+
+    def test_mutations_rescan_even_if_index_omits_a_file(self):
+        self.propose()
+        self.run_cli()
+        index = self.root / 'session-a/.index.json'
+        data = json.loads(index.read_text())
+        data['files'] = []
+        index.write_text(json.dumps(data))
+        self.run_cli('apply', 'all')
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'proposed\n')
+
+    def test_malformed_index_falls_back_to_filesystem(self):
+        self.propose()
+        (self.root / 'session-a/.index.json').write_text('{broken')
+        self.assertEqual(self.run_cli('--list').stdout.strip(), 'existing.txt')
+
+    def test_valid_index_reuses_inventory_without_tree_scan(self):
+        self.propose()
+        session = staged.Session(self.root / 'session-a')
+        session.refresh_index()
+        with patch.object(staged.os, 'walk', side_effect=AssertionError('unexpected scan')):
+            self.assertEqual(list(session.files()), ['existing.txt'])
+
+    def test_npm_launcher_uses_same_engine(self):
+        if not shutil.which('node'):
+            self.skipTest('Node is optional')
+        result = subprocess.run(['node', str(SCRIPT.parent / 'bin/staged.cjs'), 'init', 'npm-session', '--json'],
+                                env=self.env, cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['session'], 'npm-session')
+
+    def test_non_git_workspace_and_spaces(self):
+        workspace = self.base / 'workspace with spaces'
+        workspace.mkdir()
+        result = self.run_cli('init', 'non-git', '--json', cwd=workspace)
+        directory = Path(json.loads(result.stdout)['staging'])
+        (directory / 'file with spaces.txt').write_text('proposal')
+        self.run_cli('apply', 'file with spaces.txt', cwd=workspace)
+        self.assertEqual((workspace / 'file with spaces.txt').read_text(), 'proposal')
+
+
+class Unit(unittest.TestCase):
+    def test_windows_batch_arguments_are_quoted_without_shell_interpolation(self):
+        with patch.object(staged.os, 'name', 'nt'), patch.object(staged.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+            staged.run_editor(['C:/Program Files/editor.cmd', 'C:/work/file with spaces.txt'])
+            command = run.call_args[0][0]
+            self.assertIsInstance(command, str)
+            self.assertIn('/d /s /c ""C:/Program Files/editor.cmd" "C:/work/file with spaces.txt""', command)
+            with self.assertRaises(staged.StagedError):
+                staged.run_editor(['editor.cmd', '%UNTRUSTED%'])
+
+    def test_shell_block_preserves_backslashes_on_repeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'profile'
+            block = staged.COMPLETION_MARKER_START + '\n' + r'C:\Users\Example\script' + '\n' + staged.COMPLETION_MARKER_END
+            staged.upsert_shell_block(str(path), block)
+            staged.upsert_shell_block(str(path), block)
+            self.assertEqual(path.read_text().strip(), block)
+
+    def test_open_command_uses_its_own_executable(self):
+        adapter = staged.ToolAdapter('test', 'Test', ['diff-bin', '{orig}', '{staged}'], ['open-bin', '{staged}'])
+        with patch.object(adapter, 'detect_binary', side_effect=lambda command=None: '/bin/' + command):
+            self.assertEqual(adapter.get_open_command('file'), ['/bin/open-bin', 'file'])
+
+    def test_terminal_diff_exit_one_is_success(self):
+        with patch.object(staged.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)):
+            staged.run_editor(['git'], terminal=True)
+            with self.assertRaises(staged.StagedError):
+                staged.run_editor(['editor'])
+
+
+if __name__ == '__main__':
+    unittest.main()
