@@ -1,172 +1,769 @@
 #!/usr/bin/env python3
-"""
-staged: Universal side-by-side diff launcher and staging manager.
-Pure Python 3 standard library implementation.
-Supports: Cursor, Antigravity IDE, Windsurf, VS Code, JetBrains, Zed, Claude Code, Codex, CLI.
-"""
-
-import os
-import sys
-import json
+"""Isolated proposal files, explicit review and apply. Python 3.8+; no dependencies."""
+import argparse
+import fnmatch
 import glob
-import shutil
-import subprocess
+import json
+import os
+from pathlib import Path, PureWindowsPath
 import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
 import time
-import filecmp
-import textwrap
-from pathlib import Path
+import uuid
 
-HOME = os.path.expanduser("~")
-_script_dir = os.path.dirname(os.path.realpath(__file__))
-REPO_ROOT = os.path.dirname(_script_dir) if os.path.basename(_script_dir) == "scripts" else _script_dir
-DEFAULT_STAGING_ROOT = os.path.join(HOME, ".local", "share", "stage")
-LEGACY_CURSOR_ROOT = os.path.join(HOME, ".local", "share", "cursor-artifact-staging")
-LEGACY_ANTIGRAVITY_ROOT = os.path.join(HOME, ".gemini", "antigravity-ide", "brain")
+HOME = str(Path.home())
+REPO_ROOT = Path(__file__).resolve().parent
+CONFIG_DIR = Path(os.environ.get('XDG_CONFIG_HOME', Path(HOME) / '.config')) / 'staged'
+DATA_DIR = Path(os.environ.get('XDG_DATA_HOME', Path(HOME) / '.local/share')) / 'staged'
+if os.name == 'nt':
+    CONFIG_DIR = Path(os.environ.get('APPDATA', HOME)) / 'staged'
+    DATA_DIR = Path(os.environ.get('LOCALAPPDATA', HOME)) / 'staged'
+GLOBAL_STATE_FILE = CONFIG_DIR / 'state.json'
+DEFAULT_PROTECTED_BRANCHES = ['main', 'master', 'production', 'release/*', 'staging', 'develop']
+COMMANDS = ['init', 'diff', 'apply', 'clean', 'path', 'use', 'set', 'set-tool', 'migrate', 'install-skill']
+COMPLETION_MARKER_START = '# >>> staged completions >>>'
+COMPLETION_MARKER_END = '# <<< staged completions <<<'
 
-CONFIG_DIR = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config", "staged")
-GLOBAL_STATE_DIR = os.path.join(HOME, ".staged-diff")
-GLOBAL_STATE_FILE = os.path.join(GLOBAL_STATE_DIR, "state.json")
-SHELL_SESSIONS_DIR = os.path.join(GLOBAL_STATE_DIR, "shell_sessions")
 
-DEFAULT_PROTECTED_BRANCHES = ["main", "master", "production", "release/*", "staging", "develop"]
+class StagedError(Exception):
+    pass
 
-STATUS_COLORS = {
-    "APPLIED": "32",   # Green
-    "MODIFIED": "33",  # Yellow
-    "NEW FILE": "36",  # Cyan
-    "RENAMED": "35",   # Magenta
-    "RELOCATED": "35", # Magenta
-}
 
-SUBCOMMANDS = {
-    "diff", "apply", "clean", "rename", "path", "use",
-    "set", "set-tool", "migrate", "install-skill", "help"
-}
-
-# --- Styling & Output Helpers ---
-
-def colorize(text, color_code):
-    if sys.stdout.isatty():
-        return f"\033[{color_code}m{text}\033[0m"
-    return text
-
-def colorize_placeholders(text):
-    return "".join(
-        colorize(part, "33") if part.startswith("<") and part.endswith(">") else part
-        for part in re.split(r"(<[^>]+>)", text)
-    )
-
-def colorize_usage_invocation(invocation, program):
-    def paint(token):
-        if token == program or token in ("stage", "staged", "staged-diff"):
-            return colorize(token, "1;36")
-        if token in SUBCOMMANDS or token == "all":
-            return colorize(token, "1")
-        if token.startswith("<") and token.endswith(">"):
-            return colorize(token, "33")
-        if token.startswith("--") or re.fullmatch(r"-[A-Za-z],?", token):
-            return colorize(token, "36")
-        if token.startswith("[") and token.endswith("]") and "|" in token:
-            inner = token[1:-1]
-            painted = "|".join(
-                colorize(part, "36") if part.startswith("-") else part
-                for part in inner.split("|")
-            )
-            return "[" + painted + "]"
-        return token
-
-    return "".join(
-        paint(token) if not token.isspace() else token
-        for token in re.findall(r"\s+|\S+", invocation)
-    )
-
-def print_usage_line(line, program="staged"):
-    gaps = list(re.finditer(r" {2,}(?=[A-Z])", line))
-    if not gaps:
-        print(colorize_usage_invocation(line, program))
-        return
-    gap = gaps[-1]
-    print(
-        f"{colorize_usage_invocation(line[:gap.start()], program)}"
-        f"{gap.group(0)}{line[gap.end():]}"
-    )
-
-def print_status_legend(status, description):
-    tag = f"[{status}]"
-    print(f"  {colorize(tag, STATUS_COLORS[status])}{' ' * (13 - len(tag))}{description}")
-
-def format_relative_time(ts):
-    now = time.time()
-    diff = max(0, now - ts)
-    if diff < 60:
-        return "just now"
-    elif diff < 3600:
-        return f"{int(diff / 60)}m ago"
-    elif diff < 86400:
-        return f"{int(diff / 3600)}h ago"
-    else:
-        return f"{int(diff / 86400)}d ago"
-
-def is_file_equal(path1, path2):
-    if not (path1 and path2 and os.path.isfile(path1) and os.path.isfile(path2)):
-        return False
+def load_json(path):
+    path = Path(path)
+    if not path.exists():
+        return {}
     try:
-        if filecmp.cmp(path1, path2, shallow=False):
-            return True
-        with open(path1, "r", encoding="utf-8", errors="replace") as f1, \
-             open(path2, "r", encoding="utf-8", errors="replace") as f2:
-            c1 = f1.read().replace("\r\n", "\n").rstrip()
-            c2 = f2.read().replace("\r\n", "\n").rstrip()
-            if c1 == c2:
-                return True
-            lines1 = [l.strip() for l in c1.splitlines() if l.strip()]
-            lines2 = [l.strip() for l in c2.splitlines() if l.strip()]
-            return lines1 == lines2
-    except Exception:
-        return False
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (ValueError, OSError) as exc:
+        raise StagedError('Cannot read {}: {}'.format(path, exc))
+    if not isinstance(data, dict):
+        raise StagedError('Expected a JSON object in {}'.format(path))
+    return data
 
-# --- Git Helpers ---
+
+def write_text_file(path, content):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.staged-', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(content)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def save_json(path, data):
+    write_text_file(path, json.dumps(data, indent=2) + '\n')
+
+
+def git_output(path, *args):
+    try:
+        result = subprocess.run(['git', '-C', str(path)] + list(args), capture_output=True, text=True)
+        return result.stdout.strip() if result.returncode == 0 else None
+    except OSError:
+        return None
+
 
 def get_git_root(path):
-    try:
-        res = subprocess.run(
-            ["git", "-C", path, "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=True
-        )
-        out = os.path.realpath(res.stdout.strip())
-        if out == os.path.realpath(HOME):
-            return None
-        return out
-    except Exception:
-        return None
+    value = git_output(path, 'rev-parse', '--show-toplevel')
+    return Path(value).resolve() if value else None
+
 
 def get_git_branch(path):
+    return git_output(path, 'symbolic-ref', '--quiet', '--short', 'HEAD') or git_output(path, 'rev-parse', 'HEAD')
+
+
+def is_branch_protected(branch, patterns=None):
+    return bool(branch and any(fnmatch.fnmatchcase(branch, p) for p in
+                              (DEFAULT_PROTECTED_BRANCHES if patterns is None else patterns)))
+
+
+def safe_path(root, relative):
+    """Reject traversal, metadata paths and symlinks before reading or mutating files."""
+    if not isinstance(relative, str) or not relative or '\\' in relative:
+        raise StagedError('Invalid relative path: {!r}'.format(relative))
+    part = Path(relative)
+    if part.is_absolute() or PureWindowsPath(relative).drive or '..' in part.parts or not part.parts:
+        raise StagedError('Path must stay inside its root: {}'.format(relative))
+    if part.as_posix() != relative:
+        raise StagedError('Use a normalized relative path: {}'.format(relative))
+    if os.name == 'nt' and any(PureWindowsPath(p).is_reserved() or ':' in p or p.endswith(('.', ' ')) for p in part.parts):
+        raise StagedError('Unsupported Windows file path: ' + relative)
+    if any(p.lower() == '.git' for p in part.parts):
+        raise StagedError('Git metadata cannot be staged: {}'.format(relative))
+    root = Path(root).resolve()
+    dest = root
+    for component in part.parts:
+        dest = dest / component
+        if dest.is_symlink():
+            raise StagedError('Symlink paths are not supported: {}'.format(dest))
     try:
-        res = subprocess.run(
-            ["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True, check=True
-        )
-        return res.stdout.strip()
-    except Exception:
+        dest.resolve().relative_to(root)
+    except ValueError:
+        raise StagedError('Path escapes root: {}'.format(relative))
+    return dest
+
+
+def equal_files(left, right):
+    left, right = Path(left), Path(right)
+    if not left.is_file() or not right.is_file() or left.stat().st_size != right.stat().st_size:
+        return False
+    if os.name != 'nt' and stat.S_IMODE(left.stat().st_mode) != stat.S_IMODE(right.stat().st_mode):
+        return False
+    with left.open('rb') as a, right.open('rb') as b:
+        while True:
+            x, y = a.read(65536), b.read(65536)
+            if x != y:
+                return False
+            if not x:
+                return True
+
+
+def copy_atomic(source, dest):
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.staged-', dir=str(dest.parent))
+    os.close(fd)
+    try:
+        shutil.copy2(source, name)
+        os.replace(name, dest)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def confirm(message, yes=False):
+    if yes:
+        return
+    if not sys.stdin.isatty():
+        raise StagedError(message + ' Re-run interactively or pass --yes.')
+    if input(message + ' [y/N] ').strip().lower() not in ('y', 'yes'):
+        raise StagedError('Aborted; no changes made.')
+
+
+def session_id(value):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', value) or value in ('.', '..'):
+        raise StagedError('Session ID must contain only letters, digits, dots, underscores or hyphens.')
+    return value
+
+
+class Context:
+    def __init__(self, args):
+        self.args = args
+        self.workspace = get_git_root(Path.cwd()) or Path.cwd().resolve()
+        self.global_state = load_json(GLOBAL_STATE_FILE)
+        self.local = load_json(self.workspace / '.staged.json')
+        for data in (self.global_state, self.local):
+            for key in ('session_roots', 'protected_branches'):
+                if key in data and (not isinstance(data[key], list) or not all(isinstance(p, str) for p in data[key])):
+                    raise StagedError(key + ' must be a list of strings.')
+            if 'branch_protection' in data and not isinstance(data['branch_protection'], bool):
+                raise StagedError('branch_protection must be true or false.')
+        if not isinstance(self.global_state.get('tools', {}), dict):
+            raise StagedError('tools must be a JSON object.')
+        # STAGED_SHELL_ID can supply a stable ID across command-substitution subprocesses.
+        shell_id = session_id(os.environ.get('STAGED_SHELL_ID', str(os.getppid())))
+        self.shell_path = CONFIG_DIR / 'shell_sessions' / (shell_id + '.json')
+        self.shell = load_json(self.shell_path)
+        self.registry = dict(TOOL_REGISTRY)
+        for key, value in self.global_state.get('tools', {}).items():
+            if (not isinstance(value, dict) or not isinstance(value.get('name'), str)
+                    or any(not isinstance(value.get(field), list) or not value[field]
+                           or not all(isinstance(token, str) for token in value[field])
+                           for field in ('diff_cmd', 'open_cmd'))):
+                raise StagedError('Invalid custom tool configuration: ' + key)
+            self.registry[key] = ToolAdapter(key, value['name'], value['diff_cmd'], value['open_cmd'], value.get('root'))
+
+    def setting(self, key, default=None):
+        return self.local.get(key, self.global_state.get(key, default))
+
+    def tool(self):
+        key = (getattr(self.args, 'tool', None) or os.environ.get('STAGED_TOOL') or self.shell.get('tool')
+               or self.setting('default_tool'))
+        if not key:
+            key = next((k for k in ('cursor', 'antigravity', 'windsurf', 'vscode', 'pycharm', 'zed')
+                        if self.registry[k].detect_binary()), 'cli')
+        if key not in self.registry:
+            raise StagedError('Unknown tool {!r}. Choose: {}'.format(key, ', '.join(sorted(self.registry))))
+        return self.registry[key]
+
+    def staging_root(self):
+        value = (getattr(self.args, 'root', None) or os.environ.get('STAGED_ROOT')
+                 or self.setting('staging_root') or self.tool().root or DATA_DIR)
+        return Path(value).expanduser().resolve()
+
+    def roots(self):
+        values = [self.staging_root()] + [Path(r).expanduser().resolve() for r in self.setting('session_roots', [])]
+        return list(dict.fromkeys(values))
+
+    def sessions(self, all_repos=False):
+        result = []
+        for root in self.roots():
+            if not root.is_dir():
+                continue
+            for directory in sorted(root.iterdir()):
+                if directory.is_symlink() or not directory.is_dir() or not (directory / '.workspace').is_file():
+                    continue
+                session = Session(directory)
+                if all_repos or session.workspace == self.workspace:
+                    result.append(session)
+        return sorted(result, key=lambda s: s.modified(), reverse=True)
+
+    def find_session(self, key, all_repos=False):
+        sessions = self.sessions(all_repos)
+        exact = [s for s in sessions if s.id == key]
+        matches = exact or [s for s in sessions if s.id.startswith(key)]
+        if len(matches) != 1:
+            raise StagedError(('Ambiguous' if matches else 'Unknown') + ' session: ' + key)
+        return matches[0]
+
+    def active(self):
+        key = (getattr(self.args, 'session', None) or os.environ.get('STAGED_SESSION') or self.shell.get('session')
+               or self.setting('default_session'))
+        if key:
+            return self.find_session(key)
+        sessions = self.sessions()
+        if not sessions:
+            raise StagedError('No staging session for {}. Run staged init <session-id>.'.format(self.workspace))
+        return sessions[0]
+
+
+class Session:
+    def __init__(self, directory):
+        self.directory = Path(directory).resolve()
+        self.id = self.directory.name
+        self.staging = self.directory / 'staging'
+        if self.staging.is_symlink():
+            raise StagedError('Session staging directory cannot be a symlink: {}'.format(self.staging))
+        marker = (self.directory / '.workspace').read_text(encoding='utf-8').strip()
+        if not marker or not Path(marker).expanduser().is_absolute():
+            raise StagedError('.workspace must contain an absolute workspace path: ' + str(self.directory))
+        self.workspace = Path(marker).expanduser().resolve()
+        if not self.workspace.is_dir():
+            raise StagedError('Session workspace does not exist: {}'.format(self.workspace))
+        self.metadata = load_json(self.directory / 'session.json')
+        if self.metadata.get('branch') is not None and not isinstance(self.metadata['branch'], str):
+            raise StagedError('Session branch must be a string or null.')
+        provenance = self.metadata.get('migrated_from', [])
+        if (not isinstance(provenance, list) or any(not isinstance(item, dict)
+                or (item.get('branch') is not None and not isinstance(item['branch'], str)) for item in provenance)):
+            raise StagedError('Invalid migration provenance in session.json.')
+        self.manifest = load_json(self.directory / 'renames.json')
+        self.deletions = self.manifest.get('_deletions', [])
+        if not isinstance(self.deletions, list) or not all(isinstance(p, str) for p in self.deletions):
+            raise StagedError('_deletions must be a list of relative file paths.')
+        if set(self.deletions) & (set(self.manifest) - {'_deletions'}):
+            raise StagedError('A rename destination cannot also be a deletion.')
+        for dest, source in self.manifest.items():
+            if dest != '_deletions':
+                safe_path(self.staging, dest)
+                safe_path(self.workspace, source)
+        for rel in self.deletions:
+            safe_path(self.workspace, rel)
+
+    def modified(self):
+        paths = [self.staging, self.directory / 'session.json', self.directory / 'renames.json'] + list(self.files().values())
+        return max(p.stat().st_mtime for p in paths if not p.is_symlink() and p.exists())
+
+    def files(self, fresh=False):
+        if not fresh:
+            try:
+                cached = load_json(self.directory / '.index.json')
+                directories = cached.get('directories', {})
+                if cached.get('version') == 1 and isinstance(directories, dict) and '.' in directories:
+                    valid = True
+                    for rel, timestamp in directories.items():
+                        path = self.staging if rel == '.' else safe_path(self.staging, rel)
+                        if not path.is_dir() or path.stat().st_mtime_ns != timestamp:
+                            valid = False
+                            break
+                    if valid:
+                        result = {item['path']: safe_path(self.staging, item['path']) for item in cached['files']}
+                        if all(path.is_file() for path in result.values()):
+                            return dict(sorted(result.items()))
+            except (StagedError, OSError, KeyError, TypeError):
+                # The index is disposable; malformed or stale data triggers a scan.
+                pass
+        result = {}
+        self._directory_mtimes = {}
+        for root, dirs, files in os.walk(self.staging, followlinks=False):
+            self._directory_mtimes[Path(root).relative_to(self.staging).as_posix()] = Path(root).stat().st_mtime_ns
+            for name in dirs:
+                safe_path(self.staging, (Path(root) / name).relative_to(self.staging).as_posix())
+            for name in files:
+                rel = (Path(root) / name).relative_to(self.staging).as_posix()
+                path = safe_path(self.staging, rel)
+                if not path.is_file():
+                    raise StagedError('Only regular files can be staged: ' + rel)
+                result[rel] = path
+        return dict(sorted(result.items()))
+
+    def paths(self, fresh=False):
+        return sorted(set(self.files(fresh=fresh)) | set(self.deletions) | (set(self.manifest) - {'_deletions'}))
+
+    def original(self, rel):
+        return safe_path(self.workspace, self.manifest.get(rel, rel))
+
+    def status(self, rel):
+        if rel in self.deletions:
+            return 'DELETED' if self.original(rel).exists() else 'APPLIED'
+        source = safe_path(self.staging, rel)
+        if not source.is_file():
+            return 'MISSING'
+        dest = safe_path(self.workspace, rel)
+        old = self.original(rel)
+        if equal_files(dest, source) and (old == dest or not old.exists()):
+            return 'APPLIED'
+        if old != dest and old.exists():
+            return 'RENAMED' if old.name != dest.name else 'RELOCATED'
+        return 'MODIFIED' if dest.exists() or old.exists() else 'NEW FILE'
+
+    def save_manifest(self):
+        save_json(self.directory / 'renames.json', self.manifest)
+
+    def refresh_index(self):
+        entries = []
+        for rel, path in self.files(fresh=True).items():
+            stat = path.stat()
+            entries.append({'path': rel, 'basename': path.name, 'tokens': re.findall(r'\w+', rel.lower()),
+                            'mtime_ns': stat.st_mtime_ns, 'size': stat.st_size})
+        save_json(self.directory / '.index.json', {'version': 1, 'files': entries, 'deletions': self.deletions,
+                                                 'directories': self._directory_mtimes})
+
+
+def levenshtein(a, b):
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i]
+        for j, cb in enumerate(b, 1):
+            current.append(min(current[-1] + 1, previous[j] + 1, previous[j - 1] + (ca != cb)))
+        previous = current
+    return previous[-1]
+
+
+def match_file(query, paths):
+    paths = sorted(paths)
+    if query in paths:
+        return query
+    q = query.lower()
+    def subsequence(value):
+        chars = iter(value.lower())
+        return all(any(ch == c for ch in chars) for c in q)
+    candidates = [p for p in paths if p.lower() == q]
+    if not candidates:
+        candidates = [p for p in paths if Path(p).name.lower() == q]
+    if not candidates:
+        candidates = [p for p in paths if subsequence(p)]
+    if not candidates and len(q) >= 3:
+        distances = [(levenshtein(q, Path(p).name.lower()), p) for p in paths]
+        best = min((distance for distance, _ in distances), default=999)
+        if best <= max(1, min(3, len(q) // 4)):
+            candidates = [p for distance, p in distances if distance == best]
+    if len(candidates) != 1:
+        if candidates:
+            raise StagedError('Ambiguous file {!r}; use an exact path:\n  {}'.format(query, '\n  '.join(candidates)))
+        raise StagedError('No staged file matched {!r}.'.format(query))
+    return candidates[0]
+
+
+def selected(session, target):
+    # Mutating operations and explicit review never trust a derived inventory.
+    paths = session.paths(fresh=True)
+    return paths if target == 'all' else [match_file(target, paths)]
+
+
+class ToolAdapter:
+    def __init__(self, tool_id, name, diff_cmd, open_cmd, root=None):
+        self.id = tool_id
+        self.name = name
+        self.diff_cmd = diff_cmd
+        self.open_cmd = open_cmd
+        self.root = root
+
+    def detect_binary(self, command=None):
+        command = command or self.diff_cmd[0]
+        if self.id == 'pycharm' and command == self.diff_cmd[0]:
+            found = detect_jetbrains_binary()
+            if found:
+                return found
+        found = shutil.which(command)
+        if found:
+            return found
+        if sys.platform == 'darwin':
+            bundles = {'cursor': ('Cursor', 'Resources/app/bin/cursor'),
+                       'antigravity-ide': ('Antigravity IDE', 'Resources/app/bin/antigravity-ide'),
+                       'windsurf': ('Windsurf', 'Resources/app/bin/windsurf'),
+                       'code': ('Visual Studio Code', 'Resources/app/bin/code'),
+                       'zed': ('Zed', 'MacOS/zed')}
+            if command in bundles:
+                app, suffix = bundles[command]
+                for parent in (Path('/Applications'), Path(HOME) / 'Applications'):
+                    path = parent / (app + '.app') / 'Contents' / suffix
+                    if path.is_file():
+                        return str(path)
+        if os.name == 'nt':
+            programs = Path(os.environ.get('LOCALAPPDATA', HOME)) / 'Programs'
+            for folder in (command, {'code': 'Microsoft VS Code'}.get(command, command)):
+                for ext in ('.cmd', '.exe'):
+                    path = programs / folder / 'bin' / (command + ext)
+                    if path.is_file():
+                        return str(path)
         return None
 
-def is_branch_protected(branch_name, protected_list=None):
-    if not branch_name:
-        return False
-    if protected_list is None:
-        protected_list = DEFAULT_PROTECTED_BRANCHES
-    for pattern in protected_list:
-        if pattern.endswith("*"):
-            prefix = pattern[:-1]
-            if branch_name.startswith(prefix):
-                return True
-        elif branch_name == pattern:
-            return True
-    return False
+    def build_command(self, template, orig=None, staged=None):
+        # Replace inside tokens too, supporting custom editors' command arguments.
+        executable = self.detect_binary(template[0])
+        if not executable:
+            raise StagedError('Executable not found: {}. Configure --tool cli or install the editor launcher.'.format(template[0]))
+        values = {'orig': str(orig or ''), 'staged': str(staged or '')}
+        args = [executable] + [token.replace('{orig}', values['orig']).replace('{staged}', values['staged'])
+                               for token in template[1:]]
+        if sys.platform.startswith('linux') and executable.lower().endswith(('.exe', '.cmd', '.bat')):
+            for i in range(1, len(args)):
+                for path in (orig, staged):
+                    if path and str(path) in args[i]:
+                        translated = subprocess.run(['wslpath', '-w', str(path)], capture_output=True, text=True, check=True)
+                        args[i] = args[i].replace(str(path), translated.stdout.strip())
+        return args
 
-# --- Tool Adapters Engine ---
+    def get_diff_command(self, orig, staged):
+        if self.id in ('cli', 'codex', 'claudecode'):
+            if shutil.which('difft'):
+                return ['difft', str(orig), str(staged)]
+            if shutil.which('git'):
+                return ['git', '--no-pager', 'diff', '--no-index', '--', str(orig), str(staged)]
+            if shutil.which('diff'):
+                return ['diff', '-u', str(orig), str(staged)]
+            raise StagedError('Install git, difftastic or diff for terminal review.')
+        return self.build_command(self.diff_cmd, orig, staged)
 
+    def get_open_command(self, staged):
+        return self.build_command(self.open_cmd, staged=staged)
+
+    def configure_sandbox(self, root):
+        if self.id != 'cursor':
+            return False
+        sandbox = Path(HOME) / '.cursor/sandbox.json'
+        data = load_json(sandbox)
+        paths = data.setdefault('additionalReadwritePaths', [])
+        if not isinstance(paths, list):
+            raise StagedError('additionalReadwritePaths must be a list in ' + str(sandbox))
+        if str(root) not in paths:
+            paths.append(str(root))
+        cli = Path(HOME) / '.cursor/cli-config.json'
+        settings = load_json(cli)
+        permissions = settings.setdefault('permissions', {})
+        if not isinstance(permissions, dict):
+            raise StagedError('permissions must be an object in ' + str(cli))
+        allowed = permissions.setdefault('allow', [])
+        if not isinstance(allowed, list):
+            raise StagedError('permissions.allow must be a list in ' + str(cli))
+        for token in ('Read({}/**)'.format(root), 'Write({}/**)'.format(root)):
+            if token not in allowed:
+                allowed.append(token)
+        save_json(sandbox, data)
+        save_json(cli, settings)
+        return True
+
+    def install_skill(self, target_dir=None):
+        roots = {'cursor': Path(HOME) / '.cursor/skills',
+                 'claudecode': Path(HOME) / '.claude/skills',
+                 'codex': Path(HOME) / '.agents/skills',
+                 'windsurf': Path(HOME) / '.codeium/windsurf/skills',
+                 'antigravity': Path(HOME) / '.gemini/config/skills'}
+        if target_dir:
+            target = Path(target_dir).expanduser().resolve()
+        elif self.id in roots:
+            target = roots[self.id] / 'stage'
+        else:
+            raise StagedError('{} has no configured native skill registry. Pass --target-dir <skill-directory> for your agent harness.'.format(self.name))
+        source = REPO_ROOT / 'SKILL.md'
+        if not source.is_file():
+            raise StagedError('Missing bundled skill: ' + str(source))
+        copy_atomic(source, target / 'SKILL.md')
+        return target / 'SKILL.md'
+
+
+TOOL_REGISTRY = {}
+for key, name, command, diff, opening in [
+    ('cursor', 'Cursor', 'cursor', ['-r', '--diff'], ['-r']),
+    ('antigravity', 'Antigravity IDE', 'antigravity-ide', ['-r', '-d'], ['-r']),
+    ('windsurf', 'Windsurf', 'windsurf', ['-r', '--diff'], ['-r']),
+    ('vscode', 'Visual Studio Code', 'code', ['-r', '-d'], ['-r']),
+    ('pycharm', 'PyCharm / JetBrains', 'charm', ['diff'], []),
+    ('zed', 'Zed', 'zed', ['--diff'], []),
+]:
+    TOOL_REGISTRY[key] = ToolAdapter(key, name, [command] + diff + ['{orig}', '{staged}'],
+                                    [command] + opening + ['{staged}'])
+for key, name in [('cli', 'Terminal'), ('codex', 'Codex'), ('claudecode', 'Claude Code')]:
+    editor = shlex.split(os.environ.get('EDITOR', 'notepad' if os.name == 'nt' else 'vi'))
+    TOOL_REGISTRY[key] = ToolAdapter(key, name, ['git', 'diff', '--no-index', '{orig}', '{staged}'], editor + ['{staged}'])
+
+
+def run_editor(command, terminal=False):
+    # Native .exe files need no shell. Batch launchers require cmd.exe on Windows.
+    if os.name == 'nt' and command[0].lower().endswith(('.cmd', '.bat')):
+        if any(any(ch in arg for ch in '\r\n%"&|<>^!') for arg in command):
+            raise StagedError('Batch launcher cannot safely represent these arguments; use a native executable.')
+        shell = subprocess.list2cmdline([os.environ.get('COMSPEC', 'cmd.exe')])
+        quoted = ' '.join('"{}"'.format(arg) for arg in command)
+        command = '{} /d /s /c "{}"'.format(shell, quoted)
+    result = subprocess.run(command)
+    if result.returncode not in ((0, 1) if terminal else (0,)):
+        raise StagedError('Editor/diff command failed with exit code {}'.format(result.returncode))
+
+
+def init_session(ctx, key, root=None):
+    key = session_id(key)
+    root = root or ctx.staging_root()
+    try:
+        root.relative_to(ctx.workspace)
+    except ValueError:
+        pass
+    else:
+        raise StagedError('Staging root must be outside the workspace: ' + str(root))
+    directory = safe_path(root, key)
+    if directory.exists():
+        if not (directory / '.workspace').is_file():
+            raise StagedError('Directory already exists without session metadata: ' + str(directory))
+        session = Session(directory)
+        if session.workspace != ctx.workspace:
+            raise StagedError('Session belongs to a different workspace: ' + str(session.workspace))
+        return session
+    (directory / 'staging').mkdir(parents=True)
+    write_text_file(directory / '.workspace', str(ctx.workspace) + '\n')
+    save_json(directory / 'session.json', {'id': key, 'branch': get_git_branch(ctx.workspace), 'created_at': time.time()})
+    save_json(directory / 'renames.json', {})
+    return Session(directory)
+
+
+def overview(ctx, session):
+    print('Repository:     {}'.format(session.workspace))
+    print('Active Session: {}'.format(session.id))
+    print('Active Tool:    {}'.format(ctx.tool().name))
+    print('Git Branch:     {}'.format(get_git_branch(session.workspace) or '(not a Git repository)'))
+    print('Staging:        {}'.format(session.staging))
+    paths = session.paths()
+    if not paths:
+        print('No staged changes yet.')
+    for rel in paths:
+        print('  [{:9}] {}'.format(session.status(rel), rel))
+        if ctx.args.verbose:
+            path = safe_path(session.staging, rel)
+            print('    Staged:    {}'.format(path if path.exists() else '(deletion)'))
+            print('    Workspace: {}'.format(session.original(rel)))
+            if path.exists():
+                print('    Size: {} bytes; modified: {}'.format(path.stat().st_size, time.ctime(path.stat().st_mtime)))
+    session.refresh_index()
+
+
+def review(ctx, session, target):
+    tool = ctx.tool()
+    terminal = tool.id in ('cli', 'codex', 'claudecode')
+    for rel in selected(session, target):
+        if target == 'all' and session.status(rel) == 'APPLIED':
+            continue
+        original = session.original(rel)
+        proposed = safe_path(session.staging, rel)
+        if rel not in session.deletions and not proposed.is_file():
+            raise StagedError('Missing staged contents: ' + rel)
+        # GUI launchers often return before opening tabs; keep the empty side on disk.
+        empty = safe_path(session.directory, '.review/empty/' + rel)
+        write_text_file(empty, '')
+        left = original if original.is_file() else empty
+        right = empty if rel in session.deletions else proposed
+        print('Review [{}]: {}'.format(session.status(rel), rel), flush=True)
+        run_editor(tool.get_diff_command(left, right), terminal)
+
+
+def guard_apply(ctx, session):
+    branch = get_git_branch(session.workspace)
+    patterns = ctx.setting('protected_branches', DEFAULT_PROTECTED_BRANCHES)
+    if ctx.setting('branch_protection', True) and is_branch_protected(branch, patterns):
+        if not ctx.args.force:
+            raise StagedError("Protected branch '{}'; switch branches or pass --force.".format(branch))
+        print("Warning: applying to protected branch '{}' (--force).".format(branch), file=sys.stderr)
+    origins = {session.metadata.get('branch')}
+    origins.update(item.get('branch') for item in session.metadata.get('migrated_from', []))
+    drifted = sorted(origin for origin in origins if origin and origin != branch)
+    if drifted:
+        confirm("Branch changed from '{}' to '{}'. Apply here?".format(', '.join(drifted), branch), ctx.args.yes)
+
+
+def preflight(session, paths):
+    files = session.files(fresh=True)
+    destinations = set(paths) - set(session.deletions)
+    all_destinations = set(files)
+    if set(files) & set(session.deletions):
+        raise StagedError('A path cannot be both a staged file and a deletion.')
+    sources = []
+    for rel in paths:
+        dest = safe_path(session.workspace, rel)
+        original = session.original(rel)
+        if dest.exists() and not dest.is_file() or original.exists() and not original.is_file():
+            raise StagedError('Apply requires regular file destinations: ' + rel)
+        for parent in dest.parents:
+            if parent == session.workspace:
+                break
+            if parent.exists() and not parent.is_dir():
+                raise StagedError('Destination parent is a file: ' + str(parent))
+        if rel not in session.deletions:
+            if rel not in files:
+                raise StagedError('Missing staged contents: ' + rel)
+            old = session.manifest.get(rel, rel)
+            if old != rel:
+                if old in all_destinations or old in session.deletions:
+                    raise StagedError('Overlapping rename/deletion sources require separate sessions: ' + old)
+                sources.append(old)
+    if len(sources) != len(set(sources)):
+        raise StagedError('Multiple staged files cannot rename the same source.')
+    for rel in destinations:
+        if any(parent.as_posix() in destinations for parent in Path(rel).parents if str(parent) != '.'):
+            raise StagedError('Conflicting staged file and directory: ' + rel)
+
+
+def apply_changes(ctx, session, target):
+    paths = selected(session, target)
+    preflight(session, paths)
+    guard_apply(ctx, session)
+    for rel in paths:
+        dest = safe_path(session.workspace, rel)
+        old = session.original(rel)
+        if rel in session.deletions:
+            if dest.exists():
+                dest.unlink()
+            print('[DELETED] ' + rel)
+        else:
+            copy_atomic(safe_path(session.staging, rel), dest)
+            if old != dest and old.is_file():
+                old.unlink()
+            print('[APPLIED] ' + rel)
+    session.refresh_index()
+
+
+def clean_session(ctx, session):
+    paths = selected(session, ctx.args.file or 'all')
+    if any(session.status(rel) != 'APPLIED' for rel in paths):
+        confirm('Discard {} pending staged change(s) from {}?'.format(len(paths), session.id), ctx.args.yes)
+    for rel in paths:
+        path = safe_path(session.staging, rel)
+        if path.is_file():
+            path.unlink()
+        session.manifest.pop(rel, None)
+        session.deletions[:] = [p for p in session.deletions if p != rel]
+    if ctx.args.file is None:
+        session.manifest = {}
+        session.deletions = []
+    elif '_deletions' in session.manifest:
+        session.manifest['_deletions'] = session.deletions
+    session.save_manifest()
+    session.refresh_index()
+    print('Cleaned {} staged change(s); workspace untouched.'.format(len(paths)))
+
+
+def cross_diff(ctx):
+    if ctx.args.apply:
+        raise StagedError('Cross-session comparison cannot be combined with --apply.')
+    if ctx.args.between:
+        left, right = (ctx.find_session(key) for key in ctx.args.between)
+    else:
+        left, right = ctx.active(), ctx.find_session(ctx.args.compare_session)
+    common = sorted(set(left.files(fresh=True)) & set(right.files(fresh=True)))
+    paths = common if ctx.args.target in (None, 'all') else [match_file(ctx.args.target, common)]
+    if not paths:
+        raise StagedError('No common staged files in the two sessions.')
+    tool = ctx.tool()
+    for rel in paths:
+        run_editor(tool.get_diff_command(safe_path(left.staging, rel), safe_path(right.staging, rel)),
+                   tool.id in ('cli', 'codex', 'claudecode'))
+
+
+def migrate(ctx):
+    source = ctx.find_session(ctx.args.source)
+    if ctx.args.to:
+        try:
+            dest = ctx.find_session(ctx.args.to)
+        except StagedError as exc:
+            if not str(exc).startswith('Unknown session:'):
+                raise
+            dest = init_session(ctx, ctx.args.to)
+    else:
+        dest = ctx.active()
+    if source.directory == dest.directory:
+        raise StagedError('Migration needs two different sessions.')
+    if ctx.args.file and any(ch in ctx.args.file for ch in '*?['):
+        paths = [p for p in source.paths(fresh=True) if fnmatch.fnmatchcase(p, ctx.args.file)]
+        if not paths:
+            raise StagedError('No staged files matched migration pattern: ' + ctx.args.file)
+    else:
+        paths = selected(source, ctx.args.file or 'all')
+    preflight(source, paths)
+    # Validate the entire transfer before changing any destination files or manifest.
+    conflicts = []
+    manifest = dict(dest.manifest)
+    deletions = set(dest.deletions)
+    for rel in paths:
+        incoming = safe_path(source.staging, rel)
+        existing = safe_path(dest.staging, rel)
+        old = source.original(rel)
+        if existing.exists() and not existing.is_file():
+            raise StagedError('Migration destination is not a regular file: ' + rel)
+        for parent in existing.parents:
+            if parent == dest.staging:
+                break
+            if parent.exists() and not parent.is_dir():
+                raise StagedError('Migration destination parent is a file: ' + str(parent))
+        if existing.exists() or rel in dest.deletions:
+            conflicts.append('target already contains ' + rel)
+        if rel not in source.deletions and old.exists() and old.stat().st_mtime_ns > incoming.stat().st_mtime_ns and not equal_files(old, incoming):
+            conflicts.append('workspace is newer than ' + rel)
+        if rel in source.deletions:
+            deletions.add(rel)
+            manifest.pop(rel, None)
+        else:
+            deletions.discard(rel)
+            if rel in source.manifest:
+                manifest[rel] = source.manifest[rel]
+            else:
+                manifest.pop(rel, None)
+    resulting_files = (set(dest.files()) | (set(paths) - set(source.deletions))) - deletions
+    for rel in resulting_files:
+        if any(parent.as_posix() in resulting_files for parent in Path(rel).parents if str(parent) != '.'):
+            raise StagedError('Migration creates conflicting file and directory: ' + rel)
+    rename_sources = [old for rel, old in manifest.items() if rel != '_deletions' and rel in resulting_files and old != rel]
+    if len(rename_sources) != len(set(rename_sources)) or set(rename_sources) & (resulting_files | deletions):
+        raise StagedError('Migration creates overlapping rename or deletion operations.')
+    if conflicts and not ctx.args.force:
+        raise StagedError('Migration requires review; use --force to replace:\n  ' + '\n  '.join(conflicts))
+    if conflicts:
+        print('Warning: ' + '; '.join(conflicts), file=sys.stderr)
+    for rel in paths:
+        target = safe_path(dest.staging, rel)
+        if rel in source.deletions:
+            if target.is_file():
+                target.unlink()
+        else:
+            copy_atomic(safe_path(source.staging, rel), target)
+    if deletions:
+        manifest['_deletions'] = sorted(deletions)
+    else:
+        manifest.pop('_deletions', None)
+    dest.manifest, dest.deletions = manifest, sorted(deletions)
+    dest.save_manifest()
+    if not dest.metadata.get('migrated_from'):
+        dest.metadata['migrated_from'] = []
+    dest.metadata['migrated_from'].append({'session': source.id, 'branch': source.metadata.get('branch'), 'paths': paths})
+    save_json(dest.directory / 'session.json', dest.metadata)
+    dest.refresh_index()
+    print('Migrated {} change(s) from {} to {}.'.format(len(paths), source.id, dest.id))
 JETBRAINS_CLI_NAMES = ("charm", "pycharm", "idea")
 
 def detect_jetbrains_binary():
@@ -197,1334 +794,6 @@ def detect_jetbrains_binary():
                 return matches[0]
     return None
 
-def jetbrains_cli_missing_message():
-    return (
-        "JetBrains command-line launcher not found (tried: charm, pycharm, idea).\n"
-        "In JetBrains Toolbox: Settings → Tools → Generate shell scripts, then ensure "
-        "the scripts directory is on your PATH.\n"
-        "macOS default: ~/Library/Application Support/JetBrains/Toolbox/scripts"
-    )
-
-def run_editor_command(cmd, tool_adapter):
-    exe = cmd[0] if cmd else ""
-    if not exe:
-        print("Error: Empty editor command.", file=sys.stderr)
-        sys.exit(1)
-    missing = not os.path.isfile(exe) and shutil.which(exe) is None
-    if missing:
-        if tool_adapter.tool_id == "pycharm":
-            print(colorize("Error: " + jetbrains_cli_missing_message(), "31"), file=sys.stderr)
-        else:
-            print(f"Error: Editor executable not found: {exe}", file=sys.stderr)
-        sys.exit(1)
-    try:
-        subprocess.run(cmd, check=False)
-    except FileNotFoundError:
-        if tool_adapter.tool_id == "pycharm":
-            print(colorize("Error: " + jetbrains_cli_missing_message(), "31"), file=sys.stderr)
-        else:
-            print(f"Error: Failed to run: {exe}", file=sys.stderr)
-        sys.exit(1)
-
-class ToolAdapter:
-    def __init__(self, tool_id, name, default_root, diff_cmd, open_cmd):
-        self.tool_id = tool_id
-        self.name = name
-        self.default_root = os.path.expanduser(default_root)
-        self.diff_cmd = diff_cmd
-        self.open_cmd = open_cmd
-
-    def detect_binary(self):
-        cmd = self.diff_cmd[0]
-        if self.tool_id == "pycharm":
-            jetbrains = detect_jetbrains_binary()
-            if jetbrains:
-                return jetbrains
-        found = shutil.which(cmd)
-        if found:
-            return found
-        if sys.platform == "darwin":
-            mac_paths = {
-                "cursor": "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
-                "antigravity-ide": "/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity-ide",
-                "windsurf": "/Applications/Windsurf.app/Contents/Resources/app/bin/windsurf",
-                "code": "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
-                "zed": "/Applications/Zed.app/Contents/MacOS/zed",
-            }
-            cand = mac_paths.get(cmd)
-            if cand and os.path.isfile(cand):
-                return cand
-        return cmd
-
-    def build_diff_args(self, orig_file, staged_file):
-        bin_path = self.detect_binary()
-        args = []
-        for token in self.diff_cmd:
-            if token == "{orig}":
-                args.append(orig_file)
-            elif token == "{staged}":
-                args.append(staged_file)
-            elif token == self.diff_cmd[0]:
-                args.append(bin_path)
-            else:
-                args.append(token)
-        return args
-
-    def build_open_args(self, staged_file):
-        bin_path = self.detect_binary()
-        args = []
-        for token in self.open_cmd:
-            if token == "{staged}":
-                args.append(staged_file)
-            elif token == self.open_cmd[0]:
-                args.append(bin_path)
-            else:
-                args.append(token)
-        return args
-
-TOOL_REGISTRY = {
-    "cursor": ToolAdapter(
-        "cursor", "Cursor",
-        "~/.local/share/stage",
-        ["cursor", "-r", "--diff", "{orig}", "{staged}"],
-        ["cursor", "-r", "{staged}"]
-    ),
-    "antigravity": ToolAdapter(
-        "antigravity", "Antigravity IDE",
-        "~/.gemini/antigravity-ide/brain",
-        ["antigravity-ide", "-r", "-d", "{orig}", "{staged}"],
-        ["antigravity-ide", "-r", "{staged}"]
-    ),
-    "windsurf": ToolAdapter(
-        "windsurf", "Windsurf IDE",
-        "~/.local/share/stage",
-        ["windsurf", "-r", "--diff", "{orig}", "{staged}"],
-        ["windsurf", "-r", "{staged}"]
-    ),
-    "vscode": ToolAdapter(
-        "vscode", "Visual Studio Code",
-        "~/.local/share/stage",
-        ["code", "-r", "-d", "{orig}", "{staged}"],
-        ["code", "-r", "{staged}"]
-    ),
-    "pycharm": ToolAdapter(
-        "pycharm", "PyCharm / JetBrains",
-        "~/.local/share/stage",
-        ["charm", "diff", "{orig}", "{staged}"],
-        ["charm", "{staged}"]
-    ),
-    "zed": ToolAdapter(
-        "zed", "Zed Editor",
-        "~/.local/share/stage",
-        ["zed", "--diff", "{orig}", "{staged}"],
-        ["zed", "{staged}"]
-    ),
-    "claudecode": ToolAdapter(
-        "claudecode", "Claude Code",
-        "~/.local/share/stage",
-        ["git", "diff", "--no-index", "{orig}", "{staged}"],
-        [os.environ.get("EDITOR", "vi"), "{staged}"]
-    ),
-    "codex": ToolAdapter(
-        "codex", "OpenAI Codex CLI",
-        "~/.local/share/stage",
-        ["git", "diff", "--no-index", "{orig}", "{staged}"],
-        [os.environ.get("EDITOR", "vi"), "{staged}"]
-    ),
-    "cli": ToolAdapter(
-        "cli", "Terminal Diff",
-        "~/.local/share/stage",
-        ["git", "diff", "--no-index", "{orig}", "{staged}"],
-        [os.environ.get("EDITOR", "vi"), "{staged}"]
-    ),
-}
-
-TOOL_ALIASES = {
-    "charm": "pycharm",
-    "jetbrains": "pycharm",
-    "idea": "pycharm",
-    "code": "vscode",
-}
-
-def normalize_tool_id(tool_id):
-    if not tool_id:
-        return tool_id
-    key = tool_id.lower()
-    return TOOL_ALIASES.get(key, key)
-
-# --- State Management (Shell Instance + Persistent) ---
-
-def load_json(path):
-    if os.path.isfile(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def save_json(path, data):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-
-def get_shell_state():
-    ppid = os.getppid()
-    path = os.path.join(SHELL_SESSIONS_DIR, f"{ppid}.json")
-    return load_json(path), path
-
-def get_global_state():
-    return load_json(GLOBAL_STATE_FILE)
-
-def resolve_active_tool(override_tool=None):
-    if override_tool:
-        override_tool = normalize_tool_id(override_tool)
-        if override_tool in TOOL_REGISTRY:
-            return TOOL_REGISTRY[override_tool]
-    env_tool = os.environ.get("STAGED_TOOL") or os.environ.get("STAGE_TOOL")
-    if env_tool:
-        env_tool = normalize_tool_id(env_tool)
-        if env_tool in TOOL_REGISTRY:
-            return TOOL_REGISTRY[env_tool]
-    sh_state, _ = get_shell_state()
-    if sh_state.get("tool"):
-        shell_tool = normalize_tool_id(sh_state["tool"])
-        if shell_tool in TOOL_REGISTRY:
-            return TOOL_REGISTRY[shell_tool]
-    g_state = get_global_state()
-    if g_state.get("default_tool"):
-        default_tool = normalize_tool_id(g_state["default_tool"])
-        if default_tool in TOOL_REGISTRY:
-            return TOOL_REGISTRY[default_tool]
-    # Auto-detection
-    if os.environ.get("CURSOR_AGENT") or os.environ.get("CURSOR_APP") or shutil.which("cursor"):
-        return TOOL_REGISTRY["cursor"]
-    if shutil.which("antigravity-ide") or os.path.isdir(LEGACY_ANTIGRAVITY_ROOT):
-        return TOOL_REGISTRY["antigravity"]
-    if shutil.which("windsurf"):
-        return TOOL_REGISTRY["windsurf"]
-    if shutil.which("code"):
-        return TOOL_REGISTRY["vscode"]
-    return TOOL_REGISTRY["cursor"]
-
-# --- Staging & Sessions Engine ---
-
-def get_known_staging_roots():
-    roots = [
-        DEFAULT_STAGING_ROOT,
-        LEGACY_CURSOR_ROOT,
-        LEGACY_ANTIGRAVITY_ROOT,
-        os.path.join(HOME, ".cursor", "artifact-staging")
-    ]
-    g_state = get_global_state()
-    if g_state.get("staging_root"):
-        roots.insert(0, os.path.expanduser(g_state["staging_root"]))
-    existing = []
-    for r in roots:
-        r_real = os.path.realpath(os.path.expanduser(r))
-        if os.path.isdir(r_real) and r_real not in existing:
-            existing.append(r_real)
-    return existing
-
-def collect_staged_files(staging_dir):
-    staged_files = []
-    if not os.path.isdir(staging_dir):
-        return staged_files
-    for root, _, files in os.walk(staging_dir):
-        for f in files:
-            if f.startswith(".") or f.endswith(".metadata.json") or f == "renames.json" or f == ".workspace":
-                continue
-            full_path = os.path.join(root, f)
-            rel_path = os.path.relpath(full_path, staging_dir)
-            staged_files.append((rel_path, full_path))
-    return staged_files
-
-def get_staging_latest_mtime(staging_dir):
-    latest = os.path.getmtime(staging_dir)
-    for root, _, files in os.walk(staging_dir):
-        for f in files:
-            if not f.startswith("."):
-                try:
-                    f_mtime = os.path.getmtime(os.path.join(root, f))
-                    if f_mtime > latest:
-                        latest = f_mtime
-                except Exception:
-                    pass
-    return latest
-
-def load_renames_manifest(conv_dir, staging_dir):
-    for candidate in [os.path.join(conv_dir, "renames.json"), os.path.join(staging_dir, "renames.json")]:
-        if os.path.isfile(candidate):
-            try:
-                with open(candidate, "r", encoding="utf-8") as f:
-                    return json.load(f), candidate
-            except Exception:
-                pass
-    return {}, None
-
-def save_renames_manifest(manifest_path, renames):
-    os.makedirs(os.path.dirname(os.path.abspath(manifest_path)), exist_ok=True)
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(renames, f, indent=2)
-        f.write("\n")
-
-def get_workspace_for_conv(conv_dir):
-    for cand in [
-        os.path.join(conv_dir, ".workspace"),
-        os.path.join(conv_dir, "staging", ".workspace"),
-        os.path.join(conv_dir, "workspace.json")
-    ]:
-        if os.path.isfile(cand):
-            try:
-                with open(cand, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                    if content.startswith("{"):
-                        data = json.loads(content)
-                        ws = data.get("workspace") or data.get("git_root")
-                        if ws:
-                            return os.path.realpath(ws)
-                    elif content:
-                        return os.path.realpath(content)
-            except Exception:
-                pass
-    # Transcript fallback
-    transcript_path = os.path.join(conv_dir, ".system_generated", "logs", "transcript.jsonl")
-    if os.path.isfile(transcript_path):
-        try:
-            with open(transcript_path, "r", errors="ignore") as f:
-                for _ in range(60):
-                    line = f.readline()
-                    if not line:
-                        break
-                    if "Active Document:" in line:
-                        m = re.search(r"Active Document:\s*([^\s\"']+)", line)
-                        if m:
-                            root = get_git_root(os.path.dirname(m.group(1)))
-                            if root:
-                                return root
-                    if "[URI] -> [CorpusName]:" in line:
-                        m = re.search(r"(\/[^\s]+)\s*->", line)
-                        if m:
-                            root = get_git_root(m.group(1))
-                            if root:
-                                return root
-        except Exception:
-            pass
-    return None
-
-def find_staging_sessions(cwd):
-    repo_root = get_git_root(cwd)
-    known_roots = get_known_staging_roots()
-    sessions = []
-    seen_convs = set()
-
-    for root_dir in known_roots:
-        pattern = os.path.join(root_dir, "*", "staging")
-        staging_dirs = glob.glob(pattern)
-        for s_dir in staging_dirs:
-            c_dir = os.path.dirname(s_dir)
-            c_id = os.path.basename(c_dir)
-            if c_id in seen_convs:
-                continue
-
-            files = collect_staged_files(s_dir)
-            if not files:
-                continue
-
-            ws = get_workspace_for_conv(c_dir)
-            is_match = False
-            if repo_root and ws:
-                ws_root = get_git_root(ws) or ws
-                if ws_root == repo_root or ws == repo_root:
-                    is_match = True
-            elif repo_root and not ws:
-                renames_map, _ = load_renames_manifest(c_dir, s_dir)
-                matching_count = 0
-                for rel, _ in files:
-                    orig = renames_map.get(rel, rel)
-                    if os.path.isfile(os.path.join(repo_root, orig)) or os.path.isfile(os.path.join(repo_root, rel)):
-                        matching_count += 1
-                if matching_count >= 1:
-                    is_match = True
-
-            if is_match:
-                seen_convs.add(c_id)
-                latest_mtime = get_staging_latest_mtime(s_dir)
-                sessions.append({
-                    "conv_id": c_id,
-                    "conv_dir": c_dir,
-                    "staging_dir": s_dir,
-                    "latest_mtime": latest_mtime,
-                    "files_count": len(files),
-                    "workspace": ws or repo_root
-                })
-
-    sessions.sort(key=lambda x: x["latest_mtime"], reverse=True)
-    return repo_root, sessions
-
-def resolve_workspace_pair(ws_dir, rel_path, renames_map, staging_dir):
-    staged_abs = os.path.join(staging_dir, rel_path)
-    orig_rel = renames_map.get(rel_path, rel_path)
-    dest_file = os.path.join(ws_dir, rel_path)
-    orig_file = os.path.join(ws_dir, orig_rel)
-
-    # 1. If destination file already exists and matches staged copy, it's APPLIED
-    if os.path.isfile(dest_file) and is_file_equal(dest_file, staged_abs):
-        orig_info = f" (moved from {orig_rel})" if orig_rel != rel_path else ""
-        return dest_file, "APPLIED", orig_info
-
-    # 2. Check original file if it exists
-    if os.path.isfile(orig_file):
-        if is_file_equal(orig_file, staged_abs):
-            status = "APPLIED"
-        else:
-            status = "MODIFIED"
-
-        if orig_rel != rel_path:
-            if os.path.basename(orig_rel) != os.path.basename(rel_path):
-                status = "RENAMED"
-                orig_info = f" (from {orig_rel})"
-            else:
-                status = "RELOCATED"
-                orig_info = f" (moved from {orig_rel})"
-        else:
-            orig_info = ""
-
-        return orig_file, status, orig_info
-
-    # 3. If destination exists but differs
-    if os.path.isfile(dest_file):
-        return dest_file, "MODIFIED", ""
-
-    return None, "NEW FILE", ""
-
-def prune_empty_dirs(start_dir, stop_dir):
-    curr = start_dir
-    while curr and os.path.realpath(curr) != os.path.realpath(stop_dir):
-        try:
-            if not os.listdir(curr):
-                os.rmdir(curr)
-                curr = os.path.dirname(curr)
-            else:
-                break
-        except Exception:
-            break
-
-def apply_staged_file(ws_dir, staging_dir, rel_path, renames_map):
-    staged_abs = os.path.join(staging_dir, rel_path)
-    if not os.path.isfile(staged_abs):
-        return False
-
-    orig_rel = renames_map.get(rel_path, rel_path)
-    dest_abs = os.path.join(ws_dir, rel_path)
-    orig_abs = os.path.join(ws_dir, orig_rel)
-
-    os.makedirs(os.path.dirname(dest_abs), exist_ok=True)
-    shutil.copy2(staged_abs, dest_abs)
-
-    if orig_rel != rel_path and os.path.isfile(orig_abs) and os.path.realpath(orig_abs) != os.path.realpath(dest_abs):
-        try:
-            os.remove(orig_abs)
-            print(f"  [REMOVED OLD] {orig_rel}")
-            prune_empty_dirs(os.path.dirname(orig_abs), ws_dir)
-        except Exception as e:
-            print(f"  Warning: failed to remove {orig_rel}: {e}", file=sys.stderr)
-
-    print(f"  {colorize('[APPLIED]', '32')} {rel_path}")
-    return True
-
-# --- Help & Usage Documentation ---
-
-def print_usage(subcmd=None):
-    program = "staged"
-    if subcmd == "diff":
-        print(f"{colorize('staged diff', '1;36')} — inspect side-by-side diffs or apply staged changes.\n")
-        print("Usage:")
-        print("  staged diff                          List staged files (same as `staged`)")
-        print("  staged diff <filename>               Open side-by-side diff in configured IDE")
-        print("  staged diff <filename> -a, --apply   Immediately apply this file's staged changes!")
-        print("  staged diff all                      Open diff tabs for all modified files")
-        print("  staged diff all -a                   Apply all staged files to the workspace")
-        print("  staged diff --between <s1> <s2> <f>  Diff same file between two conversation sessions\n")
-        return
-
-    if subcmd == "clean":
-        print(f"{colorize('staged clean', '1;36')} — purge staging sessions or delete a single staged file.\n")
-        print("Usage:")
-        print("  staged clean                         Delete all staged files for the active session")
-        print("  staged clean -f, --file <filename>   Delete only the specified staged file")
-        print("  staged clean -y, --yes               Bypass confirmation prompts\n")
-        return
-
-    if subcmd == "apply":
-        print(f"{colorize('staged apply', '1;36')} — copy staged files into the workspace repository.\n")
-        print("Usage:")
-        print("  staged apply <filename>              Apply a single staged file")
-        print("  staged apply all                     Apply all staged files and remove obsolete files")
-        print("  staged apply all --force             Bypass protected branch guard\n")
-        return
-
-    if subcmd == "path":
-        print(f"{colorize('staged path', '1;36')} — resolve absolute paths on disk for external editors.\n")
-        print("Usage:")
-        print("  staged path <filename>               Print absolute path of the staged copy")
-        print("  staged path -w <filename>            Print absolute path of the workspace original\n")
-        return
-
-    print(f"{colorize(program, '1;36')} — review proposed code in isolated staging before applying.\n")
-    print(colorize("Usage:", "1"))
-    for line in (
-        "  staged                              List staged files for this repository",
-        "  staged diff                         List staged files (same as bare `staged`)",
-        "  staged diff <file>                  Open side-by-side diff in IDE (fuzzy match)",
-        "  staged diff <file> -a, --apply      Apply staged changes for this specific file",
-        "  staged diff all                     Open diff tabs for every modified file",
-        "  staged diff all -a                  Apply all staged files to the workspace",
-        "  staged diff --between <s1> <s2> <f> Compare file between two conversation sessions",
-        "  staged path <file>                  Get raw absolute path for editor / shell pipe",
-        "  staged clean [-f <file>]            Purge session, or selectively clean one file",
-        "  staged use <session_id>             Lock active session for current shell instance",
-        "  staged use --tool <IDE>             Set active tool for current shell instance",
-        "  staged -v, --verbose                Show full absolute paths, mtimes, and sizes",
-        "  staged -s, --session <id>           Target a specific session ID or UUID prefix",
-        "  staged -R, --all-repos              List staging sessions across all repositories",
-        "  staged --install-completion         Install Zsh/Bash tab completion (persists in shell rc)",
-        "  staged install-skill [--tool <IDE>] Install /stage skill and configure IDE sandbox",
-        "  staged --help                       Show this help message",
-    ):
-        print_usage_line(line, program)
-    print()
-    print(colorize("With no arguments, each file is tagged:", "1"))
-    for status, description in (
-        ("APPLIED", "Workspace already matches the staged file"),
-        ("MODIFIED", "Workspace file exists and still differs"),
-        ("RENAMED", "Staged path is a new filename (see renames.json)"),
-        ("RELOCATED", "Staged path moved, same filename"),
-        ("NEW FILE", "No workspace file to diff against"),
-    ):
-        print_status_legend(status, description)
-    print()
-
-# --- Main Entry Point ---
-
-def main():
-    cwd = os.getcwd()
-
-    # Global help guarantee: intercept -h/--help anywhere without running operations
-    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
-        sub = None
-        for arg in sys.argv[1:]:
-            if arg in SUBCOMMANDS and arg != "help":
-                sub = arg
-                break
-        print_usage(sub)
-        return
-
-    # Completion helpers (no staging session required)
-    if len(sys.argv) >= 2 and sys.argv[1] == "--complete-tools":
-        for key in sorted(set(TOOL_REGISTRY.keys()) | set(TOOL_ALIASES.keys())):
-            print(key)
-        return
-
-    if len(sys.argv) >= 2 and sys.argv[1] == "--install-completion":
-        install_completion()
-        return
-
-    # Parse global flags: -t/--tool, -s/--session, -v/--verbose, -R/--all-repos
-    args = sys.argv[1:]
-    subcmd = next((a for a in args if a in SUBCOMMANDS and a != "help"), None)
-    override_tool = None
-    override_session = None
-    verbose = False
-    all_repos = False
-
-    cleaned_args = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in ("-t", "--tool"):
-            if subcmd in ("use", "set"):
-                cleaned_args.append(a)
-                if i + 1 < len(args):
-                    cleaned_args.append(args[i + 1])
-                    i += 2
-                else:
-                    i += 1
-                continue
-            if i + 1 < len(args):
-                override_tool = args[i + 1]
-                i += 2
-                continue
-        elif a in ("-s", "--session", "--conv"):
-            if i + 1 < len(args):
-                override_session = args[i + 1]
-                i += 2
-                continue
-        elif a in ("-v", "--verbose"):
-            verbose = True
-            i += 1
-            continue
-        elif a in ("-R", "--all-repos"):
-            all_repos = True
-            i += 1
-            continue
-        cleaned_args.append(a)
-        i += 1
-    args = cleaned_args
-
-    active_tool = resolve_active_tool(override_tool)
-
-    # All-repos listing
-    if all_repos:
-        list_all_repositories()
-        return
-
-    # Install skill
-    if len(args) >= 1 and args[0] == "install-skill":
-        target_tool = override_tool or "cursor"
-        is_default = "--default" in args
-        run_install_skill(target_tool, is_default)
-        return
-
-    # Shell session state: staged use <id>
-    if len(args) >= 1 and args[0] == "use":
-        handle_use_command(args[1:])
-        return
-
-    # Staged set
-    if len(args) >= 1 and args[0] == "set":
-        handle_set_command(args[1:])
-        return
-
-    repo_root, sessions = find_staging_sessions(cwd)
-
-    # Shell instance session binding check
-    sh_state, _ = get_shell_state()
-    effective_session_id = override_session or sh_state.get("session") or os.environ.get("STAGED_SESSION")
-
-    active_session = None
-    if effective_session_id:
-        prefix = effective_session_id.lower()
-        matched = [s for s in sessions if s["conv_id"].lower().startswith(prefix)]
-        if matched:
-            active_session = matched[0]
-        else:
-            print(f"Error: No staging session found matching '{effective_session_id}' for repo: {repo_root or cwd}")
-            sys.exit(1)
-    else:
-        if sessions:
-            active_session = sessions[0]
-
-    # Session listing
-    if len(args) >= 1 and args[0] == "--sessions":
-        if not sessions:
-            print(f"No staging sessions found for repository: {repo_root or cwd}")
-            return
-        print(f"Active Staging Sessions for {repo_root}:")
-        for idx, s in enumerate(sessions):
-            tag = " (most recent)" if idx == 0 else ""
-            m_str = format_relative_time(s["latest_mtime"])
-            print(f"  [{idx+1}] {s['conv_id']}{tag}")
-            print(f"      Modified: {m_str} | Files: {s['files_count']}")
-        print("\nSwitch session: staged use <id>  or  staged -s <id>")
-        return
-
-    # Session completion helper
-    if len(args) >= 1 and args[0] == "--complete-sessions":
-        for s in sessions:
-            c_id = s["conv_id"]
-            m_str = format_relative_time(s["latest_mtime"])
-            print(f"{c_id}:{s['files_count']} files ({m_str})")
-        return
-
-    if len(args) >= 1 and args[0] in ("--complete", "--list"):
-        if active_session:
-            c_staging = active_session["staging_dir"]
-            c_renames, _ = load_renames_manifest(active_session["conv_dir"], c_staging)
-            c_files = collect_staged_files(c_staging)
-            if args[0] == "--list":
-                for rel, _ in sorted(c_files, key=lambda x: x[0]):
-                    print(rel)
-            else:
-                seen_b = set()
-                for rel, _ in sorted(c_files, key=lambda x: x[0]):
-                    ws_file, status, orig_info = resolve_workspace_pair(cwd, rel, c_renames, c_staging)
-                    basename = os.path.basename(rel)
-                    desc = status
-                    if status in ("RENAMED", "RELOCATED") and ws_file:
-                        desc += f" from {os.path.basename(ws_file)}"
-                    elif status == "APPLIED" and orig_info:
-                        desc += " (applied)"
-                    desc_safe = desc.replace(":", "-")
-                    if basename not in seen_b:
-                        seen_b.add(basename)
-                        print(f"{basename}:{desc_safe}")
-                    print(f"{rel}:{desc_safe}")
-        return
-
-    if not active_session:
-        print(f"No active staged changes found for repository: {repo_root or cwd}")
-        print("Tip: Run `staged -R` to view staging sessions across all projects.")
-        print("Run `staged --help` for usage.")
-        sys.exit(0)
-
-    staging_dir = active_session["staging_dir"]
-    conv_dir = active_session["conv_dir"]
-    conv_id = active_session["conv_id"]
-    ws_dir = active_session.get("workspace") or repo_root or cwd
-    renames_map, manifest_path = load_renames_manifest(conv_dir, staging_dir)
-    if not manifest_path:
-        manifest_path = os.path.join(conv_dir, "renames.json")
-
-    staged_files = collect_staged_files(staging_dir)
-
-    # Command: staged clean [-f <file>]
-    if len(args) >= 1 and args[0] == "clean":
-        clean_args = args[1:]
-        clean_target = None
-        bypass_prompt = "-y" in clean_args or "--yes" in clean_args
-        if "-f" in clean_args or "--file" in clean_args:
-            flag_idx = clean_args.index("-f") if "-f" in clean_args else clean_args.index("--file")
-            if flag_idx + 1 < len(clean_args):
-                clean_target = clean_args[flag_idx + 1]
-
-        if clean_target:
-            # Clean only specified file
-            matched = [rel for rel, _ in staged_files if clean_target.lower() in rel.lower() or clean_target.lower() == os.path.basename(rel).lower()]
-            if not matched:
-                print(f"No staged file matched '{clean_target}'.")
-                sys.exit(1)
-            for m in matched:
-                abs_p = os.path.join(staging_dir, m)
-                if os.path.isfile(abs_p):
-                    os.remove(abs_p)
-                if m in renames_map:
-                    del renames_map[m]
-                save_renames_manifest(manifest_path, renames_map)
-                print(f"Cleaned staged file: {m}")
-            return
-        else:
-            if not bypass_prompt:
-                ans = input(f"Purge entire staging session {conv_id} ({len(staged_files)} files)? [y/N] ").strip().lower()
-                if ans not in ("y", "yes"):
-                    print("Aborted.")
-                    return
-            for rel, abs_path in staged_files:
-                try:
-                    os.remove(abs_path)
-                except Exception:
-                    pass
-            for root, dirs, _ in os.walk(staging_dir, topdown=False):
-                for d in dirs:
-                    try:
-                        os.rmdir(os.path.join(root, d))
-                    except Exception:
-                        pass
-            print(f"Successfully cleaned {len(staged_files)} staged file(s).")
-            return
-
-    # Command: staged path [-s|-w] <file>
-    if len(args) >= 1 and args[0] == "path":
-        target = args[-1]
-        is_workspace = "-w" in args or "--workspace" in args
-        matched = [rel for rel, _ in staged_files if target.lower() in rel.lower() or target.lower() == os.path.basename(rel).lower()]
-        if not matched:
-            print(f"Error: No staged file matched '{target}'", file=sys.stderr)
-            sys.exit(1)
-        rel = matched[0]
-        if is_workspace:
-            orig = renames_map.get(rel, rel)
-            print(os.path.join(ws_dir, orig))
-        else:
-            print(os.path.join(staging_dir, rel))
-        return
-
-    # Command: staged apply [-f] <file|all>
-    if len(args) >= 1 and args[0] == "apply":
-        target = args[1] if len(args) >= 2 else "all"
-        if target in ("-f", "--file") and len(args) >= 3:
-            target = args[2]
-        execute_apply(cwd, ws_dir, staging_dir, staged_files, renames_map, target, "--force" in args)
-        return
-
-    # Command: staged diff <file> [-a]
-    if len(args) >= 1 and args[0] == "diff":
-        diff_args = args[1:]
-        if "--between" in diff_args:
-            handle_cross_session_diff(active_tool, diff_args)
-            return
-
-        apply_flag = "-a" in diff_args or "--apply" in diff_args
-        file_tokens = [a for a in diff_args if a not in ("-a", "--apply", "--force")]
-
-        if not file_tokens and not apply_flag:
-            render_staged_overview(active_tool, cwd, ws_dir, staging_dir, conv_id, active_session, sessions, staged_files, renames_map, manifest_path, verbose)
-            return
-
-        target = file_tokens[0] if file_tokens else "all"
-
-        if apply_flag:
-            execute_apply(cwd, ws_dir, staging_dir, staged_files, renames_map, target, "--force" in args)
-            return
-        else:
-            execute_diff(active_tool, cwd, ws_dir, staging_dir, staged_files, renames_map, target)
-            return
-
-    # Default / No Args: List files
-    if len(args) == 0:
-        render_staged_overview(active_tool, cwd, ws_dir, staging_dir, conv_id, active_session, sessions, staged_files, renames_map, manifest_path, verbose)
-        return
-
-    # Shorthand: staged <filename> [-a]
-    target = args[0]
-    apply_flag = "-a" in args or "--apply" in args
-    if apply_flag:
-        execute_apply(cwd, ws_dir, staging_dir, staged_files, renames_map, target, "--force" in args)
-    else:
-        execute_diff(active_tool, cwd, ws_dir, staging_dir, staged_files, renames_map, target)
-
-# --- Subcommand Handlers ---
-
-def render_staged_overview(active_tool, cwd, ws_dir, staging_dir, conv_id, active_session, sessions, staged_files, renames_map, manifest_path, verbose):
-    m_str = format_relative_time(active_session["latest_mtime"])
-    other_sessions = [s for s in sessions if s["conv_id"] != conv_id]
-    current_branch = get_git_branch(ws_dir)
-
-    print(f"Repository:         {ws_dir}")
-    print(f"Active Tool:        {colorize(active_tool.name, '1;36')}")
-    print(f"Active Session:     {colorize(conv_id, '1')} (modified {m_str})")
-    if current_branch:
-        prot = " [PROTECTED]" if is_branch_protected(current_branch) else ""
-        print(f"Git Branch:         {current_branch}{colorize(prot, '31')}")
-    if other_sessions:
-        print(f"Other Sessions:     {len(other_sessions)} older session(s). Run `staged --sessions` or `staged use <id>`.")
-    print(f"Staging Root:       {staging_dir}\n")
-
-    applied_count = 0
-    file_results = []
-    for rel, staged_abs in sorted(staged_files, key=lambda x: x[0]):
-        ws_file, status, orig_info = resolve_workspace_pair(ws_dir, rel, renames_map, staging_dir)
-        if status == "APPLIED":
-            applied_count += 1
-        file_results.append((rel, ws_file, status, orig_info, staged_abs))
-
-    pending_count = len(staged_files) - applied_count
-    if applied_count == len(staged_files):
-        summary_badge = f" (all {applied_count} applied)"
-    elif applied_count > 0:
-        summary_badge = f" ({applied_count} applied, {pending_count} pending)"
-    else:
-        summary_badge = f" ({len(staged_files)} pending)"
-
-    print(f"Staged Files{summary_badge}:")
-    for rel, ws_file, status, orig_info, staged_abs in file_results:
-        tag_color = STATUS_COLORS.get(status, "0")
-        status_tag = f"[{status:9}]"
-        colored_tag = colorize(status_tag, tag_color)
-        print(f"  {colored_tag} {rel}{orig_info}")
-        if verbose:
-            s_size = os.path.getsize(staged_abs) if os.path.isfile(staged_abs) else 0
-            w_size = os.path.getsize(ws_file) if ws_file and os.path.isfile(ws_file) else 0
-            print(f"        Staged:    {staged_abs} ({s_size} bytes)")
-            print(f"        Workspace: {ws_file or 'N/A'} ({w_size} bytes)")
-
-    print("\nNext Steps:")
-    print("  staged diff <file>             # Open side-by-side diff in IDE")
-    print("  staged diff <file> -a          # Apply that file's staged changes")
-    print("  staged diff all -a             # Apply all staged files")
-    print("  staged clean                   # Purge staging session")
-
-def execute_diff(active_tool, cwd, ws_dir, staging_dir, staged_files, renames_map, target):
-    if target == "all":
-        count = 0
-        skipped = 0
-        for rel, staged_abs in staged_files:
-            ws_file, status, _ = resolve_workspace_pair(ws_dir, rel, renames_map, staging_dir)
-            if ws_file:
-                if status == "APPLIED":
-                    skipped += 1
-                    continue
-                cmd = active_tool.build_diff_args(ws_file, staged_abs)
-                run_editor_command(cmd, active_tool)
-                count += 1
-            else:
-                cmd = active_tool.build_open_args(staged_abs)
-                run_editor_command(cmd, active_tool)
-                count += 1
-        if skipped > 0:
-            print(f"Skipped {skipped} already applied file(s).")
-        print(f"Opened {count} diff tab(s) in {active_tool.name}.")
-        return
-
-    # Fuzzy match
-    t_lower = target.lower()
-    matches = [(rel, abs_p) for rel, abs_p in staged_files if t_lower in rel.lower() or t_lower in os.path.basename(rel).lower()]
-    if not matches:
-        print(f"No staged file matched '{target}'. Run `staged` to list files.")
-        sys.exit(1)
-
-    for rel, staged_abs in matches:
-        ws_file, status, _ = resolve_workspace_pair(ws_dir, rel, renames_map, staging_dir)
-        if ws_file:
-            note = " (already applied)" if status == "APPLIED" else ""
-            print(f"Opening side-by-side diff [{status}]: {rel}{note}")
-            cmd = active_tool.build_diff_args(ws_file, staged_abs)
-            run_editor_command(cmd, active_tool)
-        else:
-            print(f"Opening new staged file: {rel}")
-            cmd = active_tool.build_open_args(staged_abs)
-            run_editor_command(cmd, active_tool)
-
-def execute_apply(cwd, ws_dir, staging_dir, staged_files, renames_map, target, force=False):
-    branch = get_git_branch(ws_dir)
-    if is_branch_protected(branch) and not force:
-        print(colorize(f"\n[BLOCKED] Branch Protection: Current branch '{branch}' is protected!", "31"), file=sys.stderr)
-        print("To apply anyway, use: staged apply all --force  or  staged diff <file> -a --force", file=sys.stderr)
-        sys.exit(1)
-
-    if target == "all":
-        applied_count = 0
-        for rel, _ in staged_files:
-            if apply_staged_file(ws_dir, staging_dir, rel, renames_map):
-                applied_count += 1
-
-        deletions = renames_map.get("_deletions", [])
-        for del_rel in deletions:
-            del_ws = os.path.join(ws_dir, del_rel)
-            if os.path.isfile(del_ws):
-                os.remove(del_ws)
-                print(f"  [REMOVED OBSOLETE] {del_rel}")
-                prune_empty_dirs(os.path.dirname(del_ws), ws_dir)
-
-        print(colorize(f"\nSuccessfully applied {applied_count} staged file(s) to workspace!", "32"))
-        print("Tip: Run `staged clean` to purge staging.")
-        return
-
-    t_lower = target.lower()
-    matches = [rel for rel, _ in staged_files if t_lower in rel.lower() or t_lower in os.path.basename(rel).lower()]
-    if not matches:
-        print(f"No staged file matched '{target}'.")
-        sys.exit(1)
-
-    for rel in matches:
-        apply_staged_file(ws_dir, staging_dir, rel, renames_map)
-
-def handle_cross_session_diff(active_tool, args):
-    idx = args.index("--between")
-    if idx + 2 >= len(args):
-        print("Usage: staged diff --between <session-1> <session-2> <filename>")
-        return
-    s1_id = args[idx + 1]
-    s2_id = args[idx + 2]
-    filename = args[idx + 3] if idx + 3 < len(args) else None
-
-    roots = get_known_staging_roots()
-    def find_session_dir(sid):
-        for r in roots:
-            for c in glob.glob(os.path.join(r, "*")):
-                if os.path.basename(c).lower().startswith(sid.lower()):
-                    s_dir = os.path.join(c, "staging")
-                    if os.path.isdir(s_dir):
-                        return s_dir
-        return None
-
-    dir1 = find_session_dir(s1_id)
-    dir2 = find_session_dir(s2_id)
-    if not dir1 or not dir2:
-        print(f"Error: Could not locate both sessions ({s1_id}, {s2_id})")
-        sys.exit(1)
-
-    files1 = collect_staged_files(dir1)
-    files2 = collect_staged_files(dir2)
-
-    if filename:
-        m1 = [p for r, p in files1 if filename.lower() in r.lower()]
-        m2 = [p for r, p in files2 if filename.lower() in r.lower()]
-        if not m1 or not m2:
-            print(f"Error: File '{filename}' not found in both sessions.")
-            sys.exit(1)
-        f1, f2 = m1[0], m2[0]
-    else:
-        common = set(r for r, _ in files1).intersection(set(r for r, _ in files2))
-        if not common:
-            print("No common files found between sessions.")
-            return
-        f1 = os.path.join(dir1, sorted(common)[0])
-        f2 = os.path.join(dir2, sorted(common)[0])
-
-    print(f"Opening cross-session diff:\n  {s1_id}: {f1}\n  {s2_id}: {f2}")
-    cmd = active_tool.build_diff_args(f1, f2)
-    run_editor_command(cmd, active_tool)
-
-def handle_use_command(args):
-    sh_state, path = get_shell_state()
-    if not args or args[0] in ("-h", "--help"):
-        print("Usage: staged use <session_id>  or  staged use --tool <tool>  or  staged use --clear")
-        return
-    if args[0] in ("--clear", "-c"):
-        if os.path.isfile(path):
-            os.remove(path)
-        print("Cleared shell session binding.")
-        return
-    if args[0] in ("-t", "--tool") and len(args) >= 2:
-        tool_id = normalize_tool_id(args[1])
-        if tool_id not in TOOL_REGISTRY:
-            print(f"Error: Unknown tool '{args[1]}'. Known: {', '.join(sorted(TOOL_REGISTRY))}", file=sys.stderr)
-            sys.exit(1)
-        sh_state["tool"] = tool_id
-        save_json(path, sh_state)
-        print(f"Active tool for this shell set to: {TOOL_REGISTRY[tool_id].name} ({tool_id})")
-        return
-    sh_state["session"] = args[0]
-    save_json(path, sh_state)
-    print(f"Active session for this shell set to: {args[0]}")
-
-def handle_set_command(args):
-    g_state = get_global_state()
-    if "--tool" in args:
-        idx = args.index("--tool")
-        if idx + 1 < len(args):
-            tool_id = normalize_tool_id(args[idx + 1])
-            if tool_id not in TOOL_REGISTRY:
-                print(f"Error: Unknown tool '{args[idx + 1]}'. Known: {', '.join(sorted(TOOL_REGISTRY))}", file=sys.stderr)
-                sys.exit(1)
-            g_state["default_tool"] = tool_id
-    if "--default-session" in args:
-        idx = args.index("--default-session")
-        if idx + 1 < len(args):
-            g_state["default_session"] = args[idx + 1]
-    save_json(GLOBAL_STATE_FILE, g_state)
-    print(f"Updated configuration in {GLOBAL_STATE_FILE}")
-
-def run_install_skill(tool_name, is_default=False):
-    tool = TOOL_REGISTRY.get(normalize_tool_id(tool_name))
-    if not tool:
-        print(f"Error: Unknown tool '{tool_name}'")
-        sys.exit(1)
-
-    print(f"Installing /stage skill for {tool.name}...")
-    skill_src = os.path.join(REPO_ROOT, "skills", normalize_tool_id(tool_name), "SKILL.md")
-    if not os.path.isfile(skill_src):
-        skill_src = os.path.join(REPO_ROOT, "SKILL.md")
-    if not os.path.isfile(skill_src):
-        print(f"Error: Skill source not found: {skill_src}")
-        sys.exit(1)
-    if tool_name == "cursor":
-        target = os.path.join(HOME, ".cursor", "skills", "stage", "SKILL.md")
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        shutil.copy2(skill_src, target)
-        print(f"Installed skill: {target}")
-        # Sandbox config
-        sandbox_path = os.path.join(HOME, ".cursor", "sandbox.json")
-        data = load_json(sandbox_path)
-        data.setdefault("type", "workspace_readwrite")
-        rw = data.setdefault("additionalReadwritePaths", [])
-        stage_roots = [
-            os.path.realpath(tool.default_root),
-            os.path.realpath(DEFAULT_STAGING_ROOT),
-        ]
-        added = []
-        for stage_root in stage_roots:
-            if stage_root not in rw:
-                rw.append(stage_root)
-                added.append(stage_root)
-        if added:
-            save_json(sandbox_path, data)
-            for stage_root in added:
-                print(f"Added {stage_root} to ~/.cursor/sandbox.json")
-    elif tool_name == "antigravity":
-        target = os.path.join(HOME, ".gemini", "config", "skills", "stage", "SKILL.md")
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        shutil.copy2(skill_src, target)
-        print(f"Installed skill: {target}")
-
-    if is_default:
-        g = get_global_state()
-        g["default_tool"] = tool_name
-        save_json(GLOBAL_STATE_FILE, g)
-        print(f"Set {tool.name} as default tool.")
-
-def list_all_repositories():
-    roots = get_known_staging_roots()
-    found = 0
-    print("Staging Sessions Across All Repositories:\n")
-    for r in roots:
-        for c in sorted(glob.glob(os.path.join(r, "*"))):
-            s_dir = os.path.join(c, "staging")
-            if os.path.isdir(s_dir):
-                files = collect_staged_files(s_dir)
-                if files:
-                    found += 1
-                    ws = get_workspace_for_conv(c) or "Unknown Repository"
-                    m = format_relative_time(get_staging_latest_mtime(s_dir))
-                    print(f"  [{os.path.basename(c)}] {len(files)} file(s) ({m})")
-                    print(f"    Repository: {ws}")
-                    print(f"    Staging:    {s_dir}\n")
-    if found == 0:
-        print("No staging sessions found.")
-
-COMPLETION_MARKER_START = "# >>> staged completions >>>"
-COMPLETION_MARKER_END = "# <<< staged completions <<<"
-
-def embedded_zsh_completion():
-    return textwrap.dedent("""\
-        #compdef staged stage staged-diff
-        # Generated by staged --install-completion — do not edit; re-run install to refresh.
-
-        _staged() {
-          local curcontext="$curcontext" state line
-          typeset -A opt_args
-
-          local -a tools subcmds
-          tools=("${(@f)$(command staged --complete-tools 2>/dev/null)}")
-          (( ${#tools} )) || tools=(cursor antigravity windsurf vscode pycharm charm zed claudecode codex cli)
-
-          subcmds=(
-            'diff:Side-by-side diff or apply staged changes'
-            'apply:Copy staged files into the workspace'
-            'clean:Remove staged files or purge the session'
-            'path:Print absolute staged or workspace paths'
-            'use:Bind a session or IDE tool to this shell'
-            'set:Update global staged configuration'
-            'install-skill:Install the /stage agent skill'
-            '--sessions:List staging sessions for this repository'
-            '--install-completion:Install tab completion into your shell'
-          )
-
-          _arguments -C -S -s \\
-            '(-h --help)'{-h,--help}'[Show help]' \\
-            '(-v --verbose)'{-v,--verbose}'[Verbose file listing]' \\
-            '(-R --all-repos)'{-R,--all-repos}'[List sessions across all repositories]' \\
-            '(-t --tool)'{-t,--tool}'[IDE / diff launcher]:tool:($tools)' \\
-            '(-s --session --conv)'{-s,--session,--conv}'[Staging session ID]:session:_staged_sessions' \\
-            '1: :->command' \\
-            '*:: :->rest' && return 0
-
-          case $state in
-            command)
-              if (( CURRENT == 2 )); then
-                _alternative \\
-                  'commands:command:_describe -t commands subcmds' \\
-                  'files:staged file:_staged_files'
-              else
-                _describe -t commands subcmds
-              fi
-              ;;
-            rest)
-              _staged_after_command
-              ;;
-          esac
-        }
-
-        _staged_after_command() {
-          local cmd="${words[1]}"
-          case $cmd in
-            diff) _staged_diff ;;
-            apply) _staged_apply ;;
-            clean) _staged_clean ;;
-            path) _staged_path ;;
-            use) _staged_use ;;
-            set) _staged_set ;;
-            install-skill) _staged_install_skill ;;
-            *) _staged_files ;;
-          esac
-        }
-
-        _staged_diff() {
-          _arguments -C -S \\
-            '(-a --apply)'{-a,--apply}'[Apply staged changes]' \\
-            '--force[Apply on protected branches]' \\
-            '--between[Diff file across two sessions]' \\
-            '*: :_staged_diff_target'
-        }
-
-        _staged_diff_target() {
-          if (( ${#words[@]} >= 3 && words[CURRENT-1] == --between )); then
-            _staged_sessions
-            return
-          fi
-          if (( CURRENT == 3 && ${#words[@]} == 3 )); then
-            _alternative 'all:target:(all)' 'files:staged file:_staged_files' 'sessions:session ID:_staged_sessions'
-            return
-          fi
-          if (( ${#words[@]} >= 4 && words[2] == --between )); then
-            if (( CURRENT <= 5 )); then
-              _staged_sessions
-            else
-              _staged_files
-            fi
-            return
-          fi
-          _staged_files
-        }
-
-        _staged_apply() {
-          _arguments -C -S '--force[Apply on protected branches]' '*: :_staged_apply_target'
-        }
-
-        _staged_apply_target() {
-          if (( CURRENT == 3 )); then
-            _alternative 'all:target:(all)' 'files:staged file:_staged_files'
-          else
-            _staged_files
-          fi
-        }
-
-        _staged_clean() {
-          _arguments -C -S \\
-            '(-f --file)'{-f,--file}'[Remove one staged file]:file:_staged_files' \\
-            '(-y --yes)'{-y,--yes}'[Skip confirmation when purging session]'
-        }
-
-        _staged_path() {
-          _arguments -C -S \\
-            '(-w --workspace)'{-w,--workspace}'[Print workspace original path]' \\
-            '*:file:_staged_files'
-        }
-
-        _staged_use() {
-          _arguments -C -S \\
-            '(-t --tool)'{-t,--tool}'[Set IDE for this shell]:tool:($(command staged --complete-tools 2>/dev/null))' \\
-            '(-c --clear)'{-c,--clear}'[Clear shell session binding]' \\
-            '*:session ID:_staged_sessions'
-        }
-
-        _staged_set() {
-          local -a tools
-          tools=("${(@f)$(command staged --complete-tools 2>/dev/null)}")
-          _arguments -C -S \\
-            '--tool[Default IDE tool]:tool:($tools)' \\
-            '--default-session[Default session ID]:session:_staged_sessions'
-        }
-
-        _staged_install_skill() {
-          local -a tools
-          tools=("${(@f)$(command staged --complete-tools 2>/dev/null)}")
-          _arguments -C -S \\
-            '--default[Mark installed skill as default]' \\
-            '(-t --tool)'{-t,--tool}'[Target IDE]:tool:($tools)'
-        }
-
-        _staged_files() {
-          local -a items desc line key val
-          while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            key="${line%%:*}"
-            val="${line#*:}"
-            items+=("$key")
-            desc+=("$val")
-          done < <(command staged --complete 2>/dev/null)
-          (( ${#items} )) && _describe -t files 'staged file' items desc
-        }
-
-        _staged_sessions() {
-          local -a ids desc line id rest
-          while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            id="${line%%:*}"
-            rest="${line#*:}"
-            ids+=("$id")
-            desc+=("$rest")
-          done < <(command staged --complete-sessions 2>/dev/null)
-          (( ${#ids} )) && _describe -t sessions 'staging session' ids desc
-        }
-        """)
-
-def embedded_bash_completion():
-    return textwrap.dedent("""\
-        # Generated by staged --install-completion — do not edit; re-run install to refresh.
-
-        _staged_complete_files() {
-          local IFS=$'\\n'
-          COMPREPLY=( $(compgen -W "$(command staged --complete 2>/dev/null | cut -d: -f1)" -- "$cur") )
-        }
-
-        _staged_complete_sessions() {
-          local IFS=$'\\n'
-          COMPREPLY=( $(compgen -W "$(command staged --complete-sessions 2>/dev/null | cut -d: -f1)" -- "$cur") )
-        }
-
-        _staged_complete_tools() {
-          local IFS=$'\\n'
-          COMPREPLY=( $(compgen -W "$(command staged --complete-tools 2>/dev/null)" -- "$cur") )
-        }
-
-        _staged() {
-          local cur="${COMP_WORDS[COMP_CWORD]}"
-          local prev="${COMP_WORDS[COMP_CWORD-1]}"
-
-          if (( COMP_CWORD == 1 )); then
-            COMPREPLY=( $(compgen -W "diff apply clean path use set install-skill --sessions --install-completion" -- "$cur") )
-            return
-          fi
-
-          case "${COMP_WORDS[1]}" in
-            -t|--tool)
-              (( COMP_CWORD == 2 )) && _staged_complete_tools
-              return ;;
-            -s|--session|--conv)
-              (( COMP_CWORD == 2 )) && _staged_complete_sessions
-              return ;;
-          esac
-
-          case "${COMP_WORDS[1]}" in
-            diff)
-              case "$prev" in
-                --between) _staged_complete_sessions ;;
-                diff)
-                  COMPREPLY=( $(compgen -W "all --between -a --apply --force" -- "$cur") )
-                  _staged_complete_files ;;
-                *)
-                  if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-a --apply --force --between" -- "$cur") )
-                  else
-                    COMPREPLY=( $(compgen -W "all" -- "$cur") )
-                    _staged_complete_files
-                  fi ;;
-              esac ;;
-            apply)
-              if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--force" -- "$cur") )
-              else
-                COMPREPLY=( $(compgen -W "all" -- "$cur") )
-                _staged_complete_files
-              fi ;;
-            clean)
-              COMPREPLY=( $(compgen -W "-f --file -y --yes" -- "$cur") )
-              [[ "$prev" == "-f" || "$prev" == "--file" ]] && _staged_complete_files ;;
-            path)
-              COMPREPLY=( $(compgen -W "-w --workspace" -- "$cur") )
-              [[ "$cur" != -* ]] && _staged_complete_files ;;
-            use)
-              COMPREPLY=( $(compgen -W "-t --tool -c --clear" -- "$cur") )
-              if [[ "$prev" == "-t" || "$prev" == "--tool" ]]; then
-                _staged_complete_tools
-              elif [[ "$cur" != -* ]]; then
-                _staged_complete_sessions
-              fi ;;
-            set)
-              COMPREPLY=( $(compgen -W "--tool --default-session" -- "$cur") )
-              [[ "$prev" == "--tool" ]] && _staged_complete_tools
-              [[ "$prev" == "--default-session" ]] && _staged_complete_sessions ;;
-            install-skill)
-              COMPREPLY=( $(compgen -W "--default -t --tool" -- "$cur") )
-              [[ "$prev" == "-t" || "$prev" == "--tool" ]] && _staged_complete_tools ;;
-            *)
-              _staged_complete_files ;;
-          esac
-        }
-
-        complete -F _staged staged stage staged-diff
-        """)
-
-def write_text_file(path, content):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-        if not content.endswith("\n"):
-            f.write("\n")
-
 def upsert_shell_block(path, block, insert_before_compinit=False):
     block = block.strip() + "\n"
     if os.path.isfile(path):
@@ -1535,7 +804,7 @@ def upsert_shell_block(path, block, insert_before_compinit=False):
             re.DOTALL,
         )
         if pattern.search(content):
-            content = pattern.sub(block.strip(), content)
+            content = pattern.sub(lambda match: block.strip(), content)
         elif insert_before_compinit:
             lines = content.splitlines(keepends=True)
             insert_at = None
@@ -1558,42 +827,316 @@ def upsert_shell_block(path, block, insert_before_compinit=False):
         with open(path, "w", encoding="utf-8") as f:
             f.write(block)
 
-def install_completion():
-    zfunc = os.path.join(HOME, ".zfunc")
-    bash_dir = os.path.join(CONFIG_DIR, "completions")
-    zsh_body = embedded_zsh_completion()
-    bash_body = embedded_bash_completion()
 
-    zsh_dest = os.path.join(zfunc, "_staged")
-    stage_dest = os.path.join(zfunc, "_stage")
-    bash_dest = os.path.join(bash_dir, "staged.bash")
-    write_text_file(zsh_dest, zsh_body)
-    write_text_file(stage_dest, zsh_body)
-    write_text_file(bash_dest, bash_body)
 
-    zsh_block = f"""{COMPLETION_MARKER_START}
-# Tab completion for staged / stage (managed by staged --install-completion)
-[[ -d "{zfunc}" ]] && fpath=("{zfunc}" $fpath)
-{COMPLETION_MARKER_END}
-"""
+def make_parser():
+    def globals_on(parser, path_command=False):
+        parser.add_argument('-t', '--tool', default=argparse.SUPPRESS, help='editor adapter ID')
+        flags = ['--session'] if path_command else ['-s', '--session']
+        parser.add_argument(*flags, default=argparse.SUPPRESS, help='session ID or unique prefix')
+        parser.add_argument('--root', default=argparse.SUPPRESS, help='staging root (outside the workspace)')
+        parser.add_argument('-v', '--verbose', action='store_true', default=argparse.SUPPRESS)
+    parser = argparse.ArgumentParser(prog='staged', description=__doc__)
+    parser.set_defaults(tool=None, session=None, root=None, verbose=False)
+    globals_on(parser)
+    parser.add_argument('-R', '--all-repos', action='store_true', help='list sessions across repositories')
+    parser.add_argument('--sessions', action='store_true', help='list sessions for this repository')
+    parser.add_argument('--install-completion', action='store_true', help='install shell integration')
+    parser.add_argument('--shell', choices=['bash', 'zsh', 'powershell', 'cmd'], help='shell for completion installation')
+    for helper in ('--complete', '--complete-sessions', '--complete-tools', '--list'):
+        parser.add_argument(helper, action='store_true', help=argparse.SUPPRESS)
+    subs = parser.add_subparsers(dest='command')
+    command_parsers = {}
+    descriptions = {
+        'init': 'Create an isolated session and record its workspace and branch.',
+        'diff': 'Review proposed files, or explicitly apply them with -a.',
+        'apply': 'Apply proposed files, renames and deletions to the workspace.',
+        'clean': 'Discard staged proposals without changing the workspace.',
+        'path': 'Print a raw absolute staged or workspace path.',
+        'use': 'Bind a session or tool to the current shell.',
+        'set': 'Set persistent preferences.',
+        'set-tool': 'Register a custom editor using argument templates.',
+        'migrate': 'Copy proposals between sessions, checking for stale conflicts.',
+        'install-skill': 'Install /stage for an agent harness.',
+    }
+    for name in COMMANDS:
+        command = subs.add_parser(name, description=descriptions[name], help=descriptions[name])
+        globals_on(command, name == 'path')
+        command_parsers[name] = command
+    p = command_parsers['init']
+    p.add_argument('id', nargs='?', help='conversation ID; generates a UUID when omitted')
+    p.add_argument('--json', action='store_true', help='print machine-readable session paths')
+    p = command_parsers['diff']
+    p.add_argument('target', nargs='?')
+    p.add_argument('-a', '--apply', action='store_true')
+    comparison = p.add_mutually_exclusive_group()
+    comparison.add_argument('--between', nargs=2, metavar=('SESSION1', 'SESSION2'))
+    comparison.add_argument('--compare-session')
+    for name in ('diff', 'apply'):
+        command_parsers[name].add_argument('--force', action='store_true', help='allow protected-branch apply')
+        command_parsers[name].add_argument('-y', '--yes', action='store_true', help='confirm branch drift')
+    p = command_parsers['apply']
+    p.add_argument('target', nargs='?')
+    p.add_argument('-f', '--file')
+    p = command_parsers['clean']
+    p.add_argument('-f', '--file')
+    p.add_argument('-y', '--yes', action='store_true')
+    p = command_parsers['path']
+    p.add_argument('target')
+    group = p.add_mutually_exclusive_group()
+    group.add_argument('-s', '--staged', action='store_true', help='print proposed-file path (default)')
+    group.add_argument('-w', '--workspace', action='store_true')
+    p = command_parsers['use']
+    p.add_argument('id', nargs='?')
+    p.add_argument('--clear', action='store_true')
+    p = command_parsers['set']
+    p.add_argument('--default', action='store_true', help='global preferences (the default)')
+    p.add_argument('--repo', action='store_true', help='save in this workspace .staged.json')
+    p.add_argument('--default-session')
+    p.add_argument('--branch-protection', choices=['true', 'false'])
+    p.add_argument('--protected-branch', action='append', help='replace protected patterns; repeat for each pattern')
+    p.add_argument('--session-root', action='append', help='additional discovery root; repeat for each root')
+    p = command_parsers['set-tool']
+    p.add_argument('id')
+    p.add_argument('--name', required=True)
+    p.add_argument('--diff-cmd', required=True)
+    p.add_argument('--open-cmd', required=True)
+    p = command_parsers['migrate']
+    p.add_argument('--from', dest='source', required=True)
+    p.add_argument('--to', help='existing session or new session ID')
+    p.add_argument('-f', '--file')
+    p.add_argument('--force', action='store_true', help='replace target proposals despite conflicts')
+    p = command_parsers['install-skill']
+    p.add_argument('--default', action='store_true')
+    p.add_argument('--target-dir', help='explicit directory containing the installed SKILL.md')
+    p.add_argument('--configure-sandbox', action='store_true', help='merge staging-root permissions where supported')
+    return parser, command_parsers
 
-    bash_block = f"""{COMPLETION_MARKER_START}
-# Tab completion for staged / stage (managed by staged --install-completion)
-[[ -f "{bash_dest}" ]] && source "{bash_dest}"
-{COMPLETION_MARKER_END}"""
 
-    zshrc = os.path.join(HOME, ".zshrc")
-    upsert_shell_block(zshrc, zsh_block, insert_before_compinit=True)
+def install_completion(shell=None):
+    shell = shell or ('powershell' if os.name == 'nt' else Path(os.environ.get('SHELL', 'bash')).name)
+    directory = CONFIG_DIR / 'completions'
+    if shell == 'bash':
+        target = directory / 'staged.bash'
+        body = r'''_staged() {
+  local cur="${COMP_WORDS[COMP_CWORD]}" prev="${COMP_WORDS[COMP_CWORD-1]}" item
+  local -a choices=()
+  case "$prev" in
+    --tool|-t) mapfile -t choices < <(command staged --complete-tools 2>/dev/null) ;;
+    --session|-s|--from|--to|--between|--compare-session|use)
+      mapfile -t choices < <(command staged --complete-sessions 2>/dev/null) ;;
+    *)
+      choices=(init diff apply clean path use set set-tool migrate install-skill all --help --session --tool --root --force --yes --file --apply --between --compare-session)
+      while IFS= read -r item; do choices+=("$item"); done < <(command staged --list 2>/dev/null)
+      ;;
+  esac
+  COMPREPLY=()
+  for item in "${choices[@]}"; do
+    [[ "$item" == "$cur"* ]] && COMPREPLY+=("$item")
+  done
+}
+complete -F _staged staged
+'''
+        # macOS ships Bash 3.2, which has no mapfile.
+        body = body.replace('mapfile -t choices < <(', 'while IFS= read -r item; do choices+=("$item"); done < <(')
+        write_text_file(target, body)
+        hook = '{}\nsource {}\n{}\n'.format(COMPLETION_MARKER_START, shlex.quote(str(target)), COMPLETION_MARKER_END)
+        upsert_shell_block(str(Path(HOME) / '.bashrc'), hook)
+        upsert_shell_block(str(Path(HOME) / '.bash_profile'), hook)
+    elif shell == 'zsh':
+        target = directory / '_staged'
+        body = '''#compdef staged
+_staged() {
+  local -a candidates
+  case "${words[CURRENT-1]}" in
+    --tool|-t) candidates=("${(@f)$(command staged --complete-tools 2>/dev/null)}") ;;
+    --session|-s|--from|--to|--between|--compare-session|use)
+      candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}") ;;
+    *) candidates=(init diff apply clean path use set set-tool migrate install-skill all --help --session --tool --root --force --yes --file --apply --between --compare-session "${(@f)$(command staged --list 2>/dev/null)}") ;;
+  esac
+  compadd -- "${candidates[@]}"
+}
+_staged "$@"
+'''
+        write_text_file(target, body)
+        hook = '{}\nfpath=({} $fpath)\nautoload -Uz compinit\ncompinit\n{}\n'.format(
+            COMPLETION_MARKER_START, shlex.quote(str(directory)), COMPLETION_MARKER_END)
+        upsert_shell_block(str(Path(HOME) / '.zshrc'), hook, insert_before_compinit=True)
+    elif shell == 'powershell':
+        target = directory / 'staged.ps1'
+        body = '''Register-ArgumentCompleter -Native -CommandName staged -ScriptBlock {
+  param($wordToComplete, $commandAst, $cursorPosition)
+  $words = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })
+  $previous = if ($wordToComplete) { $words[-2] } else { $words[-1] }
+  $choices = switch ($previous) {
+    { $_ -in '--tool','-t' } { & staged --complete-tools; break }
+    { $_ -in '--session','-s','--from','--to','--between','--compare-session','use' } { & staged --complete-sessions; break }
+    default { 'init','diff','apply','clean','path','use','set','set-tool','migrate','install-skill','all'; & staged --list }
+  }
+  $choices | Where-Object { $_.StartsWith($wordToComplete) } | ForEach-Object {
+    $quoted = "'" + $_.Replace("'", "''") + "'"
+    [System.Management.Automation.CompletionResult]::new($quoted, $_, 'ParameterValue', $_)
+  }
+}
+'''
+        write_text_file(target, body)
+        print("Load in PowerShell (add to $PROFILE to persist): . '{}'".format(str(target).replace("'", "''")))
+    elif shell == 'cmd':
+        target = CONFIG_DIR / 'bin/staged.cmd'
+        write_text_file(target, '@echo off\r\n"{}" "{}" %*\r\n'.format(sys.executable, REPO_ROOT / 'staged'))
+        print('Add {} to PATH. CMD provides filesystem completion, not dynamic argument completion.'.format(target.parent))
+    else:
+        raise StagedError('Choose --shell bash, zsh, powershell or cmd.')
+    print('Installed: {}'.format(target))
 
-    for bash_rc in (os.path.join(HOME, ".bashrc"), os.path.join(HOME, ".bash_profile")):
-        upsert_shell_block(bash_rc, bash_block)
 
-    print("Installed shell tab completion:")
-    print(f"  Zsh:  {zsh_dest} (+ symlink name _stage)")
-    print(f"        fpath hook appended to {zshrc}")
-    print(f"  Bash: {bash_dest}")
-    print("        source hook appended to ~/.bashrc and ~/.bash_profile (if present)")
-    print("\nStart a new shell (or run: exec zsh / exec bash), then try: staged <TAB>")
+def set_preferences(ctx):
+    args = ctx.args
+    data = dict(ctx.local if args.repo else ctx.global_state)
+    if args.repo and args.default:
+        raise StagedError('--repo and --default are mutually exclusive.')
+    if args.tool:
+        data['default_tool'] = ctx.tool().id
+    if args.default_session:
+        data['default_session'] = ctx.find_session(args.default_session).id
+    if args.root:
+        data['staging_root'] = str(Path(args.root).expanduser().resolve())
+    if args.branch_protection:
+        data['branch_protection'] = args.branch_protection == 'true'
+    if args.protected_branch is not None:
+        data['protected_branches'] = args.protected_branch
+    if args.session_root is not None:
+        data['session_roots'] = [str(Path(r).expanduser().resolve()) for r in args.session_root]
+    path = ctx.workspace / '.staged.json' if args.repo else GLOBAL_STATE_FILE
+    save_json(path, data)
+    print('Updated ' + str(path))
 
-if __name__ == "__main__":
-    main()
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser, commands = make_parser()
+    # Handle help before parsing required values or reading any configuration.
+    if '--help' in argv or '-h' in argv or argv[:1] == ['help']:
+        command = next((arg for arg in argv if arg in commands), None)
+        (commands.get(command) or parser).print_help()
+        return
+    args = parser.parse_args(argv)
+    ctx = Context(args)
+    if args.install_completion:
+        install_completion(args.shell)
+        return
+    if args.complete_tools:
+        print('\n'.join(sorted(ctx.registry)))
+        return
+    if args.all_repos or args.sessions or args.complete_sessions:
+        for session in ctx.sessions(args.all_repos):
+            if args.complete_sessions:
+                print(session.id)
+            else:
+                print('{}  {} changes  {}\n  {}'.format(session.id, len(session.paths()), session.workspace, session.staging))
+        return
+    if args.complete or args.list:
+        try:
+            print('\n'.join(ctx.active().paths()))
+        except StagedError as exc:
+            if not str(exc).startswith('No staging session'):
+                raise
+        return
+    if args.command == 'init':
+        session = init_session(ctx, args.id or args.session or str(uuid.uuid4()))
+        ctx.shell['session'] = session.id
+        save_json(ctx.shell_path, ctx.shell)
+        result = {'session': session.id, 'workspace': str(session.workspace), 'staging': str(session.staging),
+                  'branch': session.metadata.get('branch'), 'directory': str(session.directory)}
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print('Session: {}\nStaging: {}\nReview: staged --session {}'.format(session.id, session.staging, session.id))
+        return
+    if args.command == 'use':
+        if args.id and args.session:
+            raise StagedError('Choose either --session <id> or a positional session ID.')
+        binding = args.session or args.id
+        if args.clear:
+            if binding or args.tool:
+                raise StagedError('--clear cannot be combined with a session or tool.')
+            if ctx.shell_path.exists():
+                ctx.shell_path.unlink()
+            print('Cleared shell binding.')
+            return
+        if not binding and not args.tool:
+            raise StagedError('Provide --session <id>, --tool or --clear.')
+        if binding:
+            ctx.shell['session'] = ctx.find_session(binding).id
+        if args.tool:
+            ctx.shell['tool'] = ctx.tool().id
+        save_json(ctx.shell_path, ctx.shell)
+        print('Shell binding: ' + json.dumps(ctx.shell))
+        return
+    if args.command == 'set':
+        set_preferences(ctx)
+        return
+    if args.command == 'set-tool':
+        key = session_id(args.id)
+        if key in TOOL_REGISTRY:
+            raise StagedError('Choose a custom ID; built-in adapters cannot be replaced.')
+        diff, opening = shlex.split(args.diff_cmd), shlex.split(args.open_cmd)
+        if not diff or not opening or '{orig}' not in args.diff_cmd or '{staged}' not in args.diff_cmd or '{staged}' not in args.open_cmd:
+            raise StagedError('Diff requires {orig} and {staged}; open requires {staged}.')
+        ctx.global_state.setdefault('tools', {})[key] = {'name': args.name, 'diff_cmd': diff, 'open_cmd': opening, 'root': args.root}
+        save_json(GLOBAL_STATE_FILE, ctx.global_state)
+        print('Registered tool: ' + key)
+        return
+    if args.command == 'install-skill':
+        tool = ctx.tool()
+        path = tool.install_skill(args.target_dir)
+        root = ctx.staging_root()
+        root.mkdir(parents=True, exist_ok=True)
+        if args.configure_sandbox:
+            if tool.configure_sandbox(root):
+                print('Configured staging-root permissions for ' + tool.name)
+            else:
+                print('Automatic sandbox configuration is unavailable for {}. Add {} to your harness writable roots.'.format(tool.name, root))
+        if args.default:
+            ctx.global_state['default_tool'] = tool.id
+        ctx.global_state['staging_root'] = str(root)
+        save_json(GLOBAL_STATE_FILE, ctx.global_state)
+        print('Installed /stage: {}'.format(path))
+        print('Staging root: {}. Skill installation alone does not grant filesystem permissions.'.format(root))
+        return
+    if args.command == 'migrate':
+        migrate(ctx)
+        return
+    if args.command == 'diff' and (args.between or args.compare_session):
+        cross_diff(ctx)
+        return
+    session = ctx.active()
+    if args.command == 'path':
+        rel = match_file(args.target, session.paths())
+        if args.workspace:
+            print(session.original(rel))
+        elif rel in session.deletions:
+            raise StagedError('Deletion has no staged file; use --workspace.')
+        else:
+            print(safe_path(session.staging, rel))
+    elif args.command == 'clean':
+        clean_session(ctx, session)
+    elif args.command == 'apply' or (args.command == 'diff' and args.apply):
+        if args.command == 'apply' and args.file and args.target:
+            raise StagedError('Choose either a positional target or --file.')
+        apply_changes(ctx, session, getattr(args, 'file', None) or args.target or 'all')
+    elif args.command == 'diff' and args.target:
+        review(ctx, session, args.target)
+    else:
+        overview(ctx, session)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (StagedError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        print('Error: {}'.format(exc), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print('\nAborted.', file=sys.stderr)
+        sys.exit(130)
