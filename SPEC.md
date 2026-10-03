@@ -16,8 +16,8 @@ git clone https://github.com/melchi-shared-useful.git
 cd melchi-shared-useful/packages/staged
 
 # 2. Link CLI to user PATH
-ln -sfn "$(pwd)/scripts/staged" ~/.local/bin/staged
-ln -sfn "$(pwd)/scripts/staged" ~/.local/bin/stage
+ln -sfn "$(pwd)/staged" ~/.local/bin/staged
+ln -sfn "$(pwd)/staged" ~/.local/bin/stage
 
 # 3. Install completion
 staged --install-completion

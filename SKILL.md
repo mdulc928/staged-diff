@@ -8,7 +8,7 @@ description: >-
 
 # Staging Workflow (`/stage`)
 
-This skill defines a safety-first, non-intrusive development workflow where the **session artifacts/staging directory serves as the isolated workspace**. All proposed source code modifications, new files, and refactors are physically created and edited inside the staging directory first, allowing full review of real files before anything is applied to the workspace.
+This skill defines a safety-first, non-intrusive development workflow where the **session staging directory serves as the isolated workspace**. All proposed source code modifications, new files, and refactors are physically created and edited inside the staging directory first, allowing full review of real files before anything is applied to the workspace.
 
 ---
 
@@ -16,10 +16,10 @@ This skill defines a safety-first, non-intrusive development workflow where the 
 
 - **Isolated Staging Folder as Workspace**: The staging folder acts as the working directory during the staging phase. Real files (`.svelte`, `.ts`, `.js`, `.py`, `.css`, etc.) are created and modified there on disk, mirroring relative project paths.
   - Antigravity staging path: `<appDataDir>/brain/<conversation-id>/staging/`
-  - Cursor staging path: `~/.local/share/cursor-artifact-staging/<conversation-id>/staging/` (or `~/.local/share/stage/<conversation-id>/staging/`)
+  - Cursor / Generic staging path: `~/.local/share/stage/<conversation-id>/staging/`
 - **No Git Worktree Needed**: The staging directory provides complete file-level isolation without allocating or switching git worktrees. Running dev servers (`npm run dev`, Vite) and editor buffers remain completely undisturbed.
 - **Real Files, Not Markdown Text Diffs**: Never output raw markdown diff blocks (` ```diff `) as a substitute for code changes. Write the actual updated or new source files to the staging directory so they are valid, inspectable files with syntax highlighting and language tooling.
-- **Side-by-Side Review Dashboard (`staged_changes.md`)**: A dedicated review artifact is maintained with direct clickable links (`file:///`) to both the **staged file** and the **original workspace file**.
+- **Side-by-Side Review Dashboard (`staged_changes.md`)**: A dedicated review dashboard is maintained with direct clickable links (`file:///`) to both the **staged file** and the **original workspace file**.
 - **Mandatory Conversation ID Output**: Every `/stage` review dashboard (`staged_changes.md`) and summary response **MUST prominently print the active Conversation ID** at the top so the user can easily copy and switch between sessions or use `staged use <session_id>`.
 - **Side-by-Side Graphical Diffing (`staged diff <file>`)**: The user or agent can launch graphical diff tabs directly in their editor with `staged diff <file>` and apply them directly with `staged diff <file> -a`.
 - **Explicit Apply Gating**: No workspace files may be touched until the user explicitly approves or asks to apply.
@@ -28,11 +28,11 @@ This skill defines a safety-first, non-intrusive development workflow where the 
 
 ## 2. Directory Structure
 
-Inside the conversation's storage directory (`<appDataDir>/brain/<conversation-id>/`):
+Inside the conversation's session directory (e.g. `~/.local/share/stage/<conversation-id>/` or `<appDataDir>/brain/<conversation-id>/`):
 
 ```
 <conversation-id>/
-├── staged_changes.md          # Review dashboard artifact (RequestFeedback: true)
+├── staged_changes.md          # Review dashboard summary
 ├── .workspace                 # Absolute path to repository root
 ├── renames.json               # Optional tracking of moves, renames, and deletions
 └── staging/                   # Staging workspace root (mirrors project paths)
@@ -51,10 +51,10 @@ Inside the conversation's storage directory (`<appDataDir>/brain/<conversation-i
 ### Step 1: Research & Setup Staging Target
 
 1. Read the target workspace files using read tools (`view_file`, `grep_search`, `list_dir`).
-2. Identify the active conversation artifact directory:
-   `<appDataDir>/brain/<conversation-id>/`
+2. Identify the active conversation session directory:
+   `~/.local/share/stage/<conversation-id>/` (or `<appDataDir>/brain/<conversation-id>/`)
 3. Identify the target paths in the staging directory:
-   `<appDataDir>/brain/<conversation-id>/staging/<relative-workspace-path>`
+   `<session-dir>/staging/<relative-workspace-path>`
 
 ### Step 2: Implement Changes in the Staging Workspace
 
@@ -63,11 +63,10 @@ Inside the conversation's storage directory (`<appDataDir>/brain/<conversation-i
 3. **Renames / Moves**: Update `renames.json` so the new relative path maps to the old workspace path.
 4. **Deletions**: Note pending deletions in `renames.json` under `"_deletions": ["path/..."]`. Do not delete workspace files yet.
 
-### Step 3: Create the Review Dashboard Artifact (`staged_changes.md`)
+### Step 3: Create the Review Dashboard (`staged_changes.md`)
 
-1. Create or update `staged_changes.md` in `<appDataDir>/brain/<conversation-id>/staged_changes.md`.
-2. Set `ArtifactMetadata` with `UserFacing: true` and `RequestFeedback: true`.
-3. Include the mandatory header with the Session ID:
+1. Create or update `staged_changes.md` in `<session-dir>/staged_changes.md`.
+2. Include the mandatory header with the Session ID:
 
    ```markdown
    # Staged Changes Review
@@ -80,7 +79,7 @@ Inside the conversation's storage directory (`<appDataDir>/brain/<conversation-i
    Quick Apply: `staged diff <filename> -a`
    ```
 
-4. Provide a clickable table of all staged files and workspace originals.
+3. Provide a clickable table of all staged files and workspace originals.
 
 ### Step 4: Await Review & Refine
 
