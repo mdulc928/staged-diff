@@ -284,7 +284,7 @@ class ToolAdapter:
 TOOL_REGISTRY = {
     "cursor": ToolAdapter(
         "cursor", "Cursor",
-        "~/.local/share/cursor-artifact-staging",
+        "~/.local/share/stage",
         ["cursor", "-r", "--diff", "{orig}", "{staged}"],
         ["cursor", "-r", "{staged}"]
     ),
@@ -1197,20 +1197,21 @@ def handle_set_command(args):
     print(f"Updated configuration in {GLOBAL_STATE_FILE}")
 
 def run_install_skill(tool_name, is_default=False):
-    tool = TOOL_REGISTRY.get(normalize_tool_id(tool_name))
+    norm_id = normalize_tool_id(tool_name)
+    tool = TOOL_REGISTRY.get(norm_id)
     if not tool:
         print(f"Error: Unknown tool '{tool_name}'")
         sys.exit(1)
 
     print(f"Installing /stage skill for {tool.name}...")
-    if tool_name == "cursor":
-        skill_src = os.path.join(REPO_ROOT, "skills", "cursor", "SKILL.md")
-    else:
+    skill_src = os.path.join(REPO_ROOT, "skills", norm_id, "SKILL.md")
+    if not os.path.isfile(skill_src):
         skill_src = os.path.join(REPO_ROOT, "SKILL.md")
     if not os.path.isfile(skill_src):
         print(f"Error: Skill source not found: {skill_src}")
         sys.exit(1)
-    if tool_name == "cursor":
+
+    if norm_id == "cursor":
         target = os.path.join(HOME, ".cursor", "skills", "stage", "SKILL.md")
         os.makedirs(os.path.dirname(target), exist_ok=True)
         shutil.copy2(skill_src, target)
@@ -1233,15 +1234,37 @@ def run_install_skill(tool_name, is_default=False):
             save_json(sandbox_path, data)
             for stage_root in added:
                 print(f"Added {stage_root} to ~/.cursor/sandbox.json")
-    elif tool_name == "antigravity":
+    elif norm_id == "antigravity":
         target = os.path.join(HOME, ".gemini", "config", "skills", "stage", "SKILL.md")
         os.makedirs(os.path.dirname(target), exist_ok=True)
         shutil.copy2(skill_src, target)
         print(f"Installed skill: {target}")
+    elif norm_id == "claudecode":
+        target = os.path.join(HOME, ".claude", "skills", "stage", "SKILL.md")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(skill_src, target)
+        print(f"Installed skill: {target}")
+    elif norm_id == "windsurf":
+        target = os.path.join(HOME, ".codeium", "windsurf", "skills", "stage", "SKILL.md")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(skill_src, target)
+        print(f"Installed skill: {target}")
+    elif norm_id == "zed":
+        target = os.path.join(HOME, ".config", "zed", "skills", "stage", "SKILL.md")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(skill_src, target)
+        print(f"Installed skill: {target}")
+    elif norm_id == "codex":
+        target = os.path.join(HOME, ".codex", "skills", "stage", "SKILL.md")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(skill_src, target)
+        print(f"Installed skill: {target}")
+    else:
+        print(f"Note: Staged skill source ready at: {skill_src}")
 
     if is_default:
         g = get_global_state()
-        g["default_tool"] = tool_name
+        g["default_tool"] = norm_id
         save_json(GLOBAL_STATE_FILE, g)
         print(f"Set {tool.name} as default tool.")
 

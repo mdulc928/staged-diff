@@ -1,7 +1,7 @@
 ---
 name: stage
 description: >-
-  Stages proposed code as real files under ~/.local/share/stage (or ~/.local/share/cursor-artifact-staging) before anything is written to the workspace, with side-by-side review via the 'staged' CLI tool.
+  Stages proposed code as real files under ~/.local/share/stage before anything is written to the workspace, with side-by-side review via the 'staged' CLI tool.
   Use when the user asks to stage changes first, preview edits before applying them, review a patch without a git worktree, or keep the agent from touching the working tree until approved.
 ---
 
@@ -15,7 +15,7 @@ The user may stay in Agent mode (or any mode). Your job is to copy targets into 
 
 ## Sandbox vs approvals (Cursor)
 
-**Filesystem:** proposed files go under `~/.local/share/stage/...` (or legacy `~/.local/share/cursor-artifact-staging/...`).
+**Filesystem:** proposed files go under `~/.local/share/stage/...`.
 Cursor write-protects `~/.cursor` except `rules/`, `commands/`, `worktrees/`, `skills/`, and `agents/`. Staging stays outside `~/.cursor` so a sandboxed shell can write it. That path must appear in `~/.cursor/sandbox.json` → `additionalReadwritePaths` (keep `type`: `workspace_readwrite`). After changes, start a **new agent session** so the sandbox reloads.
 
 **Cursor CLI:** [CLI permissions](https://cursor.com/docs/cli/reference/permissions) in `~/.cursor/cli-config.json` need both `Read(...)` and `Write(...)`. Run `staged install-skill --tool cursor --default` to configure both automatically.
@@ -35,7 +35,7 @@ Cursor write-protects `~/.cursor` except `rules/`, `commands/`, `worktrees/`, `s
 
 ## Absolute paths only (critical)
 
-The Write/StrReplace tool path must be a **full absolute path** starting with `/Users/.../.local/share/stage/` (or `.../cursor-artifact-staging/`).
+The Write/StrReplace tool path must be a **full absolute path** starting with `/Users/.../.local/share/stage/`.
 
 - **Correct:** `/Users/<you>/.local/share/stage/<conversation-id>/staging/src/foo.ts`
 - **Wrong:** `.local/share/stage/...` (creates `./.local` inside git repo)
