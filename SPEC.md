@@ -153,13 +153,14 @@ Skill installation uses the selected adapter and reports the actual destination:
 | Claude Code | `~/.claude/skills/stage` |
 | Windsurf/Cascade | `~/.codeium/windsurf/skills/stage` |
 | Antigravity | `~/.gemini/config/skills/stage` |
+| Zed | `~/.agents/skills/stage` |
 | Other editor or custom harness | Explicit `--target-dir` required |
 
 `--default` saves the selected tool. Skill installation and sandbox permission changes are distinct capabilities. `--configure-sandbox` opts into merging Cursor staging-root permissions into `sandbox.json` and `cli-config.json`, preserving unrelated settings. Unsupported harnesses must report that automatic permission configuration is unavailable and identify the root needing manual access. No undocumented allowlist files should be invented.
 
 The tool does not enforce a repository read-only sandbox. A harness or administrator may impose additional restrictions; installing the skill cannot override them. A read-only listing must not prompt for or grant new sandbox permissions.
 
-Installation paths and Cursor settings are based on [Cursor skills](https://prod.cursor.com/docs/skills), [Cursor sandbox configuration](https://prod.cursor.com/docs/reference/sandbox), [Cursor CLI permissions](https://prod.cursor.com/docs/cli/reference/permissions), [Codex skills](https://learn.chatgpt.com/docs/build-skills), [Claude Code skills](https://code.claude.com/docs/en/skills), [Cascade skills](https://docs.devin.ai/desktop/cascade/skills), and [Antigravity skills](https://antigravity.google/docs/skills?app=antigravity-ide).
+Installation paths and Cursor settings are based on [Cursor skills](https://prod.cursor.com/docs/skills), [Cursor sandbox configuration](https://prod.cursor.com/docs/reference/sandbox), [Cursor CLI permissions](https://prod.cursor.com/docs/cli/reference/permissions), [Codex skills](https://learn.chatgpt.com/docs/build-skills), [Claude Code skills](https://code.claude.com/docs/en/skills), [Cascade skills](https://docs.devin.ai/desktop/cascade/skills), [Antigravity skills](https://antigravity.google/docs/skills?app=antigravity-ide), and [Zed skills](https://zed.dev/docs/ai/skills).
 
 ## 7. Skill behavior
 

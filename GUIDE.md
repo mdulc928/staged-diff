@@ -94,9 +94,10 @@ staged install-skill --tool codex
 staged install-skill --tool claudecode
 staged install-skill --tool windsurf
 staged install-skill --tool antigravity
+staged install-skill --tool zed
 ```
 
-Run the command for the harness you use; you do not need to install all five. `--default` makes that tool the default review adapter. Codex and Claude Code adapters use terminal diffs; you can choose a graphical editor separately afterward.
+Run the command for the harness you use; you do not need to install all six. `--default` makes that tool the default review adapter. Codex and Claude Code adapters use terminal diffs; you can choose a graphical editor separately afterward.
 
 | Harness | Installed skill directory |
 | --- | --- |
@@ -105,14 +106,15 @@ Run the command for the harness you use; you do not need to install all five. `-
 | Claude Code | `~/.claude/skills/stage` |
 | Windsurf/Cascade | `~/.codeium/windsurf/skills/stage` |
 | Antigravity | `~/.gemini/config/skills/stage` |
+| Zed | `~/.agents/skills/stage` |
 
-For VS Code, PyCharm, Zed, or another editor, use the skill directory recognized by the agent harness inside that editor:
+For VS Code, PyCharm, or another editor, use the skill directory recognized by the agent harness inside that editor:
 
 ```bash
-staged install-skill --tool zed --target-dir /absolute/path/to/skills/stage
+staged install-skill --tool vscode --target-dir /absolute/path/to/skills/stage
 ```
 
-`--target-dir` is the directory that will contain `SKILL.md`, including the final `stage` directory. It is not the proposal storage root. Reinstalling replaces that installed `SKILL.md` with the bundled copy.
+`--target-dir` is the directory that will contain `SKILL.md`, including the final `stage` directory. It is not the proposal storage root. Reinstalling replaces that installed `SKILL.md` with the bundled copy. External agents running inside Zed use their own skill configuration; Zed's native assistant loads skills from `~/.agents/skills/` (see [Zed's skills documentation](https://zed.dev/docs/ai/skills)).
 
 ### Grant staging-directory access
 
