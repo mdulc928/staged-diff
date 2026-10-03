@@ -42,29 +42,29 @@ For a rename, write the complete destination file and map its relative destinati
 }
 ```
 
-Preserve unrelated entries when editing the manifest. Use forward-slash relative paths. Symlinks, Git metadata, path traversal and overlapping rename chains are unsupported. A path cannot be both a proposed file and a deletion.
+Preserve unrelated entries when editing the manifest. Use forward-slash relative paths. Symlinks, Git metadata, path traversal and overlapping rename chains are unsupported. A path cannot be both a staged file and a deletion.
 
-Run `staged` to inspect the selected session's proposal. `staged diff <path>` opens review; `--tool cli` requests terminal output. Use exact relative paths when filenames are ambiguous.
+Run `staged` to inspect the selected session's staged changes. `staged diff -f <path>` opens review; `--tool cli` requests terminal output. Use exact relative paths when filenames are ambiguous.
 
 ## Present and refine
 
-Create or update `<session>/staged_changes.md`. Put the session ID prominently at the top, followed by the origin branch, staging path, changes and validation performed. Link the proposed files and workspace originals using links supported by the host. Include deletions and renames in the review.
+Create or update `<session>/staged_changes.md`. Put the session ID prominently at the top, followed by the origin branch, staging path, changes and validation performed. Link the staged files and workspace originals using links supported by the host. Include deletions and renames in the review.
 
 Include the session ID prominently in the response and offer the concrete review/apply commands:
 
 ```text
 staged use --session <id>
 staged
-staged diff <relative-path>
-staged apply all
+staged diff -f <relative-path>
+staged apply --all
 ```
 
-Explain tests that could not run against the isolated proposal. Do not run formatters or generators against the original workspace while staging. If full project validation needs a separate disposable copy, keep it outside the workspace and report where it ran.
+Explain tests that could not run against the isolated staged files. Do not run formatters or generators against the original workspace while staging. If full project validation needs a separate disposable copy, keep it outside the workspace and report where it ran.
 
 If the user requested review before apply and has not authorized applying, present the proposal and await their decision. Refinements stay in the same staging session.
 
 ## Apply when authorized
 
-With the intended session selected, run `staged apply <relative-path|all>` for the authorized scope. Do not silently add `--force` or `--yes` when branch protection or a change from the proposal's original Git branch blocks application; explain the concrete branch condition. Existing explicit approval for that condition can be used without asking again.
+With the intended session selected, run `staged apply -f <relative-path>` or `staged apply --all` for the authorized scope. Do not silently add `--force` or `--yes` when branch protection or a change from the staging session's original Git branch blocks application; explain the concrete branch condition. Existing explicit approval for that condition can be used without asking again.
 
-Run the checks appropriate to the project after applying. Report the outcome. Keep the staged proposal until the user requests cleanup; `staged clean` discards proposals and never reverts workspace files.
+Run the checks appropriate to the project after applying. Report the outcome. Keep the staged changes until the user requests cleanup; `staged clean -f <path>` or `staged clean --all` discards staged changes and never reverts workspace files.

@@ -24,8 +24,10 @@ if os.name == 'nt':
     CONFIG_DIR = Path(os.environ.get('APPDATA', HOME)) / 'staged'
     DATA_DIR = Path(os.environ.get('LOCALAPPDATA', HOME)) / 'staged'
 GLOBAL_STATE_FILE = CONFIG_DIR / 'state.json'
-DEFAULT_PROTECTED_BRANCHES = ['main', 'master', 'production', 'release/*', 'staging', 'develop']
-COMMANDS = ['init', 'diff', 'apply', 'clean', 'path', 'use', 'set', 'set-tool', 'migrate', 'install-skill']
+DEFAULT_PROTECTED_BRANCHES = []
+STATUS_COLORS = {'APPLIED': '32', 'MODIFIED': '33', 'NEW FILE': '36', 'RENAMED': '35',
+                 'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
+COMMANDS = ['init', 'diff', 'apply', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion']
 COMPLETION_MARKER_START = '# >>> staged completions >>>'
 COMPLETION_MARKER_END = '# <<< staged completions <<<'
 
@@ -44,6 +46,10 @@ def color_enabled():
 
 def color(text, code):
     return '\033[{}m{}\033[0m'.format(code, text) if color_enabled() else str(text)
+
+
+def status_token(status, width=0):
+    return color('[{}]'.format(status.ljust(width)), STATUS_COLORS[status])
 
 
 def load_json(path):
@@ -237,15 +243,31 @@ class Context:
             raise StagedError(('Ambiguous' if matches else 'Unknown') + ' session: ' + key)
         return matches[0]
 
-    def active(self):
-        key = (getattr(self.args, 'session', None) or os.environ.get('STAGED_SESSION') or self.shell.get('session')
-               or self.setting('default_session'))
+    def active(self, notify=True):
+        key = getattr(self.args, 'session', None) or os.environ.get('STAGED_SESSION') or self.shell.get('session')
         if key:
             return self.find_session(key)
-        sessions = self.sessions()
-        if not sessions:
+        default = self.setting('default_session')
+        sessions = [self.find_session(default)] if default else self.sessions()
+        session = sessions[0] if sessions else None
+        if notify:
+            self.report_deleted_session(session)
+        if session is None:
             raise StagedError('No staging session for {}. Run staged init <session-id>.'.format(self.workspace))
-        return sessions[0]
+        return session
+
+    def report_deleted_session(self, replacement):
+        deleted = self.shell.pop('deleted_session', None)
+        if deleted is None:
+            return
+        message = "Previously selected session '{}' was deleted.".format(deleted)
+        if replacement is not None:
+            message += " Using session '{}'.".format(replacement.id)
+        print(message, file=sys.stderr)
+        if self.shell:
+            save_json(self.shell_path, self.shell)
+        elif self.shell_path.exists():
+            self.shell_path.unlink()
 
 
 class Session:
@@ -318,6 +340,14 @@ class Session:
                 result[rel] = path
         return dict(sorted(result.items()))
 
+    def session_files(self):
+        if not self.directory.is_dir():
+            return []
+        return sorted(p.name for p in self.directory.iterdir() if p.is_file() and not p.name.startswith('.'))
+
+    def openable_paths(self, fresh=False, meta=False):
+        return self.session_files() if meta else sorted(self.files(fresh=fresh))
+
     def paths(self, fresh=False):
         return sorted(set(self.files(fresh=fresh)) | set(self.deletions) | (set(self.manifest) - {'_deletions'}))
 
@@ -389,7 +419,7 @@ def match_file(query, paths):
 def selected(session, target):
     # Mutating operations and explicit review never trust a derived inventory.
     paths = session.paths(fresh=True)
-    return paths if target == 'all' else [match_file(target, paths)]
+    return paths if target is None else [match_file(target, paths)]
 
 
 class ToolAdapter:
@@ -571,9 +601,7 @@ def overview(ctx, session):
         print('No staged changes yet.')
     for rel in paths:
         status = session.status(rel)
-        palette = {'APPLIED': '32', 'MODIFIED': '33', 'NEW FILE': '36', 'RENAMED': '35',
-                   'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
-        print('  {} {}'.format(color('[{:9}]'.format(status), palette[status]), rel))
+        print('  {} {}'.format(status_token(status, width=9), rel))
         if ctx.args.verbose:
             path = safe_path(session.staging, rel)
             print('    Staged:    {}'.format(path if path.exists() else '(deletion)'))
@@ -587,7 +615,7 @@ def review(ctx, session, target):
     tool = ctx.tool()
     terminal = tool.id in ('cli', 'codex', 'claudecode')
     for rel in selected(session, target):
-        if target == 'all' and session.status(rel) == 'APPLIED':
+        if target is None and session.status(rel) == 'APPLIED':
             continue
         original = session.original(rel)
         proposed = safe_path(session.staging, rel)
@@ -598,8 +626,33 @@ def review(ctx, session, target):
         write_text_file(empty, '')
         left = original if original.is_file() else empty
         right = empty if rel in session.deletions else proposed
-        print('Review [{}]: {}'.format(session.status(rel), rel), flush=True)
+        print('Review {}: {}'.format(status_token(session.status(rel)), rel), flush=True)
         run_editor(tool.get_diff_command(left, right), terminal)
+
+
+def open_file(ctx, session, target):
+    meta = ctx.args.meta
+    paths = session.openable_paths(fresh=True, meta=meta)
+    if not paths:
+        raise StagedError('No {} files to open.'.format('metadata' if meta else 'staged'))
+    aliases = {
+        'staging': 'staged_changes.md',
+        'staging.md': 'staged_changes.md',
+        'staged': 'staged_changes.md',
+        'staged.md': 'staged_changes.md',
+        'diff': 'diff_viewer.md',
+        'diff.md': 'diff_viewer.md',
+    }
+    resolved_query = target
+    if meta and target not in paths and target.lower() in aliases and aliases[target.lower()] in paths:
+        resolved_query = aliases[target.lower()]
+    rel = match_file(resolved_query, paths)
+    path = safe_path(session.directory if meta else session.staging, rel)
+    if not path.is_file():
+        raise StagedError('File does not exist: ' + str(path))
+    tool = ctx.tool()
+    print('Open: {}'.format(rel), flush=True)
+    run_editor(tool.get_open_command(path))
 
 
 def guard_apply(ctx, session):
@@ -658,17 +711,54 @@ def apply_changes(ctx, session, target):
         if rel in session.deletions:
             if dest.exists():
                 dest.unlink()
-            print('[DELETED] ' + rel)
+            print(status_token('DELETED') + ' ' + rel)
         else:
             copy_atomic(safe_path(session.staging, rel), dest)
             if old != dest and old.is_file():
                 old.unlink()
-            print('[APPLIED] ' + rel)
+            print(status_token('APPLIED') + ' ' + rel)
     session.refresh_index()
 
 
 def clean_session(ctx, session):
-    paths = selected(session, ctx.args.file or 'all')
+    if getattr(ctx.args, 'clean_session', None) is not None:
+        target_session = session
+        paths = target_session.paths(fresh=True)
+        if any(target_session.status(rel) != 'APPLIED' for rel in paths):
+            confirm("Discard session '{}' with {} pending change(s)?".format(target_session.id, len(paths)), ctx.args.yes)
+        else:
+            confirm("Discard session '{}'?".format(target_session.id), ctx.args.yes)
+        for shell_path in sorted(ctx.shell_path.parent.glob('*.json')):
+            if shell_path.is_symlink() or not shell_path.is_file():
+                continue
+            shell = load_json(shell_path)
+            if shell.get('session') == target_session.id:
+                shell.pop('session')
+                if shell_path != ctx.shell_path:
+                    shell['deleted_session'] = target_session.id
+                if shell:
+                    save_json(shell_path, shell)
+                else:
+                    shell_path.unlink()
+        if ctx.local.get('default_session') == target_session.id:
+            ctx.local.pop('default_session', None)
+            local_path = ctx.workspace / '.staged.json'
+            if ctx.local:
+                save_json(local_path, ctx.local)
+            elif local_path.exists():
+                local_path.unlink()
+        if ctx.global_state.get('default_session') == target_session.id:
+            ctx.global_state.pop('default_session', None)
+            if ctx.global_state:
+                save_json(GLOBAL_STATE_FILE, ctx.global_state)
+            elif GLOBAL_STATE_FILE.exists():
+                GLOBAL_STATE_FILE.unlink()
+        shutil.rmtree(target_session.directory)
+        print('Cleaned session {}.'.format(target_session.id))
+        return
+
+    target = ctx.args.file
+    paths = selected(session, target)
     if any(session.status(rel) != 'APPLIED' for rel in paths):
         confirm('Discard {} pending staged change(s) from {}?'.format(len(paths), session.id), ctx.args.yes)
     for rel in paths:
@@ -677,25 +767,25 @@ def clean_session(ctx, session):
             path.unlink()
         session.manifest.pop(rel, None)
         session.deletions[:] = [p for p in session.deletions if p != rel]
-    if ctx.args.file is None:
+    if target is None:
         session.manifest = {}
         session.deletions = []
     elif '_deletions' in session.manifest:
         session.manifest['_deletions'] = session.deletions
     session.save_manifest()
     session.refresh_index()
-    print('Cleaned {} staged change(s); workspace untouched.'.format(len(paths)))
+    print('Cleaned {} staged change(s);'.format(len(paths)))
 
 
 def cross_diff(ctx):
-    if ctx.args.apply:
-        raise StagedError('Cross-session comparison cannot be combined with --apply.')
+    if ctx.args.apply or getattr(ctx.args, 'clean', False):
+        raise StagedError('Cross-session comparison cannot be combined with --apply or --clean.')
     if ctx.args.between:
         left, right = (ctx.find_session(key) for key in ctx.args.between)
     else:
         left, right = ctx.active(), ctx.find_session(ctx.args.compare_session)
     common = sorted(set(left.files(fresh=True)) & set(right.files(fresh=True)))
-    paths = common if ctx.args.target in (None, 'all') else [match_file(ctx.args.target, common)]
+    paths = common if ctx.args.file is None else [match_file(ctx.args.file, common)]
     if not paths:
         raise StagedError('No common staged files in the two sessions.')
     tool = ctx.tool()
@@ -722,7 +812,7 @@ def migrate(ctx):
         if not paths:
             raise StagedError('No staged files matched migration pattern: ' + ctx.args.file)
     else:
-        paths = selected(source, ctx.args.file or 'all')
+        paths = selected(source, ctx.args.file)
     preflight(source, paths)
     # Validate the entire transfer before changing any destination files or manifest.
     conflicts = []
@@ -850,62 +940,68 @@ def upsert_shell_block(path, block, insert_before_compinit=False, move_to_end=Fa
 
 
 def make_parser():
-    def globals_on(parser, path_command=False):
+    def globals_on(parser, path_command=False, clean_command=False):
         parser.add_argument('-t', '--tool', default=argparse.SUPPRESS, help='editor adapter ID')
-        flags = ['--session'] if path_command else ['-s', '--session']
-        parser.add_argument(*flags, default=argparse.SUPPRESS, help='session ID or unique prefix')
+        if not clean_command:
+            flags = ['--session'] if path_command else ['-s', '--session']
+            parser.add_argument(*flags, default=argparse.SUPPRESS, help='session ID or unique prefix')
         parser.add_argument('--root', default=argparse.SUPPRESS, help='staging root (outside the workspace)')
         parser.add_argument('-v', '--verbose', action='store_true', default=argparse.SUPPRESS)
     parser = argparse.ArgumentParser(prog='staged', description=__doc__)
-    parser.set_defaults(tool=None, session=None, root=None, verbose=False)
+    parser.set_defaults(tool=None, session=None, root=None, verbose=False, clean_session=None)
     globals_on(parser)
     parser.add_argument('-R', '--all-repos', action='store_true', help='list sessions across repositories')
     parser.add_argument('--sessions', action='store_true', help='list sessions for this repository')
-    parser.add_argument('--install-completion', action='store_true', help='install shell integration')
-    parser.add_argument('--shell', choices=['bash', 'zsh', 'powershell'], help='shell for completion installation')
-    for helper in ('--complete', '--complete-sessions', '--complete-tools', '--list'):
+    for helper in ('--complete', '--complete-sessions', '--complete-tools', '--complete-open', '--complete-meta', '--list'):
         parser.add_argument(helper, action='store_true', help=argparse.SUPPRESS)
     subs = parser.add_subparsers(dest='command')
     command_parsers = {}
     descriptions = {
         'init': 'Create an isolated session and record its workspace and branch.',
-        'diff': 'Review proposed files, or explicitly apply them with -a.',
+        'diff': 'Review proposed files, apply with -a, clean with -c, or apply then clean with -ac.',
         'apply': 'Apply proposed files, renames and deletions to the workspace.',
         'clean': 'Discard staged proposals without changing the workspace.',
         'path': 'Print a raw absolute staged or workspace path.',
+        'open': 'Open a staged proposed file or session file in your editor.',
         'use': 'Bind a session or tool to the current shell.',
         'set': 'Set persistent preferences.',
         'set-tool': 'Register a custom editor using argument templates.',
         'migrate': 'Copy proposals between sessions, checking for stale conflicts.',
         'install-skill': 'Install /stage for an agent harness.',
+        'install-completion': 'Install shell completions for bash, zsh, or powershell.',
     }
     for name in COMMANDS:
         command = subs.add_parser(name, description=descriptions[name], help=descriptions[name])
-        globals_on(command, name == 'path')
+        globals_on(command, name == 'path', name == 'clean')
         command_parsers[name] = command
+    for name in ('diff', 'apply', 'clean', 'migrate', 'path', 'open'):
+        selection = command_parsers[name].add_mutually_exclusive_group(required=name != 'diff')
+        selection.add_argument('-f', '--file', help='select one file (migration also accepts a quoted glob)')
+        if name in ('diff', 'apply', 'clean', 'migrate'):
+            selection.add_argument('--all', action='store_true', help='select all proposed changes')
+        if name == 'clean':
+            selection.add_argument('-s', '--session', nargs='?', const=True, dest='clean_session', default=argparse.SUPPRESS,
+                                   metavar='id', help='discard the entire session directory (active session when omitted)')
     p = command_parsers['init']
     p.add_argument('id', nargs='?', help='conversation ID; generates a UUID when omitted')
     p.add_argument('--json', action='store_true', help='print machine-readable session paths')
     p = command_parsers['diff']
-    p.add_argument('target', nargs='?')
-    p.add_argument('-a', '--apply', action='store_true')
+    p.add_argument('-a', '--apply', action='store_true', help='apply proposed changes before any requested clean')
+    p.add_argument('-c', '--clean', action='store_true', help='clean proposed changes; with --apply, clean only after apply succeeds')
     comparison = p.add_mutually_exclusive_group()
     comparison.add_argument('--between', nargs=2, metavar=('SESSION1', 'SESSION2'))
     comparison.add_argument('--compare-session')
     for name in ('diff', 'apply'):
         command_parsers[name].add_argument('--force', action='store_true', help='allow protected-branch apply')
-        command_parsers[name].add_argument('-y', '--yes', action='store_true', help='confirm branch drift')
-    p = command_parsers['apply']
-    p.add_argument('target', nargs='?')
-    p.add_argument('-f', '--file')
+        command_parsers[name].add_argument('-y', '--yes', action='store_true', help='confirm branch drift or clean')
     p = command_parsers['clean']
-    p.add_argument('-f', '--file')
     p.add_argument('-y', '--yes', action='store_true')
     p = command_parsers['path']
-    p.add_argument('target')
     group = p.add_mutually_exclusive_group()
     group.add_argument('-s', '--staged', action='store_true', help='print proposed-file path (default)')
     group.add_argument('-w', '--workspace', action='store_true')
+    p = command_parsers['open']
+    p.add_argument('--meta', action='store_true', help='open an editable session metadata file instead of a proposed file')
     p = command_parsers['use']
     p.add_argument('id', nargs='?')
     p.add_argument('--clear', action='store_true')
@@ -914,7 +1010,7 @@ def make_parser():
     p.add_argument('--repo', action='store_true', help='save in this workspace .staged.json')
     p.add_argument('--default-session')
     p.add_argument('--branch-protection', choices=['true', 'false'])
-    p.add_argument('--protected-branch', action='append', help='replace protected patterns; repeat for each pattern')
+    p.add_argument('--protected-branch', action='append', help='replace protected patterns (default: none); repeat for each pattern')
     p.add_argument('--session-root', action='append', help='additional discovery root; repeat for each root')
     p = command_parsers['set-tool']
     p.add_argument('id')
@@ -924,12 +1020,13 @@ def make_parser():
     p = command_parsers['migrate']
     p.add_argument('--from', dest='source', required=True)
     p.add_argument('--to', help='existing session or new session ID')
-    p.add_argument('-f', '--file')
     p.add_argument('--force', action='store_true', help='replace target proposals despite conflicts')
     p = command_parsers['install-skill']
     p.add_argument('--default', action='store_true')
     p.add_argument('--target-dir', help='explicit directory containing the installed SKILL.md')
     p.add_argument('--configure-sandbox', action='store_true', help='merge staging-root permissions where supported')
+    p = command_parsers['install-completion']
+    p.add_argument('--shell', choices=['bash', 'zsh', 'powershell'], help='shell for completion installation')
     return parser, command_parsers
 
 
@@ -1027,23 +1124,40 @@ def main(argv=None):
         (commands.get(command) or parser).print_help()
         return
     args = parser.parse_args(argv)
+    if args.command == 'diff' and (args.apply or args.clean or args.between or args.compare_session):
+        if args.file is None and not args.all:
+            commands['diff'].error('choose --file <file> or --all')
     ctx = Context(args)
-    if args.install_completion:
-        install_completion(args.shell)
-        return
     if args.complete_tools:
         print('\n'.join(sorted(ctx.registry)))
         return
     if args.all_repos or args.sessions or args.complete_sessions:
-        for session in ctx.sessions(args.all_repos):
-            if args.complete_sessions:
+        sessions = ctx.sessions(args.all_repos)
+        if args.complete_sessions:
+            for session in sessions:
                 print(session.id)
-            else:
-                print('{}  {} changes  {}\n  {}'.format(session.id, len(session.paths()), session.workspace, session.staging))
+            return
+        rows = []
+        for session in sessions:
+            count = len(session.paths())
+            rows.append((session, '{} {}'.format(count, 'change' if count == 1 else 'changes')))
+        id_width = max((len(session.id) for session, _ in rows), default=0)
+        count_width = max((len(count) for _, count in rows), default=0)
+        for session, count in rows:
+            print('{}\t{}\t{}\n\t{}'.format(
+                color(session.id.ljust(id_width), '36'), color(count.ljust(count_width), '33'),
+                color(session.workspace, '1'), color(session.staging, '2')))
+        return
+    if args.complete_open or args.complete_meta:
+        try:
+            print('\n'.join(ctx.active(notify=False).openable_paths(meta=args.complete_meta)))
+        except StagedError as exc:
+            if not str(exc).startswith('No staging session'):
+                raise
         return
     if args.complete or args.list:
         try:
-            print('\n'.join(ctx.active().paths()))
+            print('\n'.join(ctx.active(notify=False).paths()))
         except StagedError as exc:
             if not str(exc).startswith('No staging session'):
                 raise
@@ -1051,6 +1165,7 @@ def main(argv=None):
     if args.command == 'init':
         session = init_session(ctx, args.id or args.session or str(uuid.uuid4()))
         ctx.shell['session'] = session.id
+        ctx.shell.pop('deleted_session', None)
         save_json(ctx.shell_path, ctx.shell)
         result = {'session': session.id, 'workspace': str(session.workspace), 'staging': str(session.staging),
                   'branch': session.metadata.get('branch'), 'directory': str(session.directory)}
@@ -1074,6 +1189,7 @@ def main(argv=None):
             raise StagedError('Provide --session <id>, --tool or --clear.')
         if binding:
             ctx.shell['session'] = ctx.find_session(binding).id
+            ctx.shell.pop('deleted_session', None)
         if args.tool:
             ctx.shell['tool'] = ctx.tool().id
         save_json(ctx.shell_path, ctx.shell)
@@ -1110,29 +1226,37 @@ def main(argv=None):
         print('Installed /stage: {}'.format(path))
         print('Staging root: {}. Skill installation alone does not grant filesystem permissions.'.format(root))
         return
+    if args.command == 'install-completion':
+        install_completion(args.shell)
+        return
     if args.command == 'migrate':
         migrate(ctx)
         return
     if args.command == 'diff' and (args.between or args.compare_session):
         cross_diff(ctx)
         return
-    session = ctx.active()
+    if args.command == 'clean' and isinstance(args.clean_session, str):
+        session = ctx.find_session(args.clean_session)
+    else:
+        session = ctx.active()
     if args.command == 'path':
-        rel = match_file(args.target, session.paths())
+        rel = match_file(args.file, session.paths())
         if args.workspace:
             print(session.original(rel))
         elif rel in session.deletions:
             raise StagedError('Deletion has no staged file; use --workspace.')
         else:
             print(safe_path(session.staging, rel))
-    elif args.command == 'clean':
-        clean_session(ctx, session)
+    elif args.command == 'open':
+        open_file(ctx, session, args.file)
     elif args.command == 'apply' or (args.command == 'diff' and args.apply):
-        if args.command == 'apply' and args.file and args.target:
-            raise StagedError('Choose either a positional target or --file.')
-        apply_changes(ctx, session, getattr(args, 'file', None) or args.target or 'all')
-    elif args.command == 'diff' and args.target:
-        review(ctx, session, args.target)
+        apply_changes(ctx, session, args.file)
+        if args.command == 'diff' and args.clean:
+            clean_session(ctx, session)
+    elif args.command == 'clean' or (args.command == 'diff' and getattr(args, 'clean', False)):
+        clean_session(ctx, session)
+    elif args.command == 'diff' and (args.file is not None or args.all):
+        review(ctx, session, args.file)
     else:
         overview(ctx, session)
 
