@@ -11,7 +11,8 @@
     "SKILL.md",
     "SPEC.md",
     "README.md",
-    "GUIDE.md"
+    "GUIDE.md",
+    "completions"
   ],
   "scripts": {
     "test": "python3 -m unittest discover -s tests -v"

@@ -138,7 +138,7 @@ Adapters expose `id`, `name`, `root`, binary detection, diff/open argument const
 | `antigravity` | `antigravity-ide -r -d` |
 | `windsurf` | `windsurf -r --diff` |
 | `vscode` | `code -r -d` |
-| `pycharm` | `charm diff`, with PyCharm/IDEA launcher discovery |
+| `pycharm` | `pycharm diff`, with platform-specific PyCharm launcher discovery |
 | `zed` | `zed --diff` |
 | `codex`, `claudecode`, `cli` | `difft`, then `git diff --no-index`, then `diff -u` |
 
@@ -169,7 +169,7 @@ When the user requested review before apply, the agent presents the proposal and
 
 ## 8. Shells, operating systems and distribution
 
-`staged --install-completion --shell <shell>` installs generated completion files. Bash and Zsh use idempotent marked rc blocks. Bash 3.2 is supported. PowerShell writes a `Register-ArgumentCompleter` script and prints how to source it from the profile. CMD receives a `.cmd` launcher; CMD's built-in filesystem completion does not provide Bash-style dynamic argument completion.
+`staged --install-completion --shell <shell>` links versioned completion files from the checkout or installed package. Bash and Zsh use idempotent marked rc blocks. Bash 3.2 is supported. PowerShell links its `Register-ArgumentCompleter` script and prints how to source it from the profile; when Windows denies symlinks, a loader sources the bundled script instead. Open shells must reload previously loaded functions after updates. PowerShell is the supported Windows shell; its installer also creates the Windows `.cmd` launcher. Completion is case-insensitive in Bash, Zsh and PowerShell.
 
 Native executables use argument-list subprocess execution. Windows batch launchers require `cmd.exe`; arguments containing unsafe batch metacharacters are rejected. WSL can translate paths for Windows launchers using `wslpath`; host binaries must be on PATH. Automatic Windows Registry discovery is not implemented.
 

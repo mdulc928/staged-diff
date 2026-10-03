@@ -34,6 +34,18 @@ class StagedError(Exception):
     pass
 
 
+def color_enabled():
+    if 'NO_COLOR' in os.environ:
+        return False
+    if os.environ.get('FORCE_COLOR', '0') not in ('', '0'):
+        return True
+    return sys.stdout.isatty() and os.environ.get('TERM') != 'dumb'
+
+
+def color(text, code):
+    return '\033[{}m{}\033[0m'.format(code, text) if color_enabled() else str(text)
+
+
 def load_json(path):
     path = Path(path)
     if not path.exists():
@@ -498,7 +510,7 @@ for key, name, command, diff, opening in [
     ('antigravity', 'Antigravity IDE', 'antigravity-ide', ['-r', '-d'], ['-r']),
     ('windsurf', 'Windsurf', 'windsurf', ['-r', '--diff'], ['-r']),
     ('vscode', 'Visual Studio Code', 'code', ['-r', '-d'], ['-r']),
-    ('pycharm', 'PyCharm / JetBrains', 'charm', ['diff'], []),
+    ('pycharm', 'PyCharm', 'pycharm', ['diff'], []),
     ('zed', 'Zed', 'zed', ['--diff'], []),
 ]:
     TOOL_REGISTRY[key] = ToolAdapter(key, name, [command] + diff + ['{orig}', '{staged}'],
@@ -546,16 +558,21 @@ def init_session(ctx, key, root=None):
 
 
 def overview(ctx, session):
-    print('Repository:     {}'.format(session.workspace))
-    print('Active Session: {}'.format(session.id))
-    print('Active Tool:    {}'.format(ctx.tool().name))
-    print('Git Branch:     {}'.format(get_git_branch(session.workspace) or '(not a Git repository)'))
-    print('Staging:        {}'.format(session.staging))
+    branch = get_git_branch(session.workspace)
+    protected = ctx.setting('branch_protection', True) and is_branch_protected(branch, ctx.setting('protected_branches', DEFAULT_PROTECTED_BRANCHES))
+    for label, value in [('Repository:', session.workspace), ('Active Session:', color(session.id, '36')),
+                         ('Active Tool:', color(ctx.tool().name, '36')),
+                         ('Git Branch:', color(branch or '(not a Git repository)', '31' if protected else '32')),
+                         ('Staging:', session.staging)]:
+        print('{} {}'.format(color('{:15}'.format(label), '1'), value))
     paths = session.paths()
     if not paths:
         print('No staged changes yet.')
     for rel in paths:
-        print('  [{:9}] {}'.format(session.status(rel), rel))
+        status = session.status(rel)
+        palette = {'APPLIED': '32', 'MODIFIED': '33', 'NEW FILE': '36', 'RENAMED': '35',
+                   'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
+        print('  {} {}'.format(color('[{:9}]'.format(status), palette[status]), rel))
         if ctx.args.verbose:
             path = safe_path(session.staging, rel)
             print('    Staged:    {}'.format(path if path.exists() else '(deletion)'))
@@ -764,37 +781,36 @@ def migrate(ctx):
     save_json(dest.directory / 'session.json', dest.metadata)
     dest.refresh_index()
     print('Migrated {} change(s) from {} to {}.'.format(len(paths), source.id, dest.id))
-JETBRAINS_CLI_NAMES = ("charm", "pycharm", "idea")
-
 def detect_jetbrains_binary():
-    """Resolve JetBrains IDE CLI (charm / pycharm / idea) when Toolbox scripts are not on PATH."""
-    for name in JETBRAINS_CLI_NAMES:
+    """Resolve PyCharm's documented launchers, without selecting another IDE."""
+    names = ['pycharm']
+    if sys.platform == 'win32':
+        names += ['pycharm64.exe', 'pycharm.bat']
+    elif sys.platform.startswith('linux'):
+        names += ['pycharm.sh', 'pycharm-professional', 'pycharm-community']
+    for name in names:
         found = shutil.which(name)
         if found:
             return found
-    toolbox_dirs = [
-        os.path.join(HOME, "Library", "Application Support", "JetBrains", "Toolbox", "scripts"),
-        os.path.join(HOME, ".local", "share", "JetBrains", "Toolbox", "scripts"),
-    ]
+    if sys.platform == 'win32':
+        toolbox_dirs = [Path(os.environ.get('LOCALAPPDATA', str(Path(HOME) / 'AppData/Local'))) / 'JetBrains/Toolbox/scripts']
+    elif sys.platform == 'darwin':
+        toolbox_dirs = [Path(HOME) / 'Library/Application Support/JetBrains/Toolbox/scripts']
+    else:
+        toolbox_dirs = [Path(HOME) / '.local/share/JetBrains/Toolbox/scripts']
     for toolbox in toolbox_dirs:
-        if not os.path.isdir(toolbox):
-            continue
-        for name in JETBRAINS_CLI_NAMES:
-            script = os.path.join(toolbox, name)
-            if os.path.isfile(script):
-                return script
-    if sys.platform == "darwin":
-        for pattern in (
-            "/Applications/PyCharm*.app/Contents/MacOS/pycharm",
-            "/Applications/IntelliJ IDEA*.app/Contents/MacOS/idea",
-            "/Applications/WebStorm*.app/Contents/MacOS/webstorm",
-        ):
-            matches = sorted(glob.glob(pattern))
+        for name in names:
+            script = toolbox / name
+            if script.is_file():
+                return str(script)
+    if sys.platform == 'darwin':
+        for parent in (Path('/Applications'), Path(HOME) / 'Applications'):
+            matches = sorted(parent.glob('PyCharm*.app/Contents/MacOS/pycharm'))
             if matches:
-                return matches[0]
+                return str(matches[0])
     return None
 
-def upsert_shell_block(path, block, insert_before_compinit=False):
+def upsert_shell_block(path, block, insert_before_compinit=False, move_to_end=False):
     block = block.strip() + "\n"
     if os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -804,7 +820,10 @@ def upsert_shell_block(path, block, insert_before_compinit=False):
             re.DOTALL,
         )
         if pattern.search(content):
-            content = pattern.sub(lambda match: block.strip(), content)
+            if move_to_end:
+                content = pattern.sub('', content).rstrip() + '\n\n' + block
+            else:
+                content = pattern.sub(lambda match: block.strip(), content)
         elif insert_before_compinit:
             lines = content.splitlines(keepends=True)
             insert_at = None
@@ -842,7 +861,7 @@ def make_parser():
     parser.add_argument('-R', '--all-repos', action='store_true', help='list sessions across repositories')
     parser.add_argument('--sessions', action='store_true', help='list sessions for this repository')
     parser.add_argument('--install-completion', action='store_true', help='install shell integration')
-    parser.add_argument('--shell', choices=['bash', 'zsh', 'powershell', 'cmd'], help='shell for completion installation')
+    parser.add_argument('--shell', choices=['bash', 'zsh', 'powershell'], help='shell for completion installation')
     for helper in ('--complete', '--complete-sessions', '--complete-tools', '--list'):
         parser.add_argument(helper, action='store_true', help=argparse.SUPPRESS)
     subs = parser.add_subparsers(dest='command')
@@ -913,81 +932,67 @@ def make_parser():
     return parser, command_parsers
 
 
+def install_completion_file(name, target):
+    source = REPO_ROOT / 'completions' / name
+    if not source.is_file():
+        raise StagedError('Missing bundled completion script: ' + str(source))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink() and target.resolve() == source.resolve():
+        return
+    # Replace old installed copies without touching the versioned source file.
+    fd, temporary = tempfile.mkstemp(prefix='.staged-link-', dir=str(target.parent))
+    os.close(fd)
+    os.unlink(temporary)
+    try:
+        try:
+            os.symlink(str(source), temporary)
+        except OSError as exc:
+            if os.name != 'nt' or name != 'staged.ps1' or getattr(exc, 'winerror', None) != 1314:
+                raise
+            # Windows may deny symlinks without Developer Mode or elevation.
+            # A dot-source loader still reads the package's current script.
+            write_text_file(target, ". '{}'\n".format(str(source).replace("'", "''")))
+            print('Windows denied symlink creation; installed a PowerShell loader pointing to ' + str(source))
+            return
+        os.replace(temporary, target)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+
+
 def install_completion(shell=None):
     shell = shell or ('powershell' if os.name == 'nt' else Path(os.environ.get('SHELL', 'bash')).name)
     directory = CONFIG_DIR / 'completions'
     if shell == 'bash':
         target = directory / 'staged.bash'
-        body = r'''_staged() {
-  local cur="${COMP_WORDS[COMP_CWORD]}" prev="${COMP_WORDS[COMP_CWORD-1]}" item
-  local -a choices=()
-  case "$prev" in
-    --tool|-t) mapfile -t choices < <(command staged --complete-tools 2>/dev/null) ;;
-    --session|-s|--from|--to|--between|--compare-session|use)
-      mapfile -t choices < <(command staged --complete-sessions 2>/dev/null) ;;
-    *)
-      choices=(init diff apply clean path use set set-tool migrate install-skill all --help --session --tool --root --force --yes --file --apply --between --compare-session)
-      while IFS= read -r item; do choices+=("$item"); done < <(command staged --list 2>/dev/null)
-      ;;
-  esac
-  COMPREPLY=()
-  for item in "${choices[@]}"; do
-    [[ "$item" == "$cur"* ]] && COMPREPLY+=("$item")
-  done
-}
-complete -F _staged staged
-'''
-        # macOS ships Bash 3.2, which has no mapfile.
-        body = body.replace('mapfile -t choices < <(', 'while IFS= read -r item; do choices+=("$item"); done < <(')
-        write_text_file(target, body)
+        install_completion_file('staged.bash', target)
         hook = '{}\nsource {}\n{}\n'.format(COMPLETION_MARKER_START, shlex.quote(str(target)), COMPLETION_MARKER_END)
         upsert_shell_block(str(Path(HOME) / '.bashrc'), hook)
         upsert_shell_block(str(Path(HOME) / '.bash_profile'), hook)
     elif shell == 'zsh':
         target = directory / '_staged'
-        body = '''#compdef staged
-_staged() {
-  local -a candidates
-  case "${words[CURRENT-1]}" in
-    --tool|-t) candidates=("${(@f)$(command staged --complete-tools 2>/dev/null)}") ;;
-    --session|-s|--from|--to|--between|--compare-session|use)
-      candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}") ;;
-    *) candidates=(init diff apply clean path use set set-tool migrate install-skill all --help --session --tool --root --force --yes --file --apply --between --compare-session "${(@f)$(command staged --list 2>/dev/null)}") ;;
-  esac
-  compadd -- "${candidates[@]}"
-}
-_staged "$@"
-'''
-        write_text_file(target, body)
-        hook = '{}\nfpath=({} $fpath)\nautoload -Uz compinit\ncompinit\n{}\n'.format(
+        install_completion_file('_staged', target)
+        hook = '{}\nfpath=({} $fpath)\nautoload -Uz compinit\ncompinit\n' \
+               'unfunction _staged 2>/dev/null\nautoload -Uz _staged\ncompdef _staged staged\n{}\n'.format(
             COMPLETION_MARKER_START, shlex.quote(str(directory)), COMPLETION_MARKER_END)
-        upsert_shell_block(str(Path(HOME) / '.zshrc'), hook, insert_before_compinit=True)
+        # Old completion files can claim the same command, and compinit may reuse
+        # a cached mapping. Register explicitly after other shell initialization.
+        upsert_shell_block(str(Path(HOME) / '.zshrc'), hook, move_to_end=True)
     elif shell == 'powershell':
         target = directory / 'staged.ps1'
-        body = '''Register-ArgumentCompleter -Native -CommandName staged -ScriptBlock {
-  param($wordToComplete, $commandAst, $cursorPosition)
-  $words = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })
-  $previous = if ($wordToComplete) { $words[-2] } else { $words[-1] }
-  $choices = switch ($previous) {
-    { $_ -in '--tool','-t' } { & staged --complete-tools; break }
-    { $_ -in '--session','-s','--from','--to','--between','--compare-session','use' } { & staged --complete-sessions; break }
-    default { 'init','diff','apply','clean','path','use','set','set-tool','migrate','install-skill','all'; & staged --list }
-  }
-  $choices | Where-Object { $_.StartsWith($wordToComplete) } | ForEach-Object {
-    $quoted = "'" + $_.Replace("'", "''") + "'"
-    [System.Management.Automation.CompletionResult]::new($quoted, $_, 'ParameterValue', $_)
-  }
-}
-'''
-        write_text_file(target, body)
+        install_completion_file('staged.ps1', target)
+        if os.name == 'nt':
+            launcher = CONFIG_DIR / 'bin/staged.cmd'
+            write_text_file(launcher, '@echo off\r\n"{}" "{}" %*\r\n'.format(sys.executable, REPO_ROOT / 'staged'))
+            print('Launcher: {}. Add {} to your user PATH.'.format(launcher, launcher.parent))
         print("Load in PowerShell (add to $PROFILE to persist): . '{}'".format(str(target).replace("'", "''")))
-    elif shell == 'cmd':
-        target = CONFIG_DIR / 'bin/staged.cmd'
-        write_text_file(target, '@echo off\r\n"{}" "{}" %*\r\n'.format(sys.executable, REPO_ROOT / 'staged'))
-        print('Add {} to PATH. CMD provides filesystem completion, not dynamic argument completion.'.format(target.parent))
     else:
-        raise StagedError('Choose --shell bash, zsh, powershell or cmd.')
+        raise StagedError('Choose --shell bash, zsh or powershell.')
     print('Installed: {}'.format(target))
+    if shell == 'zsh':
+        print('Activate in your current shell: source ~/.zshrc (or open a new terminal).')
+    elif shell == 'bash':
+        print('Activate in your current shell: source {} (or open a new terminal).'.format(shlex.quote(str(target))))
 
 
 def set_preferences(ctx):

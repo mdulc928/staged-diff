@@ -31,7 +31,7 @@ class CLI(unittest.TestCase):
             path.mkdir()
         self.env = dict(os.environ)
         for key in list(self.env):
-            if key.startswith(('STAGED_', 'STAGE_', 'GIT_')):
+            if key.startswith(('STAGED_', 'STAGE_', 'GIT_')) or key in ('NO_COLOR', 'FORCE_COLOR'):
                 self.env.pop(key)
         self.env.update(HOME=str(self.home), USERPROFILE=str(self.home),
                         XDG_CONFIG_HOME=str(self.home / '.config'), XDG_DATA_HOME=str(self.home / '.local/share'),
@@ -317,15 +317,117 @@ class CLI(unittest.TestCase):
         self.assertEqual(len(cli['permissions']['allow']), 2)
 
     def test_completion_scripts_are_idempotent_and_parse(self):
-        for shell in ['bash', 'zsh', 'powershell', 'cmd']:
+        for shell in (['powershell'] if os.name == 'nt' else ['bash', 'zsh', 'powershell']):
             for _ in range(2):
                 self.run_cli('--install-completion', '--shell', shell)
-        self.assertEqual((self.home / '.bashrc').read_text().count(staged.COMPLETION_MARKER_START), 1)
-        self.assertEqual((self.home / '.zshrc').read_text().count(staged.COMPLETION_MARKER_START), 1)
+        if os.name != 'nt':
+            self.assertEqual((self.home / '.bashrc').read_text().count(staged.COMPLETION_MARKER_START), 1)
+            self.assertEqual((self.home / '.zshrc').read_text().count(staged.COMPLETION_MARKER_START), 1)
         directory = self.config / 'completions'
         for shell, filename in [('bash', 'staged.bash'), ('zsh', '_staged')]:
             if os.name != 'nt' and shutil.which(shell):
                 subprocess.run([shell, '-n', str(directory / filename)], check=True, capture_output=True)
+
+    @unittest.skipIf(os.name == 'nt', 'Symlink privileges depend on Windows host settings')
+    def test_completion_links_track_checkout_updates_without_reinstall(self):
+        checkout = self.base / 'checkout'
+        checkout.mkdir()
+        shutil.copy2(SCRIPT, checkout / 'staged')
+        shutil.copytree(SCRIPT.parent / 'completions', checkout / 'completions')
+        for shell, name in [('bash', 'staged.bash'), ('zsh', '_staged'), ('powershell', 'staged.ps1')]:
+            target = self.config / 'completions' / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('old installed copy')
+            command = [sys.executable, str(checkout / 'staged'), '--install-completion', '--shell', shell]
+            subprocess.run(command, cwd=self.repo, env=self.env, capture_output=True, check=True)
+            self.assertTrue(target.is_symlink())
+            source = checkout / 'completions' / name
+            self.assertEqual(target.resolve(), source.resolve())
+            source.write_text(source.read_text() + '\n# updated in checkout\n')
+            self.assertIn('# updated in checkout', target.read_text())
+            subprocess.run(command, cwd=self.repo, env=self.env, capture_output=True, check=True)
+            self.assertTrue(target.is_symlink())
+            self.assertIn('# updated in checkout', target.read_text())
+
+    @unittest.skipIf(os.name == 'nt' or not shutil.which('zsh'), 'Requires Zsh')
+    def test_zsh_install_overrides_stale_cached_handler_and_completes_files(self):
+        self.propose(rel='README with spaces.md')
+        old = self.home / 'old-completions'
+        old.mkdir()
+        (old / '_stage').write_text('#compdef staged\nprint OLD_HANDLER\n')
+        import shlex
+        rc = self.home / '.zshrc'
+        rc.write_text('fpath=(' + shlex.quote(str(old)) + ' $fpath)\nautoload -Uz compinit\ncompinit\n')
+        subprocess.run(['zsh', '-f', '-c', 'source "$HOME/.zshrc"; [[ $_comps[staged] == _stage ]]'],
+                       cwd=self.repo, env=self.env, capture_output=True, text=True, check=True)
+        # Simulate an existing installation placed before another completion setup.
+        self.run_cli('--install-completion', '--shell', 'zsh')
+        with rc.open('a') as stream:
+            stream.write('\ncompdef _stage staged\n')
+        self.run_cli('--install-completion', '--shell', 'zsh')
+        script = r'''_staged() { print OLD_LOADED_FUNCTION; }
+source "$HOME/.zshrc"
+[[ $_comps[staged] == _staged ]] || exit 2
+words=(staged diff README)
+CURRENT=3
+compadd() { print -rl -- "$@"; }
+_staged
+'''
+        env = dict(self.env, PATH=str(SCRIPT.parent) + os.pathsep + self.env['PATH'])
+        result = subprocess.run(['zsh', '-f', '-c', script], cwd=self.repo, env=env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('README with spaces.md', result.stdout.splitlines())
+        self.assertNotIn('OLD_HANDLER', result.stdout)
+        self.assertNotIn('OLD_LOADED_FUNCTION', result.stdout)
+
+    def test_overview_color_and_plain_machine_output(self):
+        self.propose()
+        env = dict(self.env, FORCE_COLOR='1')
+        self.assertIn('\x1b[33m[MODIFIED', self.run_cli('diff', env=env).stdout)
+        self.assertNotIn('\x1b[', self.run_cli('diff').stdout)
+        self.assertNotIn('\x1b[', self.run_cli('diff', env=dict(env, NO_COLOR='1')).stdout)
+        self.assertNotIn('\x1b[', self.run_cli('path', 'existing.txt', env=env).stdout)
+        self.assertNotIn('\x1b[', self.run_cli('--list', env=env).stdout)
+
+    @unittest.skipIf(os.name == 'nt' or not shutil.which('bash'), 'Requires Bash')
+    def test_bash_completion_is_case_insensitive_and_restores_shell_option(self):
+        self.propose(rel='README.md')
+        self.run_cli('--install-completion', '--shell', 'bash')
+        env = dict(self.env, PATH=str(SCRIPT.parent) + os.pathsep + self.env['PATH'])
+        script = 'source "$HOME/.config/staged/completions/staged.bash"; COMP_WORDS=(staged diff rea); COMP_CWORD=2; _staged; printf "%s\\n" "${COMPREPLY[@]}"; ! shopt -q nocasematch'
+        result = subprocess.run(['bash', '--noprofile', '--norc', '-c', script], env=env, cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('README.md', result.stdout.splitlines())
+
+    @unittest.skipIf(os.name == 'nt' or not shutil.which('zsh'), 'Requires a POSIX terminal and Zsh')
+    def test_zsh_real_tab_matches_lowercase_and_uppercase(self):
+        import select
+        import time
+        self.propose(rel='README.md')
+        self.run_cli('--install-completion', '--shell', 'zsh')
+        master, slave = os.openpty()
+        env = dict(self.env, PATH=str(SCRIPT.parent) + os.pathsep + self.env['PATH'], TERM='xterm')
+        process = subprocess.Popen(['zsh', '-f'], stdin=slave, stdout=slave, stderr=slave,
+                                   cwd=self.repo, env=env, start_new_session=True)
+        os.close(slave)
+        def read_until(marker):
+            output = b''
+            deadline = time.monotonic() + 15
+            while marker not in output and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    output += os.read(master, 65536)
+            self.assertIn(marker, output)
+        try:
+            os.write(master, b'''source "$HOME/.zshrc"; PS1='READY> '; bindkey '^I' complete-word; _capture() { print -r -- "CAPTURE:$BUFFER"; zle send-break; }; zle -N _capture; bindkey '^X' _capture; print SETUP_DONE\n''')
+            read_until(b'\r\nSETUP_DONE\r\n')
+            for prefix in (b'rea', b'REA'):
+                os.write(master, b'staged diff ' + prefix + b'\t\x18')
+                read_until(b'CAPTURE:staged diff README.md')
+        finally:
+            process.kill()
+            process.wait(timeout=5)
+            os.close(master)
 
     def test_corrupt_config_and_manifest_are_not_silently_ignored(self):
         self.propose()
@@ -457,6 +559,25 @@ class CLI(unittest.TestCase):
 
 
 class Unit(unittest.TestCase):
+    def test_pycharm_prefers_documented_launcher(self):
+        with patch.object(staged.shutil, 'which', side_effect=lambda name: '/bin/' + name):
+            self.assertEqual(staged.TOOL_REGISTRY['pycharm'].get_diff_command('old', 'new'),
+                             ['/bin/pycharm', 'diff', 'old', 'new'])
+
+    def test_pycharm_platform_launchers(self):
+        for platform, executable in [('win32', 'pycharm64.exe'), ('win32', 'pycharm.bat'),
+                                     ('linux', 'pycharm.sh'), ('linux', 'pycharm-community')]:
+            with self.subTest(platform=platform, executable=executable):
+                with patch.object(staged.sys, 'platform', platform), patch.object(
+                        staged.shutil, 'which', side_effect=lambda name: '/bin/' + name if name == executable else None):
+                    self.assertEqual(staged.detect_jetbrains_binary(), '/bin/' + executable)
+
+    def test_pycharm_does_not_substitute_other_jetbrains_editors(self):
+        with tempfile.TemporaryDirectory() as home, patch.object(staged, 'HOME', home), \
+                patch.object(staged.sys, 'platform', 'linux'), patch.object(
+                    staged.shutil, 'which', side_effect=lambda name: '/bin/' + name if name in ('idea', 'charm', 'webstorm') else None):
+            self.assertIsNone(staged.detect_jetbrains_binary())
+
     def test_windows_batch_arguments_are_quoted_without_shell_interpolation(self):
         with patch.object(staged.os, 'name', 'nt'), patch.object(staged.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
             staged.run_editor(['C:/Program Files/editor.cmd', 'C:/work/file with spaces.txt'])
