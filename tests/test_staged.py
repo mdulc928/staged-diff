@@ -297,11 +297,11 @@ class CLI(unittest.TestCase):
     def test_supported_skill_installation(self):
         for tool, path in [('cursor', '.cursor/skills'), ('codex', '.agents/skills'),
                            ('claudecode', '.claude/skills'), ('windsurf', '.codeium/windsurf/skills'),
-                           ('antigravity', '.gemini/config/skills')]:
+                           ('antigravity', '.gemini/config/skills'), ('zed', '.agents/skills')]:
             self.run_cli('install-skill', '--tool', tool)
             self.assertTrue((self.home / path / 'stage/SKILL.md').is_file())
-        self.run_cli('install-skill', '--tool', 'zed', ok=False)
-        self.run_cli('install-skill', '--tool', 'zed', '--target-dir', str(self.home / 'custom/stage'))
+        self.run_cli('install-skill', '--tool', 'vscode', ok=False)
+        self.run_cli('install-skill', '--tool', 'vscode', '--target-dir', str(self.home / 'custom/stage'))
         self.assertTrue((self.home / 'custom/stage/SKILL.md').is_file())
 
     def test_cursor_sandbox_merge_preserves_existing_config(self):

@@ -490,7 +490,8 @@ class ToolAdapter:
                  'claudecode': Path(HOME) / '.claude/skills',
                  'codex': Path(HOME) / '.agents/skills',
                  'windsurf': Path(HOME) / '.codeium/windsurf/skills',
-                 'antigravity': Path(HOME) / '.gemini/config/skills'}
+                 'antigravity': Path(HOME) / '.gemini/config/skills',
+                 'zed': Path(HOME) / '.agents/skills'}
         if target_dir:
             target = Path(target_dir).expanduser().resolve()
         elif self.id in roots:
