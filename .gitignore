@@ -1,0 +1,23 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+package-lock.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.class
+.venv/
+env/
+
+# Editor
+.vscode/
+.idea/
+.cursor/
+
+# Staging runtime
+.workspace
+renames.json
