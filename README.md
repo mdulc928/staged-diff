@@ -24,6 +24,8 @@ My hope is that you can use this as **a starting point** for your own workflow s
 
 > **Note:** I recommend pairing `staged` with an editor that can open a visual two-file diff from the command line: VS Code(-ish) , PyCharm, or Zed. See [editor setup](GUIDE.md#editor-compatibility). Your diff tool does not need to be same as your agent.
 
+**P.S.** I would love to learn what you think, if you'll just leave a comment me a message on the social platform of your choice. You can find my links in my profile 🙏.
+
 ## Install and Setup
 
 > Requires **Python 3.8+**.
@@ -64,7 +66,7 @@ ln -sf "$(pwd)/staged" ~/.local/bin/staged
 
 ```powershell
 # Create the command launcher (%APPDATA%\staged\bin):
-py -3 .\staged install-completion --shell powershell
+py -3 .\staged install-launcher
 
 # Add to user PATH permanently:
 [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$env:APPDATA\staged\bin", "User")
@@ -72,7 +74,7 @@ py -3 .\staged install-completion --shell powershell
 
 ### Shell Completion (Optional)
 
-Enable tab-completion for commands and staged filenames:
+Enable tab-completion for commands and staged filenames (also prompted to install on first run):
 
 ```bash
 staged install-completion --shell zsh        # macOS / Linux (Zsh)
@@ -118,7 +120,9 @@ staged open --meta -f staged_changes.md --tool cli
 
 Use `-f` / `--file` for one file and `--all` for bulk operations (or `--session` with `clean` to discard a session). Positional filenames and positional `all` are no longer accepted. Apply, clean, migrate, and diff actions/comparisons require a selection; `staged diff` alone shows the overview. Open searches staged files by default; `--meta` searches editable session metadata only.
 
-**The tool does more:** compare sessions, migrate staged changes, clean up files, configure your favorite editor, and more. See [GUIDE.md](GUIDE.md) for detailed instructions, examples, and troubleshooting, or run `staged --help`.
+**The tool does more:** compare sessions, migrate staged changes, clean up files, configure your favorite editor, and more.
+
+See [GUIDE.md](GUIDE.md) for detailed instructions, examples, and troubleshooting, or run `staged --help`. Use `staged <command> --help` for one command or `staged --help-all` for the complete option reference.
 
 ## License
 

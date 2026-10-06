@@ -1,6 +1,6 @@
 # Unified staging engine and `/stage` skill specification
 
-Version 2.0.0 · revised October 3, 2026 · package `@melchi/staged`
+Version 2.0.0 · revised October 6, 2026 · package `@melchi/staged`
 
 This specification defines the architectural and behavioral contract of `staged` and the `/stage` skill.
 
@@ -49,6 +49,7 @@ All built-in adapters share a single staging root on disk.
 | Repository Settings | `<workspace>/.staged.json`                                                    | Same layout                   |
 
 **Root Precedence**:
+
 1. `--root <path>` CLI flag
 2. `STAGED_ROOT` environment variable
 3. Repository configuration (`staging_root` in `<workspace>/.staged.json`)
@@ -124,30 +125,33 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 
 ### Command Specifications
 
-| Command | Action | Contract |
-| ------- | ------ | -------- |
-| `staged`, `staged diff` | Overview | Print workspace, session ID, tool, branch, and status summary |
-| `staged -v` | Verbose Overview | Include absolute paths, file sizes, and modification timestamps |
-| `staged --sessions` | Local List | List sessions associated with current workspace |
-| `staged -R` | Global List | List all sessions across all configured workspaces and roots |
-| `init [id]` | Initialize | Create or reuse session; bind to active shell |
-| `diff -f <f>` | File Diff | Open visual diff in configured editor |
-| `diff --all` | Bulk Diff | Open visual diff sequentially for all pending changes |
-| `diff -f <f> -a` | File Apply | Apply single file immediately instead of opening diff |
-| `diff --all -a` | Bulk Apply | Apply all staged additions, edits, and deletions |
-| `diff -f <f> -c` | File Discard | Discard single staged file instead of opening diff |
-| `diff --all -c` | Bulk Discard | Discard all staged files in session |
-| `apply -f <f> \| --all` | Explicit Apply | Copy staged files to workspace (requires `-f` or `--all`) |
-| `path [-s\|-w] -f <f>` | Print Path | Print raw absolute path (`-s` staged, `-w` workspace) |
-| `open [--meta] -f <f>` | Open File | Open staged file (or session root metadata with `--meta`) |
-| `clean -f <f> \| --all` | Discard Changes | Discard staged changes; prompts unless `-y` is passed |
-| `clean --session [<id>]` | Delete Session | Remove session folder from disk and clear shell bindings |
-| `use --session <id>` | Bind Shell | Bind session to current shell process |
-| `migrate --from <id>` | Migrate | Copy staged files and manifest entries between sessions |
-| `set [--repo]` | Save Settings | Store persistent configuration |
-| `set-tool <id>` | Register Tool | Register custom editor CLI adapter |
-| `install-skill` | Install Skill | Copy `SKILL.md` to harness skill directory |
-| `install-completion` | Install Shell Completion | Configure Bash, Zsh, or PowerShell tab-completion |
+| Command                  | Action                   | Contract                                                                    |
+| ------------------------ | ------------------------ | --------------------------------------------------------------------------- |
+| `staged`, `staged diff`  | Overview                 | Print workspace, session ID, tool, branch, and status summary               |
+| `staged -v`              | Verbose Overview         | Include absolute paths, file sizes, and modification timestamps             |
+| `staged --sessions`      | Local List               | List sessions associated with current workspace                             |
+| `staged --list`          | File List                | Print proposed file paths, one per line                                     |
+| `staged --help-all`      | Full Help                | Show every command and public option                                        |
+| `staged -R`              | Global List              | List all sessions across all configured workspaces and roots                |
+| `init [id]`              | Initialize               | Create or reuse session; bind to active shell                               |
+| `diff -f <f>`            | File Diff                | Open visual diff in configured editor                                       |
+| `diff --all`             | Bulk Diff                | Open visual diff sequentially for all pending changes                       |
+| `diff -f <f> -a`         | File Apply               | Apply single file immediately instead of opening diff                       |
+| `diff --all -a`          | Bulk Apply               | Apply all staged additions, edits, and deletions                            |
+| `diff -f <f> -c`         | File Discard             | Discard single staged file instead of opening diff                          |
+| `diff --all -c`          | Bulk Discard             | Discard all staged files in session                                         |
+| `apply -f <f> \| --all`  | Explicit Apply           | Copy staged files to workspace (requires `-f` or `--all`)                   |
+| `path [-s\|-w] -f <f>`   | Print Path               | Print raw absolute path (`-s` staged, `-w` workspace)                       |
+| `open [--meta] -f <f>`   | Open File                | Open staged file (or session root metadata with `--meta`)                   |
+| `clean -f <f> \| --all`  | Discard Changes          | Discard staged changes; prompts unless `-y` is passed                       |
+| `clean --session [<id>]` | Delete Session           | Remove session folder from disk and clear shell bindings                    |
+| `use --session <id>`     | Bind Shell               | Bind session to current shell process                                       |
+| `migrate --from <id>`    | Migrate                  | Copy staged files and manifest entries between sessions                     |
+| `set [--repo]`           | Save Settings            | Store persistent configuration                                              |
+| `set-tool <id>`          | Register Tool            | Register custom editor CLI adapter                                          |
+| `install-skill`          | Install Skill            | Copy `SKILL.md` to harness skill directory                                  |
+| `install-completion`     | Install Shell Completion | Configure Bash, Zsh, or PowerShell tab-completion; no launcher installation |
+| `install-launcher`       | Install Windows Launcher | Write `staged.cmd`; leave PATH unchanged                                    |
 
 ---
 
@@ -247,6 +251,7 @@ If a query matches multiple files at any step, resolution halts and outputs all 
 ## 7. Skill Behavior Contract
 
 The bundled `SKILL.md` requires agents to:
+
 1. Initialize or reuse a staging session and record returned paths.
 2. Write complete proposal files to `staging/`, matching workspace-relative paths.
 3. Record file renames, relocations, and deletions in `renames.json`.
@@ -258,7 +263,10 @@ The bundled `SKILL.md` requires agents to:
 
 ## 8. Shells, Operating Systems, and Distribution
 
-- **Completions**: Bash, Zsh, and PowerShell support case-insensitive substring completion on `-f`.
+- **Completions**: Public options follow the CLI parser. Bash, Zsh, and PowerShell support session/tool IDs and case-insensitive substring completion on `-f`.
+- **Completion Setup**: Interactive `staged` and `init` offer missing completion setup once per shell. Bash/Zsh update startup files; PowerShell prints a profile loader.
+- **Launcher Setup**: On Windows, explicit `--shell powershell` offers `staged.cmd` once when no launcher is available. Installation requires acceptance or `install-launcher`; PATH is unchanged.
+- **Setup Prompts**: Remember declines. Skip help, machine output, CI, redirected streams, and `STAGED_NO_PROMPT=1`.
 - **Subprocesses**: Argument vector execution. Windows batch scripts execute via `cmd.exe` with safe metacharacter quoting. WSL translates paths for Windows binaries via `wslpath`.
 - **Distribution**: Packaged as `@melchi/staged` with a Node binary launcher wrapping the Python engine. The engine runs standalone with Python 3.8+.
 - **Test Suite**: Comprehensive automated test coverage validating branch protections, manifest handling, prefix matching, cross-session diffs, and shell completion parsing.

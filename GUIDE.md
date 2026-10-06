@@ -3,6 +3,7 @@
 `staged` isolates an AI agent's proposed edits in a dedicated directory outside your Git working tree.
 
 The workflow is straightforward:
+
 - **Isolate**: The agent writes complete proposed files to a session directory on disk.
 - **Engage**: You work through your own solution in your editor, unblocked and uninterrupted.
 - **Review & Apply**: When you are ready, review a side-by-side diff in your IDE and apply only the files you want.
@@ -86,7 +87,10 @@ Windows uses a small `staged.cmd` launcher rather than a symlink. PowerShell is 
 git clone https://github.com/mdulc928/staged-diff.git
 cd staged-diff
 
-# Generate Windows launcher (%APPDATA%\staged\bin) and PowerShell completion script
+# Install the Windows launcher (%APPDATA%\staged\bin)
+py -3 .\staged install-launcher
+
+# Install PowerShell completions
 py -3 .\staged install-completion --shell powershell
 ```
 
@@ -96,6 +100,9 @@ py -3 .\staged install-completion --shell powershell
    $env:Path += ";$env:APPDATA\staged\bin"
    ```
 3. Add the printed completion loader command to your `$PROFILE` to load completions automatically.
+
+> [!NOTE]
+> On Windows, `--shell powershell` also offers launcher setup once if no launcher is available. Declines are remembered; PATH changes remain manual.
 
 ---
 
@@ -164,7 +171,7 @@ In your editor or chat panel, instruct the agent:
 
 > Use /stage to prepare these changes for review before applying them.
 
-The agent initializes a session, writes complete proposed files to the staging directory, and reports the session ID. 
+The agent initializes a session, writes complete proposed files to the staging directory, and reports the session ID.
 
 Bind the session in your terminal:
 
@@ -227,6 +234,7 @@ staged set --repo --default-session <id>  # Set repository-level default
 ```
 
 **Selection Precedence** (first match wins):
+
 1. Command-line flag (`--session <id>`)
 2. Environment variables (`STAGED_SESSION`, `STAGED_TOOL`)
 3. Active shell binding (`staged use`)
@@ -259,15 +267,15 @@ staged diff -f src/example.py --tool cli # Open terminal diff
 
 ### Status Indicators
 
-| Status      | Color    | Meaning                                                                 |
-| ----------- | -------- | ----------------------------------------------------------------------- |
-| `MODIFIED`  | Yellow   | Staged file differs from workspace file                                 |
-| `NEW FILE`  | Cyan     | File exists only in staging                                             |
-| `RENAMED`   | Magenta  | File is renamed in manifest                                             |
-| `RELOCATED` | Magenta  | File is moved to another folder without renaming                        |
-| `DELETED`   | Red      | Workspace file is marked for deletion                                   |
-| `APPLIED`   | Green    | Workspace file matches staged file byte-for-byte (and POSIX permissions)|
-| `MISSING`   | Bold Red | Rename recorded in manifest, but staged destination file is missing     |
+| Status      | Color    | Meaning                                                                  |
+| ----------- | -------- | ------------------------------------------------------------------------ |
+| `MODIFIED`  | Yellow   | Staged file differs from workspace file                                  |
+| `NEW FILE`  | Cyan     | File exists only in staging                                              |
+| `RENAMED`   | Magenta  | File is renamed in manifest                                              |
+| `RELOCATED` | Magenta  | File is moved to another folder without renaming                         |
+| `DELETED`   | Red      | Workspace file is marked for deletion                                    |
+| `APPLIED`   | Green    | Workspace file matches staged file byte-for-byte (and POSIX permissions) |
+| `MISSING`   | Bold Red | Rename recorded in manifest, but staged destination file is missing      |
 
 Color support follows `NO_COLOR=1` (disable) and `FORCE_COLOR=1` (force enable).
 
@@ -276,6 +284,7 @@ Color support follows `NO_COLOR=1` (disable) and `FORCE_COLOR=1` (force enable).
 ### File Matching
 
 When targeting a file (`-f <query>`), matching resolves in order:
+
 1. Exact relative path
 2. Exact filename (`Button.svelte`)
 3. Subsequence or distinctive substring (`Btn.sve`, `nested/btn`)
@@ -292,7 +301,7 @@ staged path -s -f src/example.py   # Staged file absolute path
 staged path -w -f src/example.py   # Workspace file absolute path
 ```
 
-*(Deletions have only a workspace path. Inside `path`, `-s` means `--staged`; use `--session <id>` to specify a session.)*
+_(Deletions have only a workspace path. Inside `path`, `-s` means `--staged`; use `--session <id>` to specify a session.)_
 
 ---
 
@@ -306,6 +315,7 @@ staged apply --all                 # Apply all staged additions, edits, and dele
 ```
 
 **Shortcuts via `diff`**:
+
 ```bash
 staged diff -f src/example.py -a   # Apply directly instead of opening diff
 staged diff --all -a              # Apply all changes
@@ -338,6 +348,7 @@ staged apply -f src/example.py --yes   # Confirm applying on drifted branch
 ```
 
 **Configuring Branch Protection**:
+
 ```bash
 staged set --repo --protected-branch main --protected-branch 'release/*'
 staged set --repo --branch-protection true
@@ -393,7 +404,7 @@ staged migrate --from approach-a --to approach-b --all             # All files
 
 - If `--to` is omitted, targets the active session.
 - Source session and workspace files remain unchanged.
-- If destination files exist or workspace files are newer, migration pauses. Pass `--force` to deliberately overwrite. *(Timestamp checks flag potential staleness; they do not perform a 3-way merge).*
+- If destination files exist or workspace files are newer, migration pauses. Pass `--force` to deliberately overwrite. _(Timestamp checks flag potential staleness; they do not perform a 3-way merge)._
 
 ---
 
@@ -430,14 +441,14 @@ Built-in tools: `cursor`, `antigravity`, `windsurf`, `vscode`, `pycharm`, `zed`,
 
 ### Editor Compatibility
 
-| Adapter       | CLI Command                             | Documentation / Evidence                                   |
-| ------------- | --------------------------------------- | ---------------------------------------------------------- |
-| `vscode`      | `code -r -d original staged`            | [VS Code CLI Docs](https://code.visualstudio.com/docs/configure/command-line) |
+| Adapter       | CLI Command                             | Documentation / Evidence                                                                           |
+| ------------- | --------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `vscode`      | `code -r -d original staged`            | [VS Code CLI Docs](https://code.visualstudio.com/docs/configure/command-line)                      |
 | `pycharm`     | `pycharm diff original staged`          | [PyCharm Diff Viewer](https://www.jetbrains.com/help/pycharm/command-line-differences-viewer.html) |
-| `zed`         | `zed --diff original staged`            | [Zed CLI Reference](https://zed.dev/docs/reference/cli)   |
-| `cursor`      | `cursor -r --diff original staged`      | Verified in local CLI parser                               |
-| `antigravity` | `antigravity-ide -r -d original staged` | Verified in local CLI parser                               |
-| `windsurf`    | `windsurf -r --diff original staged`    | Standard vendor CLI flags                                  |
+| `zed`         | `zed --diff original staged`            | [Zed CLI Reference](https://zed.dev/docs/reference/cli)                                            |
+| `cursor`      | `cursor -r --diff original staged`      | Verified in local CLI parser                                                                       |
+| `antigravity` | `antigravity-ide -r -d original staged` | Verified in local CLI parser                                                                       |
+| `windsurf`    | `windsurf -r --diff original staged`    | Standard vendor CLI flags                                                                          |
 
 Codex, Claude Code, and CLI use terminal diffs (`difft`, `git diff`, `diff`). For PyCharm, `staged` checks standard PATH names, JetBrains Toolbox scripts, macOS application bundles, and Linux Snap packages.
 
@@ -478,19 +489,24 @@ staged set --session-root /extra/root         # Add additional discovery directo
 
 ## Shell Completion
 
+Interactive `staged` and `staged init` offer completion setup on first use. You can also install it manually:
+
 ```bash
-# Bash: link completion script and configure ~/.bashrc
+# Bash: configure ~/.bashrc and ~/.bash_profile
 staged install-completion --shell bash
 
 # Zsh: link completion script and configure ~/.zshrc
 staged install-completion --shell zsh
 
-# PowerShell: link completion script and generate Windows launcher
+# PowerShell: link completion script
 staged install-completion --shell powershell
 ```
 
 - **Bash & Zsh**: Symlinks completion scripts into your configuration folder and adds a managed block to `~/.bashrc` or `~/.zshrc`.
-- **PowerShell**: Links script and generates the `staged.cmd` launcher.
+- **PowerShell**: Links the completion script and prints a loader for `$PROFILE`.
+- **Activation**: Run the printed activation command or restart your shell after setup.
+- **Setup Prompt**: Remembers declines per shell. Skips CI, redirected streams, help, and machine output. Set `STAGED_NO_PROMPT=1` to disable it.
+- **Suggestions**: Commands, supported options, session IDs, and editor IDs.
 - **Substring Matching**: Tab-completion matches any case-insensitive substring on `-f` (e.g., `staged diff -f btn<Tab>`).
 
 ---
@@ -502,57 +518,69 @@ Syntax: `<value>` is required, `[value]` is optional, `|` indicates alternatives
 ```text
 staged [global options] [command] [command options]
 staged <command> --help
+staged --help-all
 ```
 
 ### Global Options
 
-| Option                      | Meaning                                                                 |
-| --------------------------- | ----------------------------------------------------------------------- |
-| `-t <id>`, `--tool <id>`    | Select editor adapter; with `use` or `set`, saves in that scope         |
-| `-s <id>`, `--session <id>` | Select session by ID or prefix; with `use`, binds to shell              |
-| `--root <path>`             | Override staging root; with `set`, saves as default                     |
-| `-v`, `--verbose`           | Include absolute paths, file sizes, and timestamps                      |
-| `-h`, `--help`              | Show help without running an operation                                  |
+| Option                      | Meaning                                                         |
+| --------------------------- | --------------------------------------------------------------- |
+| `-t <id>`, `--tool <id>`    | Select editor adapter; with `use` or `set`, saves in that scope |
+| `-s <id>`, `--session <id>` | Select session by ID or prefix; with `use`, binds to shell      |
+| `--root <path>`             | Override staging root; with `set`, saves as default             |
+| `--shell <name>`            | Select Bash, Zsh, or PowerShell for setup                       |
+| `-v`, `--verbose`           | Include absolute paths, file sizes, and timestamps              |
+| `-h`, `--help`              | Show help without running an operation                          |
 
-*(After `path`, `-s` means `--staged`; use `--session <id>` for session selection.)*
+_(After `path`, `-s` means `--staged`; use `--session <id>` for session selection.)_
+
+### Top-Level Options
+
+| Option              | Meaning                                    |
+| ------------------- | ------------------------------------------ |
+| `--sessions`        | List sessions for the current repository   |
+| `-R`, `--all-repos` | List sessions across repositories          |
+| `--list`            | Print proposed file paths, one per line    |
+| `--help-all`        | Show the full command and option reference |
 
 ---
 
 ### Overview & Subcommands
 
-| Command | Key Options | Description |
-| ------- | ----------- | ----------- |
-| `staged` | `[-v]`, `[--sessions]`, `[-R]` | Show overview of active session, workspace sessions, or all roots |
-| `init` | `[id]`, `[--json]`, `[--root <p>]` | Initialize or reuse a staging session |
-| `use` | `--session <id>`, `--tool <id>`, `--clear` | Bind session or tool to current shell |
-| `diff` | `-f <f>`, `--all`, `-a`, `-c`, `-ac`, `--between <a> <b>` | Review or apply visual diffs in editor |
-| `apply` | `-f <f>`, `--all`, `[--force]`, `[-y]` | Apply complete staged files to workspace |
-| `path` | `[-s\|-w]`, `-f <f>`, `[--session <id>]` | Print raw absolute path without headers |
-| `open` | `[--meta]`, `-f <f>` | Open staged file or session metadata in editor |
-| `clean` | `-f <f>`, `--all`, `--session [<id>]`, `[-y]` | Discard staged files or delete session folder |
-| `migrate` | `--from <id>`, `[--to <id>]`, `(-f <q>\|--all)`, `[--force]` | Copy staged files and metadata between sessions |
-| `set` | `[--repo]`, `--tool`, `--default-session`, `--root` | Save persistent preferences |
-| `set-tool` | `<id>`, `--name`, `--diff-cmd`, `--open-cmd` | Register custom editor adapter |
-| `install-skill` | `[--tool]`, `[--default]`, `[--target-dir]`, `[--configure-sandbox]` | Install `/stage` skill for agent harness |
-| `install-completion` | `[--shell bash\|zsh\|powershell]` | Install tab completion |
+| Command              | Key Options                                                          | Description                                                       |
+| -------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `staged`             | `[-v]`, `[--sessions]`, `[-R]`                                       | Show overview of active session, workspace sessions, or all roots |
+| `init`               | `[id]`, `[--json]`, `[--root <p>]`                                   | Initialize or reuse a staging session                             |
+| `use`                | `--session <id>`, `--tool <id>`, `--clear`                           | Bind session or tool to current shell                             |
+| `diff`               | `-f <f>`, `--all`, `-a`, `-c`, `-ac`, `--between <a> <b>`            | Review or apply visual diffs in editor                            |
+| `apply`              | `-f <f>`, `--all`, `[--force]`, `[-y]`                               | Apply complete staged files to workspace                          |
+| `path`               | `[-s\|-w]`, `-f <f>`, `[--session <id>]`                             | Print raw absolute path without headers                           |
+| `open`               | `[--meta]`, `-f <f>`                                                 | Open staged file or session metadata in editor                    |
+| `clean`              | `-f <f>`, `--all`, `--session [<id>]`, `[-y]`                        | Discard staged files or delete session folder                     |
+| `migrate`            | `--from <id>`, `[--to <id>]`, `(-f <q>\|--all)`, `[--force]`         | Copy staged files and metadata between sessions                   |
+| `set`                | `[--repo]`, `--tool`, `--default-session`, `--root`                  | Save persistent preferences                                       |
+| `set-tool`           | `<id>`, `--name`, `--diff-cmd`, `--open-cmd`                         | Register custom editor adapter                                    |
+| `install-skill`      | `[--tool]`, `[--default]`, `[--target-dir]`, `[--configure-sandbox]` | Install `/stage` skill for agent harness                          |
+| `install-completion` | `[--shell bash\|zsh\|powershell]`                                    | Install tab completion                                            |
+| `install-launcher`   |                                                                      | Install the standalone Windows launcher                           |
 
 ---
 
 ## Troubleshooting
 
-| Situation | Resolution |
-| --------- | ---------- |
-| `staged` command not found | Add `~/.local/bin` (or `%APPDATA%\staged\bin`) to your shell `PATH`. |
-| No staging session found | Confirm current directory is in the workspace. Check `staged --sessions` or `staged -R`. |
-| Session selection ignored | Environment variables (`STAGED_SESSION`) or CLI flags take precedence over shell bindings. |
-| Session lost between agent calls | Use persistent shells or pass `STAGED_SHELL_ID` across agent subprocess calls. |
-| File or session is ambiguous | Provide exact relative path or full session ID. |
-| Editor launcher missing | Ensure editor CLI is in `PATH`, switch with `staged use --tool`, or use `--tool cli`. |
-| Agent denied write access | Add printed staging root path to harness writable directory permissions. |
-| Protected or changed branch warning | Use `--force` for protected branches; use `-y` for drifted branches. |
-| `MISSING` status | Staged file missing for a tracked rename. Add destination file or clean the entry. |
-| Migration refuses to copy | Destination file exists or workspace file is newer. Pass `--force` to overwrite. |
-| Apply fails mid-batch | Inspect `staged`. Apply is atomic per-file, not a transaction; earlier files remain applied. |
+| Situation                           | Resolution                                                                                   |
+| ----------------------------------- | -------------------------------------------------------------------------------------------- |
+| `staged` command not found          | Add `~/.local/bin` (or `%APPDATA%\staged\bin`) to your shell `PATH`.                         |
+| No staging session found            | Confirm current directory is in the workspace. Check `staged --sessions` or `staged -R`.     |
+| Session selection ignored           | Environment variables (`STAGED_SESSION`) or CLI flags take precedence over shell bindings.   |
+| Session lost between agent calls    | Use persistent shells or pass `STAGED_SHELL_ID` across agent subprocess calls.               |
+| File or session is ambiguous        | Provide exact relative path or full session ID.                                              |
+| Editor launcher missing             | Ensure editor CLI is in `PATH`, switch with `staged use --tool`, or use `--tool cli`.        |
+| Agent denied write access           | Add printed staging root path to harness writable directory permissions.                     |
+| Protected or changed branch warning | Use `--force` for protected branches; use `-y` for drifted branches.                         |
+| `MISSING` status                    | Staged file missing for a tracked rename. Add destination file or clean the entry.           |
+| Migration refuses to copy           | Destination file exists or workspace file is newer. Pass `--force` to overwrite.             |
+| Apply fails mid-batch               | Inspect `staged`. Apply is atomic per-file, not a transaction; earlier files remain applied. |
 
 ---
 
@@ -563,4 +591,4 @@ python3 -m unittest discover -s tests -v
 npm pack --dry-run
 ```
 
-All 74 tests execute against isolated temporary directories without modifying your user configuration or active working tree. See [SPEC.md](SPEC.md) for behavioral contracts and [IMPLEMENTATION.md](IMPLEMENTATION.md) for roadmap items.
+Tests execute against isolated temporary directories without modifying your user configuration or active working tree. See [SPEC.md](SPEC.md) for behavioral contracts and [IMPLEMENTATION.md](IMPLEMENTATION.md) for roadmap items.
