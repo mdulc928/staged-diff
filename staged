@@ -28,7 +28,7 @@ GLOBAL_STATE_FILE = CONFIG_DIR / 'state.json'
 DEFAULT_PROTECTED_BRANCHES = []
 STATUS_COLORS = {'APPLIED': '32', 'MODIFIED': '33', 'NEW FILE': '36', 'RENAMED': '35',
                  'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
-COMMANDS = ['init', 'diff', 'apply', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion']
+COMMANDS = ['init', 'diff', 'apply', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher']
 
 
 def is_reserved_windows_name(name):
@@ -956,13 +956,20 @@ def make_parser():
             flags = ['--session'] if path_command else ['-s', '--session']
             parser.add_argument(*flags, default=argparse.SUPPRESS, help='session ID or unique prefix')
         parser.add_argument('--root', default=argparse.SUPPRESS, help='staging root (outside the workspace)')
-        parser.add_argument('-v', '--verbose', action='store_true', default=argparse.SUPPRESS)
-    parser = argparse.ArgumentParser(prog='staged', description=__doc__)
-    parser.set_defaults(tool=None, session=None, root=None, verbose=False, clean_session=None)
+        parser.add_argument('--shell', choices=['bash', 'zsh', 'powershell'], default=argparse.SUPPRESS,
+                            help='shell for setup; powershell offers an optional Windows launcher')
+        parser.add_argument('-v', '--verbose', action='store_true', default=argparse.SUPPRESS, help='include absolute paths, file sizes, and timestamps in the overview')
+    parser = argparse.ArgumentParser(
+        prog='staged', description=__doc__,
+        epilog='Run staged <command> --help for command options, or staged --help-all for the full reference. '
+               'Use --sessions to list sessions; --session <id> selects one.')
+    parser.set_defaults(tool=None, session=None, root=None, verbose=False, clean_session=None, shell=None)
     globals_on(parser)
     parser.add_argument('-R', '--all-repos', action='store_true', help='list sessions across repositories')
+    parser.add_argument('--help-all', action='store_true', help='show help for every command')
     parser.add_argument('--sessions', action='store_true', help='list sessions for this repository')
-    for helper in ('--complete', '--complete-sessions', '--complete-tools', '--complete-open', '--complete-meta', '--list'):
+    parser.add_argument('--list', action='store_true', help='print proposed file paths, one per line')
+    for helper in ('--complete', '--complete-sessions', '--complete-tools', '--complete-open', '--complete-meta', '--complete-options'):
         parser.add_argument(helper, action='store_true', help=argparse.SUPPRESS)
     subs = parser.add_subparsers(dest='command')
     command_parsers = {}
@@ -979,6 +986,7 @@ def make_parser():
         'migrate': 'Copy proposals between sessions, checking for stale conflicts.',
         'install-skill': 'Install /stage for an agent harness.',
         'install-completion': 'Install shell completions for bash, zsh, or powershell.',
+        'install-launcher': 'Install the standalone Windows command launcher (PATH unchanged).',
     }
     for name in COMMANDS:
         command = subs.add_parser(name, description=descriptions[name], help=descriptions[name])
@@ -999,45 +1007,161 @@ def make_parser():
     p.add_argument('-a', '--apply', action='store_true', help='apply proposed changes before any requested clean')
     p.add_argument('-c', '--clean', action='store_true', help='clean proposed changes; with --apply, clean only after apply succeeds')
     comparison = p.add_mutually_exclusive_group()
-    comparison.add_argument('--between', nargs=2, metavar=('SESSION1', 'SESSION2'))
-    comparison.add_argument('--compare-session')
+    comparison.add_argument('--between', nargs=2, metavar=('SESSION1', 'SESSION2'), help='compare proposed files in two sessions')
+    comparison.add_argument('--compare-session', help='compare the active session with another session')
     for name in ('diff', 'apply'):
         command_parsers[name].add_argument('--force', action='store_true', help='allow protected-branch apply')
         command_parsers[name].add_argument('-y', '--yes', action='store_true', help='confirm branch drift or clean')
     p = command_parsers['clean']
-    p.add_argument('-y', '--yes', action='store_true')
+    p.add_argument('-y', '--yes', action='store_true', help='confirm discarding proposed changes')
     p = command_parsers['path']
     group = p.add_mutually_exclusive_group()
     group.add_argument('-s', '--staged', action='store_true', help='print proposed-file path (default)')
-    group.add_argument('-w', '--workspace', action='store_true')
+    group.add_argument('-w', '--workspace', action='store_true', help='print the original workspace path')
     p = command_parsers['open']
     p.add_argument('--meta', action='store_true', help='open an editable session metadata file instead of a proposed file')
     p = command_parsers['use']
-    p.add_argument('id', nargs='?')
-    p.add_argument('--clear', action='store_true')
+    p.add_argument('id', nargs='?', help='session ID or unique prefix to bind to this shell')
+    p.add_argument('--clear', action='store_true', help='clear current shell session and tool bindings')
     p = command_parsers['set']
     p.add_argument('--default', action='store_true', help='global preferences (the default)')
     p.add_argument('--repo', action='store_true', help='save in this workspace .staged.json')
-    p.add_argument('--default-session')
-    p.add_argument('--branch-protection', choices=['true', 'false'])
+    p.add_argument('--default-session', help='session ID or unique prefix to use by default')
+    p.add_argument('--branch-protection', choices=['true', 'false'], help='enable or disable protected-branch apply checks')
     p.add_argument('--protected-branch', action='append', help='replace protected patterns (default: none); repeat for each pattern')
     p.add_argument('--session-root', action='append', help='additional discovery root; repeat for each root')
     p = command_parsers['set-tool']
-    p.add_argument('id')
-    p.add_argument('--name', required=True)
-    p.add_argument('--diff-cmd', required=True)
-    p.add_argument('--open-cmd', required=True)
+    p.add_argument('id', help='ID for the custom editor adapter')
+    p.add_argument('--name', required=True, help='display name for the editor')
+    p.add_argument('--diff-cmd', required=True, help='diff command template with {orig} and {staged} placeholders')
+    p.add_argument('--open-cmd', required=True, help='open command template with a {staged} placeholder')
     p = command_parsers['migrate']
-    p.add_argument('--from', dest='source', required=True)
+    p.add_argument('--from', dest='source', required=True, help='source session ID or unique prefix')
     p.add_argument('--to', help='existing session or new session ID')
     p.add_argument('--force', action='store_true', help='replace target proposals despite conflicts')
     p = command_parsers['install-skill']
-    p.add_argument('--default', action='store_true')
+    p.add_argument('--default', action='store_true', help='install in the user-level skill directory (default)')
     p.add_argument('--target-dir', help='explicit directory containing the installed SKILL.md')
     p.add_argument('--configure-sandbox', action='store_true', help='merge staging-root permissions where supported')
-    p = command_parsers['install-completion']
-    p.add_argument('--shell', choices=['bash', 'zsh', 'powershell'], help='shell for completion installation')
     return parser, command_parsers
+
+
+def completion_options(words, parser, commands):
+    """Derive public candidates from the parser, skipping global option values."""
+    selected = parser
+    remaining = 0
+    for word in words:
+        if remaining:
+            remaining -= 1
+            continue
+        if word == 'help':
+            return list(commands)
+        if word in commands:
+            selected = commands[word]
+            break
+        action = parser._option_string_actions.get(word.split('=', 1)[0])
+        if action and action.nargs != 0 and '=' not in word:
+            remaining = 1
+    options = [flag for action in selected._actions if action.help != argparse.SUPPRESS
+               for flag in action.option_strings]
+    return (list(commands) if selected is parser else []) + options
+
+
+def completion_shell():
+    return 'powershell' if os.name == 'nt' else Path(os.environ.get('SHELL', '')).name
+
+
+def zsh_rc():
+    return Path(os.environ.get('ZDOTDIR') or HOME) / '.zshrc'
+
+
+def completion_installed(shell):
+    filename = {'bash': 'staged.bash', 'zsh': '_staged', 'powershell': 'staged.ps1'}[shell]
+    target = CONFIG_DIR / 'completions' / filename
+    if not target.is_file():
+        return False
+    # PowerShell's profile varies by host; installation prints its loader command.
+    if shell == 'powershell':
+        return True
+    profiles = [zsh_rc()] if shell == 'zsh' else [Path(HOME) / '.bashrc', Path(HOME) / '.bash_profile']
+    for path in profiles:
+        if path.is_file():
+            content = path.read_text(encoding='utf-8')
+            if (COMPLETION_MARKER_START in content and COMPLETION_MARKER_END in content
+                    and str(target if shell == 'bash' else target.parent) in content):
+                return True
+    return False
+
+
+def setup_prompts_enabled():
+    return (not os.environ.get('CI') and not os.environ.get('STAGED_NO_PROMPT')
+            and all(stream.isatty() for stream in (sys.stdin, sys.stdout, sys.stderr)))
+
+
+def offer_completion_install(shell=None):
+    """Offer setup once per supported shell, only on interactive overview/init."""
+    if not setup_prompts_enabled():
+        return
+    shell = shell or completion_shell()
+    if shell not in ('bash', 'zsh', 'powershell'):
+        return
+    state_path = CONFIG_DIR / 'completion-setup.json'
+    try:
+        state = load_json(state_path)
+        if state.get(shell) or completion_installed(shell):
+            return
+        detail = ('Install the script and show how to add it to $PROFILE' if shell == 'powershell'
+                  else 'Update {}'.format(zsh_rc() if shell == 'zsh' else '~/.bashrc and ~/.bash_profile'))
+        print('Enable staged tab completion for {}? {}. [y/N] '.format(shell, detail),
+              end='', file=sys.stderr, flush=True)
+        answer = sys.stdin.readline()
+        if not answer:  # No answer is not a saved preference.
+            return
+        if answer.strip().lower() in ('y', 'yes'):
+            install_completion(shell)
+            state[shell] = 'installed'
+        else:
+            print('You can enable it later: staged install-completion --shell ' + shell, file=sys.stderr)
+            state[shell] = 'declined'
+        save_json(state_path, state)
+    except (OSError, StagedError, ValueError) as exc:
+        # Optional onboarding must never prevent the requested command from running.
+        print('Completion setup skipped: {}. Run staged install-completion --shell {} to retry.'.format(exc, shell),
+              file=sys.stderr)
+
+
+def install_launcher():
+    if sys.platform != 'win32':
+        raise StagedError('The standalone cmd launcher is only supported on Windows.')
+    launcher = CONFIG_DIR / 'bin/staged.cmd'
+    # Percent signs in literal batch-file paths must not expand environment variables.
+    python = sys.executable.replace('%', '%%')
+    engine = str(REPO_ROOT / 'staged').replace('%', '%%')
+    write_text_file(launcher, '@echo off\n"{}" "{}" %*\n'.format(python, engine))
+    print('Launcher: {}. Add {} to your user PATH.'.format(launcher, launcher.parent))
+
+
+def offer_launcher_install():
+    if sys.platform != 'win32' or not setup_prompts_enabled():
+        return
+    launcher = CONFIG_DIR / 'bin/staged.cmd'
+    state_path = CONFIG_DIR / 'launcher-setup.json'
+    try:
+        # npm already supplies a command shim; do not offer a competing launcher.
+        if launcher.is_file() or shutil.which('staged') or load_json(state_path).get('answered'):
+            return
+        print('Install the standalone staged.cmd launcher at {}? PATH will remain unchanged. [y/N] '.format(launcher),
+              end='', file=sys.stderr, flush=True)
+        answer = sys.stdin.readline()
+        if not answer:
+            return
+        if answer.strip().lower() in ('y', 'yes'):
+            install_launcher()
+        else:
+            print('You can install it later: python staged install-launcher', file=sys.stderr)
+        save_json(state_path, {'answered': True})
+    except (OSError, StagedError, ValueError) as exc:
+        print('Launcher setup skipped: {}. Run python staged install-launcher to retry.'.format(exc), file=sys.stderr)
 
 
 def install_completion_file(name, target):
@@ -1069,7 +1193,7 @@ def install_completion_file(name, target):
 
 
 def install_completion(shell=None):
-    shell = shell or ('powershell' if os.name == 'nt' else Path(os.environ.get('SHELL', 'bash')).name)
+    shell = shell or completion_shell() or 'bash'
     directory = CONFIG_DIR / 'completions'
     if shell == 'bash':
         target = directory / 'staged.bash'
@@ -1085,20 +1209,16 @@ def install_completion(shell=None):
             COMPLETION_MARKER_START, shlex.quote(str(directory)), COMPLETION_MARKER_END)
         # Old completion files can claim the same command, and compinit may reuse
         # a cached mapping. Register explicitly after other shell initialization.
-        upsert_shell_block(str(Path(HOME) / '.zshrc'), hook, move_to_end=True)
+        upsert_shell_block(str(zsh_rc()), hook, move_to_end=True)
     elif shell == 'powershell':
         target = directory / 'staged.ps1'
         install_completion_file('staged.ps1', target)
-        if os.name == 'nt':
-            launcher = CONFIG_DIR / 'bin/staged.cmd'
-            write_text_file(launcher, '@echo off\r\n"{}" "{}" %*\r\n'.format(sys.executable, REPO_ROOT / 'staged'))
-            print('Launcher: {}. Add {} to your user PATH.'.format(launcher, launcher.parent))
         print("Load in PowerShell (add to $PROFILE to persist): . '{}'".format(str(target).replace("'", "''")))
     else:
         raise StagedError('Choose --shell bash, zsh or powershell.')
     print('Installed: {}'.format(target))
     if shell == 'zsh':
-        print('Activate in your current shell: source ~/.zshrc (or open a new terminal).')
+        print('Activate in your current shell: source {} (or open a new terminal).'.format(shlex.quote(str(zsh_rc()))))
     elif shell == 'bash':
         print('Activate in your current shell: source {} (or open a new terminal).'.format(shlex.quote(str(target))))
 
@@ -1128,6 +1248,16 @@ def set_preferences(ctx):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     parser, commands = make_parser()
+    # Completion must work with incomplete arguments and without loading user configuration.
+    if argv[:1] == ['--complete-options']:
+        print('\n'.join(completion_options(argv[1:], parser, commands)))
+        return
+    if '--help-all' in argv:
+        parser.print_help()
+        for command in commands.values():
+            print('\n' + '=' * 72)
+            command.print_help()
+        return
     # Handle help before parsing required values or reading any configuration.
     if '--help' in argv or '-h' in argv or argv[:1] == ['help']:
         command = next((arg for arg in argv if arg in commands), None)
@@ -1137,6 +1267,11 @@ def main(argv=None):
     if args.command == 'diff' and (args.apply or args.clean or args.between or args.compare_session):
         if args.file is None and not args.all:
             commands['diff'].error('choose --file <file> or --all')
+    if args.command == 'install-launcher':
+        install_launcher()
+        return
+    if not argv or (args.command == 'init' and not args.json):
+        offer_completion_install(args.shell)
     ctx = Context(args)
     if args.complete_tools:
         print('\n'.join(sorted(ctx.registry)))
@@ -1172,6 +1307,8 @@ def main(argv=None):
             if not str(exc).startswith('No staging session'):
                 raise
         return
+    if args.shell == 'powershell' and args.command != 'path' and not getattr(args, 'json', False):
+        offer_launcher_install()
     if args.command == 'init':
         session = init_session(ctx, args.id or args.session or str(uuid.uuid4()))
         ctx.shell['session'] = session.id

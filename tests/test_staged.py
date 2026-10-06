@@ -436,6 +436,91 @@ class CLI(unittest.TestCase):
         cli = json.loads((path.parent / 'cli-config.json').read_text())
         self.assertEqual(len(cli['permissions']['allow']), 2)
 
+    def test_help_and_completion_cover_public_options_without_config(self):
+        (self.repo / '.staged.json').write_text('{broken')
+        parser, commands = staged.make_parser()
+        full_help = self.run_cli('--help-all').stdout
+        for name, command in [(None, parser)] + list(commands.items()):
+            with self.subTest(command=name):
+                args = ['--complete-options'] + ([name] if name else [])
+                choices = self.run_cli(*args).stdout.splitlines()
+                for action in command._actions:
+                    if action.help == staged.argparse.SUPPRESS:
+                        continue
+                    if action.option_strings:
+                        self.assertTrue(action.help, action.option_strings)
+                    for flag in action.option_strings:
+                        self.assertIn(flag, choices)
+                        self.assertIn(flag, full_help)
+                self.assertNotIn('--complete-tools', choices)
+        root = self.run_cli('--complete-options').stdout.splitlines()
+        self.assertIn('--session', root)
+        self.assertIn('--sessions', root)
+        # A global option value matching a command must not switch contexts.
+        options = self.run_cli('--complete-options', '--session', 'set', 'diff').stdout.splitlines()
+        self.assertIn('--between', options)
+        self.assertNotIn('--repo', options)
+
+    @unittest.skipIf(os.name == 'nt', 'Requires POSIX shells')
+    def test_shell_completion_public_options_and_session_values(self):
+        self.init('session-a')
+        self.init('session-b')
+        env = dict(self.env, PATH=str(SCRIPT.parent) + os.pathsep + self.env['PATH'])
+        scripts = {
+            'bash': ('staged.bash', r'''source "$1"
+shift
+COMP_WORDS=(staged "$@")
+COMP_CWORD=$((${#COMP_WORDS[@]} - 1))
+_staged
+printf '%s\n' "${COMPREPLY[@]}"
+'''),
+            'zsh': ('_staged', r'''completion_file=$1
+shift
+words=(staged "$@")
+CURRENT=${#words[@]}
+compadd() {
+  while [[ "$1" != -- ]]; do shift; done
+  shift
+  print -rl -- "$@"
+}
+source "$completion_file"
+'''),
+        }
+        cases = [
+            ([''], ['--session', '--sessions', '--all-repos', '--verbose'], ['--file']),
+            (['diff', ''], ['--between', '--compare-session', '--file'], ['--repo']),
+            (['init', ''], ['--json'], ['--apply']),
+            (['use', ''], ['session-a', '--clear', '--session'], ['--apply']),
+            (['set', ''], ['--default-session', '--branch-protection', '--session-root'], ['--apply']),
+            (['install-completion', ''], ['--shell', '--help'], ['--apply']),
+            (['path', '-s', ''], ['--workspace', '--file'], ['session-a']),
+            (['clean', '-s', ''], ['session-a', 'session-b'], ['--workspace']),
+            (['diff', '--between', 'session-a', ''], ['session-b'], ['--all']),
+            (['set', '--default-session', ''], ['session-a'], ['--all']),
+            (['set', '--branch-protection', ''], ['true', 'false'], ['--all']),
+        ]
+        for shell, (filename, script) in scripts.items():
+            if not shutil.which(shell):
+                continue
+            for words, included, excluded in cases:
+                with self.subTest(shell=shell, words=words):
+                    result = subprocess.run([shell, '-f', '-c', script, 'test',
+                                             str(SCRIPT.parent / 'completions' / filename)] + words,
+                                            cwd=self.repo, env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    choices = result.stdout.splitlines()
+                    for choice in included:
+                        self.assertIn(choice, choices)
+                    for choice in excluded:
+                        self.assertNotIn(choice, choices)
+
+    def test_machine_commands_never_offer_completion_setup(self):
+        self.init()
+        self.run_cli('--sessions')
+        self.run_cli('--help-all')
+        self.run_cli('--complete-options')
+        self.assertFalse((self.config / 'completion-setup.json').exists())
+
     def test_completion_scripts_are_idempotent_and_parse(self):
         for shell in (['powershell'] if os.name == 'nt' else ['bash', 'zsh', 'powershell']):
             for _ in range(2):
@@ -443,6 +528,7 @@ class CLI(unittest.TestCase):
         if os.name != 'nt':
             self.assertEqual((self.home / '.bashrc').read_text().count(staged.COMPLETION_MARKER_START), 1)
             self.assertEqual((self.home / '.zshrc').read_text().count(staged.COMPLETION_MARKER_START), 1)
+        self.assertFalse((self.config / 'bin/staged.cmd').exists())
         directory = self.config / 'completions'
         for shell, filename in [('bash', 'staged.bash'), ('zsh', '_staged')]:
             if os.name != 'nt' and shutil.which(shell):
@@ -946,6 +1032,173 @@ class Unit(unittest.TestCase):
             staged.run_editor(['git'], terminal=True)
             with self.assertRaises(staged.StagedError):
                 staged.run_editor(['editor'])
+
+
+class CompletionOnboarding(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='staged-setup-test-')
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name)
+        self.config = self.home / 'config'
+        self.state = self.config / 'completion-setup.json'
+        for patcher in [patch.object(staged, 'HOME', str(self.home)),
+                        patch.object(staged, 'CONFIG_DIR', self.config),
+                        patch.object(staged, 'completion_shell', return_value='zsh'),
+                        patch.dict(os.environ, {'CI': '', 'STAGED_NO_PROMPT': '', 'ZDOTDIR': str(self.home)})]:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.streams = []
+        for name in ('stdin', 'stdout', 'stderr'):
+            patcher = patch.object(staged.sys, name)
+            stream = patcher.start()
+            stream.isatty.return_value = True
+            self.streams.append(stream)
+            self.addCleanup(patcher.stop)
+        self.streams[0].readline.return_value = 'n\n'
+
+    def test_decline_is_remembered_without_shell_edits(self):
+        staged.offer_completion_install()
+        staged.offer_completion_install()
+        self.streams[0].readline.assert_called_once()
+        self.assertEqual(json.loads(self.state.read_text()), {'zsh': 'declined'})
+        self.assertFalse((self.home / '.zshrc').exists())
+
+    @unittest.skipIf(os.name == 'nt', 'Zsh installation requires symlink support')
+    def test_accept_installs_and_does_not_offer_again(self):
+        self.streams[0].readline.return_value = 'yes\n'
+        staged.offer_completion_install()
+        self.assertIn(staged.COMPLETION_MARKER_START, (self.home / '.zshrc').read_text())
+        self.assertTrue((self.config / 'completions/_staged').is_file())
+        self.assertEqual(json.loads(self.state.read_text()), {'zsh': 'installed'})
+        # Also recognize an explicit installation with no onboarding state.
+        self.state.unlink()
+        staged.offer_completion_install()
+        self.streams[0].readline.assert_called_once()
+
+    def test_noninteractive_ci_and_opt_out_never_prompt(self):
+        for stream in self.streams:
+            stream.isatty.return_value = False
+            staged.offer_completion_install()
+            stream.isatty.return_value = True
+        for variable in ('CI', 'STAGED_NO_PROMPT'):
+            with patch.dict(os.environ, {variable: '1'}):
+                staged.offer_completion_install()
+        with patch.object(staged, 'completion_shell', return_value='fish'):
+            staged.offer_completion_install()
+        self.streams[0].readline.assert_not_called()
+        self.assertFalse(self.state.exists())
+
+    def test_eof_does_not_record_a_decline(self):
+        self.streams[0].readline.return_value = ''
+        staged.offer_completion_install()
+        self.assertFalse(self.state.exists())
+
+    def test_setup_failure_is_nonfatal_and_can_be_retried(self):
+        self.streams[0].readline.return_value = 'y\n'
+        with patch.object(staged, 'install_completion', side_effect=OSError('read-only profile')):
+            staged.offer_completion_install()
+        self.assertFalse(self.state.exists())
+        self.assertTrue(any('read-only profile' in str(call) for call in self.streams[2].write.call_args_list))
+
+
+class LauncherOnboarding(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='staged-launcher-test-')
+        self.addCleanup(temporary.cleanup)
+        self.config = Path(temporary.name)
+        self.launcher = self.config / 'bin/staged.cmd'
+        self.state = self.config / 'launcher-setup.json'
+        for patcher in [patch.object(staged, 'CONFIG_DIR', self.config),
+                        patch.object(staged.sys, 'platform', 'win32'),
+                        patch.object(staged.shutil, 'which', return_value=None),
+                        patch.dict(os.environ, {'CI': '', 'STAGED_NO_PROMPT': ''})]:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.streams = []
+        for name in ('stdin', 'stdout', 'stderr'):
+            patcher = patch.object(staged.sys, name)
+            stream = patcher.start()
+            stream.isatty.return_value = True
+            self.streams.append(stream)
+            self.addCleanup(patcher.stop)
+        self.streams[0].readline.return_value = 'n\n'
+
+    def test_decline_is_remembered_without_installing(self):
+        staged.offer_launcher_install()
+        staged.offer_launcher_install()
+        self.streams[0].readline.assert_called_once()
+        self.assertFalse(self.launcher.exists())
+        self.assertEqual(json.loads(self.state.read_text()), {'answered': True})
+        # An explicit install remains available after declining.
+        staged.install_launcher()
+        self.assertTrue(self.launcher.is_file())
+
+    def test_accept_installs_without_changing_path_or_completions(self):
+        self.streams[0].readline.return_value = 'yes\n'
+        original_path = os.environ.get('PATH')
+        staged.offer_launcher_install()
+        self.assertIn('%*', self.launcher.read_text())
+        self.assertIn(str(SCRIPT), self.launcher.read_text())
+        self.assertEqual(os.environ.get('PATH'), original_path)
+        self.assertFalse((self.config / 'completions').exists())
+        self.state.unlink()
+        staged.offer_launcher_install()
+        self.streams[0].readline.assert_called_once()
+
+    def test_existing_command_shim_suppresses_offer(self):
+        with patch.object(staged.shutil, 'which', return_value='C:/npm/staged.cmd'):
+            staged.offer_launcher_install()
+        self.streams[0].readline.assert_not_called()
+        self.assertFalse(self.launcher.exists())
+        self.assertFalse(self.state.exists())
+
+    def test_noninteractive_ci_opt_out_and_other_platforms_skip_offer(self):
+        for stream in self.streams:
+            stream.isatty.return_value = False
+            staged.offer_launcher_install()
+            stream.isatty.return_value = True
+        for variable in ('CI', 'STAGED_NO_PROMPT'):
+            with patch.dict(os.environ, {variable: '1'}):
+                staged.offer_launcher_install()
+        with patch.object(staged.sys, 'platform', 'linux'):
+            staged.offer_launcher_install()
+            with self.assertRaises(staged.StagedError):
+                staged.install_launcher()
+        self.streams[0].readline.assert_not_called()
+        self.assertFalse(self.launcher.exists())
+        self.assertFalse(self.state.exists())
+
+    def test_eof_and_write_failure_do_not_save_a_choice(self):
+        self.streams[0].readline.return_value = ''
+        staged.offer_launcher_install()
+        self.assertFalse(self.state.exists())
+        self.streams[0].readline.return_value = 'y\n'
+        with patch.object(staged, 'install_launcher', side_effect=OSError('read-only directory')):
+            staged.offer_launcher_install()
+        self.assertFalse(self.launcher.exists())
+        self.assertFalse(self.state.exists())
+
+    def test_powershell_completion_install_does_not_write_launcher(self):
+        staged.install_completion('powershell')
+        self.assertTrue((self.config / 'completions/staged.ps1').is_file())
+        self.assertFalse(self.launcher.exists())
+        self.streams[0].readline.assert_not_called()
+
+    def test_explicit_shell_routes_offer_separately_from_completion(self):
+        with patch.object(staged, 'Context'), patch.object(staged, 'install_completion') as completion, \
+                patch.object(staged, 'offer_launcher_install') as offer:
+            staged.main(['install-completion', '--shell', 'powershell'])
+            offer.assert_called_once_with()
+            completion.assert_called_once_with('powershell')
+            offer.reset_mock()
+            staged.main(['--shell', 'powershell', '--sessions'])
+            staged.main(['--shell', 'powershell', '--list'])
+            staged.main(['--shell', 'powershell', '--help'])
+            staged.main(['--shell', 'powershell', '--help-all'])
+            staged.main(['install-completion', '--shell', 'bash'])
+            offer.assert_not_called()
+            staged.main(['--shell', 'powershell'])
+            offer.assert_called_once_with()
 
 
 if __name__ == '__main__':

@@ -8,8 +8,18 @@ _staged() {
   fi
   case "${words[CURRENT-1]}" in
     --tool|-t) candidates=("${(@f)$(command staged --complete-tools 2>/dev/null)}") ;;
-    --session|-s|--from|--to|--between|--compare-session|use)
+    --session|--from|--to|--between|--compare-session|--default-session)
       candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}") ;;
+    use)
+      candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}"
+                  "${(@f)$(command staged --complete-options "${(@)words[2,CURRENT-1]}" 2>/dev/null)}") ;;
+    -s)
+      if (( ${words[(Ie)path]} )); then
+        candidates=("${(@f)$(command staged --complete-options "${(@)words[2,CURRENT-1]}" 2>/dev/null)}")
+      else
+        candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}")
+      fi ;;
+    --branch-protection) candidates=(true false) ;;
     --file|-f)
       candidates=("${(@f)$(command staged "$file_helper" 2>/dev/null)}")
       local candidate query="${words[CURRENT]:l}"
@@ -24,9 +34,12 @@ _staged() {
       return ;;
     --shell)
       candidates=(bash zsh powershell) ;;
-    install-completion)
-      candidates=(--shell) ;;
-    *) candidates=(init diff apply clean path open use set set-tool migrate install-skill install-completion --all --meta --help -h --session -s --tool -t --root --force --yes -y --clear --file -f --apply -a --clean -c --between --compare-session) ;;
+    *)
+      if (( CURRENT >= 3 )) && [[ "${words[CURRENT-2]}" == --between ]]; then
+        candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}")
+      else
+        candidates=("${(@f)$(command staged --complete-options "${(@)words[2,CURRENT-1]}" 2>/dev/null)}")
+      fi ;;
   esac
   compadd -M 'm:{a-zA-Z}={A-Za-z}' -- "${candidates[@]}"
 }
