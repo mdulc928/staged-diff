@@ -1,6 +1,6 @@
 {
   "name": "@melchi/staged",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Review isolated proposal files before applying them to your workspace.",
   "license": "MIT",
   "bin": {
