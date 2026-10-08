@@ -8,8 +8,14 @@ _staged() {
   fi
   case "${words[CURRENT-1]}" in
     --tool|-t) candidates=("${(@f)$(command staged --complete-tools 2>/dev/null)}") ;;
-    --session|--from|--to|--between|--compare-session|--default-session)
+    --session|--from|--between|--compare-session|--default-session)
       candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}") ;;
+    --to)
+      if (( ${words[(Ie)copy]} || ${words[(Ie)rename]} )); then
+        candidates=()
+      else
+        candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}")
+      fi ;;
     use)
       candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}"
                   "${(@f)$(command staged --complete-options "${(@)words[2,CURRENT-1]}" 2>/dev/null)}") ;;
@@ -31,6 +37,16 @@ _staged() {
       done
       # Matching is already done; allow insertion of a full path for a substring query.
       compadd -U -- "${matches[@]}"
+      if (( ${#matches[@]} > 1 )); then
+        # A common prefix can be empty for substring matches. List on the first
+        # Tab without replacing the query; another Tab begins menu selection.
+        if [[ "${compstate[old_list]}" == (yes|shown) || "${compstate[insert]}" == menu* ]]; then
+          compstate[insert]=menu
+        else
+          compstate[insert]=''
+          compstate[list]=list
+        fi
+      fi
       return ;;
     --shell)
       candidates=(bash zsh powershell) ;;

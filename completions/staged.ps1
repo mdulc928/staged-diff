@@ -9,7 +9,8 @@ Register-ArgumentCompleter -Native -CommandName staged -ScriptBlock {
   } else { '--list' }
   $choices = switch ($previous) {
     { $_ -in '--tool','-t' } { & staged --complete-tools; break }
-    { $_ -in '--session','--from','--to','--between','--compare-session','--default-session' } { & staged --complete-sessions; break }
+    { $_ -in '--session','--from','--between','--compare-session','--default-session' } { & staged --complete-sessions; break }
+    '--to' { if ($contextWords -notcontains 'copy' -and $contextWords -notcontains 'rename') { & staged --complete-sessions }; break }
     'use' { & staged --complete-sessions; & staged --complete-options @contextWords; break }
     '-s' { if ($contextWords -contains 'path') { & staged --complete-options @contextWords } else { & staged --complete-sessions }; break }
     '--branch-protection' { 'true','false'; break }

@@ -8,8 +8,12 @@ _staged() {
   fi
   case "$prev" in
     --tool|-t) while IFS= read -r item; do choices+=("$item"); done < <(command staged --complete-tools 2>/dev/null) ;;
-    --session|--from|--to|--between|--compare-session|--default-session)
+    --session|--from|--between|--compare-session|--default-session)
       while IFS= read -r item; do choices+=("$item"); done < <(command staged --complete-sessions 2>/dev/null) ;;
+    --to)
+      if [[ " ${COMP_WORDS[*]} " != *" copy "* && " ${COMP_WORDS[*]} " != *" rename "* ]]; then
+        while IFS= read -r item; do choices+=("$item"); done < <(command staged --complete-sessions 2>/dev/null)
+      fi ;;
     use)
       while IFS= read -r item; do choices+=("$item"); done < <(command staged --complete-sessions 2>/dev/null)
       while IFS= read -r item; do choices+=("$item"); done < <(command staged --complete-options "${COMP_WORDS[@]:1:COMP_CWORD-1}" 2>/dev/null) ;;
