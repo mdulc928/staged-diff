@@ -177,7 +177,12 @@ def confirm(message, yes=False):
         return
     if not sys.stdin.isatty():
         raise StagedError(message + ' Re-run interactively or pass --yes.')
-    if input(message + ' [y/N] ').strip().lower() not in ('y', 'yes'):
+    try:
+        answer = input(message + ' [y/N] ')
+    except EOFError:
+        # A character device (including Windows NUL) may be a tty with no input.
+        raise StagedError(message + ' Re-run interactively or pass --yes.') from None
+    if answer.strip().lower() not in ('y', 'yes'):
         raise StagedError('Aborted; no changes made.')
 
 
@@ -1890,7 +1895,11 @@ def uninstall(ctx):
     remove_sessions = ctx.args.remove_sessions
     if sessions and not remove_sessions and not ctx.args.keep_sessions:
         if sys.stdin.isatty():
-            remove_sessions = input('Also permanently delete all {} listed sessions? [y/N] '.format(len(sessions))).strip().lower() in ('y', 'yes')
+            try:
+                answer = input('Also permanently delete all {} listed sessions? [y/N] '.format(len(sessions)))
+            except EOFError:
+                answer = ''
+            remove_sessions = answer.strip().lower() in ('y', 'yes')
         else:
             print('Keeping sessions; pass --remove-sessions to delete them.')
     # Run the package manager first: a permissions failure must leave cleanup retryable.

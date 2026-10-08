@@ -21,8 +21,16 @@ loader.exec_module(staged)
 
 # Executing a script never uses a .pyc cache, so each `python staged` recompiles ~2k lines.
 # Compile once per test process and run the cached code object with the real __file__,
-# so REPO_ROOT, tracebacks and behavior match running SCRIPT directly.
-LAUNCHER_SOURCE = '''import marshal, sys
+# so REPO_ROOT and tracebacks match running SCRIPT directly.
+LAUNCHER_SOURCE = '''import marshal, sys, types
+# Integration tests never access the real Windows registry. Registry behavior
+# is covered separately with a mock containing an explicit PATH fixture.
+registry = types.ModuleType('winreg')
+registry.HKEY_CURRENT_USER = 0
+def missing_registry_key(*args, **kwargs):
+    raise FileNotFoundError('No registry keys in the test sandbox')
+registry.OpenKey = missing_registry_key
+sys.modules['winreg'] = registry
 source, cache = sys.argv[1], sys.argv[2]
 sys.argv = [source] + sys.argv[3:]
 with open(cache, 'rb') as handle:
@@ -42,13 +50,19 @@ WINDOWS_SHIM_TEMPLATES = {
 TEMPLATE_BRANCH = 'feature/test'
 
 
-def isolated_env(base_env=None):
+def isolated_env(base_env=None, home=None):
     """Strip variables that would let a test read or change the developer's real configuration."""
     env = dict(os.environ if base_env is None else base_env)
     for key in list(env):
-        if key.startswith(('STAGED_', 'STAGE_', 'GIT_')) or key in ('NO_COLOR', 'FORCE_COLOR'):
+        if key.upper().startswith(('STAGED_', 'STAGE_', 'GIT_')) or key.upper() in (
+                'NO_COLOR', 'FORCE_COLOR', 'ZDOTDIR', 'ONEDRIVE', 'ONEDRIVECONSUMER', 'ONEDRIVECOMMERCIAL'):
             env.pop(key)
     env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+    if home is not None:
+        home = Path(home)
+        env.update(HOME=str(home), USERPROFILE=str(home),
+                   XDG_CONFIG_HOME=str(home / '.config'), XDG_DATA_HOME=str(home / '.local/share'),
+                   APPDATA=str(home / 'AppData/Roaming'), LOCALAPPDATA=str(home / 'AppData/Local'))
     return env
 
 
@@ -104,12 +118,14 @@ class CLI(unittest.TestCase):
         self.home.mkdir()
         # Copying a prebuilt repository replaces six git processes per test.
         shutil.copytree(str(support.repo), str(self.repo), symlinks=True)
-        self.env = isolated_env()
-        self.env.update(HOME=str(self.home), USERPROFILE=str(self.home),
-                        XDG_CONFIG_HOME=str(self.home / '.config'), XDG_DATA_HOME=str(self.home / '.local/share'),
-                        APPDATA=str(self.home / 'AppData/Roaming'), LOCALAPPDATA=str(self.home / 'AppData/Local'),
-                        STAGED_ROOT=str(self.root), STAGED_TOOL='cli', STAGED_SHELL_ID='test-shell',
+        self.env = isolated_env(home=self.home)
+        self.env.update(STAGED_ROOT=str(self.root), STAGED_TOOL='cli', STAGED_SHELL_ID='test-shell',
                         PATH=str(support.bin) + os.pathsep + os.environ.get('PATH', ''))
+        for command in ('npm', 'staged'):
+            expected = support.bin / (command + '.cmd' if os.name == 'nt' else command)
+            found = shutil.which(command, path=self.env['PATH'])
+            self.assertEqual(Path(found).resolve() if found else None, expected.resolve(),
+                             'Refusing to run tests with a real ' + command + ' command')
 
     def git(self, *args):
         return subprocess.run(['git', '-C', str(self.repo)] + list(args), env=self.env,
@@ -1630,6 +1646,17 @@ source "$1"
 
 
 class Unit(unittest.TestCase):
+    def test_cli_test_launcher_uses_an_empty_registry(self):
+        support = _Support.ensure()
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / 'probe.code'
+            probe = "import winreg\nwinreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment')\n"
+            cache.write_bytes(marshal.dumps(compile(probe, '<registry-probe>', 'exec')))
+            result = subprocess.run([sys.executable, str(support.launcher), str(SCRIPT), str(cache)],
+                                    env=isolated_env(home=tmp), capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('No registry keys in the test sandbox', result.stderr)
+
     def test_pycharm_prefers_documented_launcher(self):
         with patch.object(staged.shutil, 'which', side_effect=lambda name: '/bin/' + name):
             self.assertEqual(staged.TOOL_REGISTRY['pycharm'].get_diff_command('old', 'new'),
@@ -1853,6 +1880,26 @@ class Uninstall(unittest.TestCase):
     init = CLI.init
     propose = CLI.propose
 
+    def test_inherited_profile_locations_are_not_touched(self):
+        self.propose()
+        self.run_cli('install-completion', '--shell', 'bash')
+        host = self.base / 'simulated-real-home'
+        profiles = [host / 'zsh/.zshrc',
+                    host / 'OneDrive/Documents/PowerShell/Microsoft.PowerShell_profile.ps1',
+                    host / 'xdg/powershell/Microsoft.PowerShell_profile.ps1']
+        content = (staged.COMPLETION_MARKER_START + '\nkeep this real installation\n' +
+                   staged.COMPLETION_MARKER_END + '\n').encode('utf-8')
+        for profile in profiles:
+            profile.parent.mkdir(parents=True, exist_ok=True)
+            profile.write_bytes(content)
+        inherited = dict(self.env, ZDOTDIR=str(host / 'zsh'), OneDrive=str(host / 'OneDrive'),
+                         XDG_CONFIG_HOME=str(host / 'xdg'))
+        env = isolated_env(inherited, home=self.home)
+        self.run_cli('uninstall', '-y', '--keep-sessions', env=env)
+        self.assertFalse((self.config / 'completions/staged.bash').exists())
+        for profile in profiles:
+            self.assertEqual(profile.read_bytes(), content)
+
     def test_uninstall_requires_confirmation_without_mutations(self):
         proposal = self.propose()
         self.run_cli('install-completion', '--shell', 'bash')
@@ -1995,6 +2042,53 @@ class Uninstall(unittest.TestCase):
 
 
 class UninstallPrompts(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='staged-uninstall-env-')
+        self.addCleanup(temporary.cleanup)
+        # These tests call uninstall in-process; environment lookups must also
+        # stay isolated when individual tests patch HOME and CONFIG_DIR.
+        registry = unittest.mock.Mock(spec=['HKEY_CURRENT_USER', 'OpenKey'])
+        registry.OpenKey.side_effect = FileNotFoundError
+        for patcher in (patch.dict(os.environ, isolated_env(home=temporary.name), clear=True),
+                        patch.dict(sys.modules, {'winreg': registry})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_eof_aborts_unconfirmed_uninstall_but_keeps_sessions_with_yes(self):
+        # Windows NUL can report isatty() while input() immediately raises EOFError.
+        for yes in (False, True):
+            with self.subTest(yes=yes), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                config = home / 'config'
+                config.mkdir()
+                state = config / 'state.json'
+                state.write_bytes(b'{}')
+                session = home / 'session'
+                session.mkdir()
+                proposal = session / 'proposal.txt'
+                proposal.write_bytes(b'keep this proposal')
+                ctx = unittest.mock.Mock()
+                ctx.args = staged.make_parser()[0].parse_args(['uninstall'] + (['--yes'] if yes else []))
+                with patch.object(staged, 'CONFIG_DIR', config), patch.object(staged, 'HOME', tmp), \
+                        patch.object(staged, 'zsh_rc', return_value=home / '.zshrc'), \
+                        patch.object(staged, 'uninstall_sessions', return_value=[session]), \
+                        patch.object(staged, 'npm_uninstall_command', return_value=None), \
+                        patch.object(staged, 'windows_launcher_path_edit', return_value=None), \
+                        patch.object(staged.shutil, 'which', return_value=None), \
+                        patch.object(staged.sys.stdin, 'isatty', return_value=True), \
+                        patch('builtins.input', side_effect=EOFError) as prompt:
+                    if yes:
+                        staged.uninstall(ctx)
+                    else:
+                        with self.assertRaisesRegex(staged.StagedError, 'Re-run interactively'):
+                            staged.uninstall(ctx)
+                    prompt.assert_called_once()
+                self.assertEqual(proposal.read_bytes(), b'keep this proposal')
+                if yes:
+                    self.assertFalse(state.exists())
+                else:
+                    self.assertEqual(state.read_bytes(), b'{}')
+
     def test_session_prompt_is_separate_and_defaults_to_keep(self):
         for answer, deleted in [('n', False), ('', False), ('yes', True)]:
             with self.subTest(answer=answer), tempfile.TemporaryDirectory() as tmp:
