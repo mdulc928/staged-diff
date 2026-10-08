@@ -1,4 +1,4 @@
-# @melchi/staged
+# /stage
 
 Below is my insight, and everything else following that is syntax.
 
@@ -10,34 +10,38 @@ Below is my insight, and everything else following that is syntax.
 
 This is how we learned to code in the first place, and I imagine this is how we get better too when using AI a lot.
 
-`staged` gives the agent its own working space outside my tree. My IDE stays mine and I apply only what I want to keep.
+_`staged` gives the agent its own working space outside my git working tree. My IDE stays mine and I apply only what I want to keep._
 
-My hope is that you can use this as **a starting point** for your own workflow setup. Let's get to it.
+My hope is that you can use this as **a starting point** for your own workflow setup. Part of the reason I just provide the code is so that you can set it up to your desire with the model of your choice.
+
+Let's get to it.
 
 ## The "Syntax"
 
-- **CLI Tool:** `staged`
-  - Tracks an agent's proposed edits in real files outside your working tree.
-  - `staged diff`- open a visual diff with working tree in your favorite IDE,
-  - `staged apply` - apply the changes you like.
 - **Agent SKILL:** `/stage` - Informs agent of this workflow
 
-> **Note:** I recommend pairing `staged` with an editor that can open a visual two-file diff from the command line: VS Code(-ish) , PyCharm, or Zed. See [editor setup](GUIDE.md#editor-compatibility). Your diff tool does not need to be same as your agent.
+- **CLI Tool:** `staged`
+  - Tracks an agent's proposed edits in real files outside your working tree.
+  - `staged diff` - open a visual diff with your working tree in your favorite IDE.
+  - `staged apply` - apply the changes you like.
 
-**P.S.** I would love to learn what you think, if you'll just leave a comment me a message on the social platform of your choice. You can find my links in my profile 🙏.
+> **Note:** I recommend pairing `staged` with an editor that can open a visual two-file diff from the command line: VS Code(-ish), PyCharm, or Zed. See [editor setup](GUIDE.md#editor-compatibility). Your diff tool does not need to be the same as your agent.
+
+**P.S.** I would love to learn what you think, if you'll just leave a comment or send me a message on the social platform of your choice. You can find my links in my profile 🙏.
 
 ## Install and Setup
 
 > Requires **Python 3.8+**.
 
-First, clone the repository:
+#### First
 
 ```bash
+# clone the repository
 git clone https://github.com/mdulc928/staged-diff.git
 cd staged-diff
 ```
 
-### Quick Setup
+#### Second
 
 > Requires `Node.js >= 18` / `npm`
 
@@ -47,11 +51,11 @@ Installs the cross-platform command launcher automatically:
 npm install -g .
 ```
 
-### Manual Setup
+#### Manual Setup
 
 If you prefer not using `npm`, configure the CLI manually for your platform:
 
-#### macOS or Linux
+##### macOS or Linux
 
 ```bash
 mkdir -p ~/.local/bin
@@ -60,7 +64,7 @@ ln -sf "$(pwd)/staged" ~/.local/bin/staged
 
 ⭐️ Ensure `~/.local/bin` is in `PATH`.
 
-#### Windows
+##### Windows
 
 ⭐️ Use `PowerShell`
 
@@ -93,6 +97,19 @@ staged install-skill --tool cursor --default --configure-sandbox
 
 For other editors and agent harnesses, see [setup in the guide](GUIDE.md#installation-and-agent-setup).
 
+### Uninstalling
+
+```bash
+staged uninstall
+```
+
+Cleanly removes the CLI, shell completion hooks, installed agent skills, and global settings.
+
+- **Safe by default**, so no need to worry about accidentally deleting things you didn't want to. Your source checkout and git workspace files are never touched.
+- **Script-friendly**: Run `staged uninstall --yes --keep-sessions` (or `--remove-sessions`) for non-interactive cleanup.
+
+See [GUIDE.md](GUIDE.md#uninstalling) for detailed options.
+
 ## Use
 
 In your agent, enter **“/stage solve all of life's mysteries”**. It will stage the changes, and report its session ID.
@@ -100,6 +117,8 @@ In your agent, enter **“/stage solve all of life's mysteries”**. It will sta
 ```bash
 # staged use --session <id>               # if you need to switch sessions
 staged                                    # see everything the AI staged
+staged --sessions                         # list sessions with their change summaries
+staged diff -v                            # see session and per-file summaries
 staged diff -f example.py                 # review a file in your editor
 staged diff -f example.py -a              # apply that file when you're ready
 staged diff -f example.py -c              # clean/discard that file if not needed
@@ -109,7 +128,7 @@ staged diff -f example.py -c              # clean/discard that file if not neede
 
 staged open -f example.py                 # edit the staged file
 staged open --meta -f staged_changes.md   # edit review notes or dashboards
-staged diff --all                         # review the remaining changes
+staged diff --all -v                      # review remaining changes with summaries
 staged apply --all                        # apply all staged changes
 staged clean --session                    # discard the active session directory
 
@@ -118,7 +137,31 @@ staged diff -f src/example.py --tool cli
 staged open --meta -f staged_changes.md --tool cli
 ```
 
-Use `-f` / `--file` for one file and `--all` for bulk operations (or `--session` with `clean` to discard a session). Positional filenames and positional `all` are no longer accepted. Apply, clean, migrate, and diff actions/comparisons require a selection; `staged diff` alone shows the overview. Open searches staged files by default; `--meta` searches editable session metadata only.
+> [!TIP]
+>
+> - **File vs. bulk selection**: Use `-f` / `--file <path>` for a single file and `--all` for bulk operations (or `--session` with `clean` to discard an entire session). Positional filenames and positional `all` are no longer accepted.
+> - **Actions require a target**: `apply`, `clean`, `migrate`, and `diff` actions/comparisons require an explicit selection; running `staged diff` alone shows the overview.
+> - **Metadata editing**: `staged open` searches staged files by default; pass `--meta` to search and edit session metadata only (such as `staged_changes.md`).
+
+Agents can also manage proposal files directly through the CLI without touching your working tree:
+
+```bash
+staged create -f src/new.py --text 'initial contents'
+staged copy --workspace -f src/example.py
+staged copy -f src/example.py --to src/variant.py
+staged rename -f src/example.py --to src/renamed.py
+staged delete -f src/variant.py                  # Discard staged proposal
+staged delete -f src/obsolete.py --workspace     # Propose deletion for later apply
+```
+
+All staged modifications stay isolated in staging until applied. Agents can also attach concise explanations to proposals:
+
+```bash
+staged summarize -f example.py -m 'Handle empty input without raising an error.'
+staged summarize -m 'Make input handling tolerate empty values.'
+```
+
+These summaries surface in `staged --sessions` and `staged diff -v`, giving you quick context on what changed and why before you review the full diff.
 
 **The tool does more:** compare sessions, migrate staged changes, clean up files, configure your favorite editor, and more.
 
@@ -130,7 +173,9 @@ See [GUIDE.md](GUIDE.md) for detailed instructions, examples, and troubleshootin
 
 #### Ways to Say Thank You and Support
 
-- Follow on Socials (checkout[ Github profile](https://github.com/mdulc928))
+> **(ABSOLUTELY OPTIONAL)**: _My intention is for as many people as possible to use this to help themselves because this workflow has helped me SOO much! But I also acknowledge the need to give people a way to reciprocate, so here are the ways🙏._
+
+- Follow on Socials (check out [GitHub profile](https://github.com/mdulc928))
 - [Say Thank you: $3 (Stripe)](https://buy.stripe.com/14AdR91jf8Vj2wu7ur1Jm01)
 - [Say Big Thank you: $10 (Stripe)](https://buy.stripe.com/bJe7sL6Dz2wVb30bKH1Jm02)
 - [Go Crazy: (you choose) (Stripe)](https://buy.stripe.com/8x2fZhfa5gnL5IG9Cz1Jm03)
