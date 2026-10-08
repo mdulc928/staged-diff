@@ -163,6 +163,37 @@ The installer prints the absolute path to your staging root. Your AI agent requi
 
 ---
 
+### Uninstalling
+
+```bash
+staged uninstall
+```
+
+Confirms removal of the CLI and installed integrations, then asks separately whether
+to permanently delete sessions across all known roots and repositories. Sessions
+are kept by default; deleting them discards unapplied proposals too.
+
+For scripts, choose explicitly:
+
+```bash
+staged uninstall --yes --keep-sessions
+staged uninstall --yes --remove-sessions
+```
+
+`--yes` confirms uninstall only. Without a terminal, it keeps sessions unless
+`--remove-sessions` is supplied. Use `--root <path>` for an old session root that
+is no longer configured. Session paths are listed before cleanup.
+
+Uninstall removes the matching global npm package or manual command symlink,
+the Windows launcher, completion hooks, installed skills, global settings, and
+shell bindings. It preserves source checkouts, workspace files, unrelated files,
+and modified installed skills. New installations record custom skill/profile
+locations and sandbox permissions they add so uninstall can undo them. Older
+unrecorded custom skills and sandbox permissions need manual cleanup.
+Uninstall also removes the exact PowerShell loader from standard profile locations
+and the dedicated Windows launcher directory from user PATH. Custom profile locations
+need manual cleanup. Open a new terminal afterward to refresh PATH and completions.
+
 ## Preparing Proposals
 
 ### Using an AI Agent
@@ -198,6 +229,101 @@ staged init my-experiment --json
 
 ---
 
+### Reading & Writing Staged Files
+
+Use `read` and `write` when an agent needs file access through the CLI:
+
+```bash
+# Read lines from the workspace original, including its full-file hash
+staged read --workspace -f src/example.py --start-line 10 --end-line 20 --json
+
+# Stage the original and replace those lines with input from a file
+staged write -f src/example.py --from-workspace --start-line 10 --end-line 20 --stdin < replacement.txt
+
+# Insert text before a staged line
+printf '# Review this section\n' | staged write -f src/example.py --start-line 10 --stdin
+
+# Read bytes, then replace a byte range in the staged file
+staged read -f src/example.py --offset 0 --length 128
+staged write -f src/example.py --offset 0 --delete-count 12 --text 'replacement'
+
+# Replace a complete staged file, or append to it
+staged write -f notes.txt --text 'Draft notes'
+staged write -f notes.txt --append --text ' — revised'
+```
+
+- **Paths**: Exact relative paths; no fuzzy matching. Reads default to staging; `--workspace` reads originals. Writes stay inside `staging/`.
+- **First Edit**: `--from-workspace` copies a missing staged file before editing and preserves permissions. Omit it for later edits.
+- **Byte Ranges**: Offsets start at 0. `--length` limits reads; `--delete-count` selects bytes to replace. An offset without a delete count inserts bytes.
+- **Line Ranges**: Lines start at 1; end lines are inclusive. Reads without an end line continue to EOF. Writes without an end line insert before the start line.
+- **Input**: Supply `--text` or `--stdin`. No range replaces the entire file; empty input clears it. Newlines are never added automatically.
+- **Conflict Check**: Pass `--expect-sha256 <hash>` from `read --json` to reject stale edits. This checks content; it does not lock other writers.
+- **Output**: Reads emit raw bytes. `--json` adds range information and the full-file SHA-256; non-UTF-8 slices use Base64 with `encoding: "base64"`.
+- **Preservation**: Edits preserve bytes outside the selected range, including CRLF. Line boundaries use LF; byte ranges can split UTF-8 characters.
+
+The bundled skill teaches agents these commands. Approve the staging directory for writes and workspace reads in the host sandbox; command approval alone does not grant filesystem access. Session setup and review metadata also need access to the session directory and staged configuration. Limit agent command approvals to the intended subcommands: approving all of `staged` also permits commands such as `apply`.
+
+---
+
+### Creating, Copying, Renaming, and Deleting Proposals
+
+Use managed exact-path operations instead of direct filesystem access:
+
+```bash
+staged create -f src/new.py                          # New empty staged file
+staged create -f src/new.py --stdin < contents.py    # Alternative: create with bytes
+staged copy --workspace -f src/example.py            # Workspace → staging
+staged copy --workspace -f src/example.py --to src/variant.py
+staged copy -f src/example.py --to src/second.py      # Staging → staging
+staged rename -f src/example.py --to src/renamed.py
+staged delete -f src/second.py                       # Discard the staged proposal
+staged delete -f src/obsolete.py --workspace          # Propose a workspace deletion
+```
+
+These examples are alternatives. After each operation, agents update summaries before making another modification. All four commands accept `--json`; create accepts `--text` or `--stdin`, or creates an empty file when neither is provided. JSON results identify `operation` and `path`; create/copy/rename also return `size` and `sha256`, with `source` and `source_root` for copy/rename. Delete returns `mode: "discard"` or `"propose"`.
+
+All destinations are staged. `copy` reads from staging unless `--workspace` is present; `--to` defaults to the source's relative path. There is no staging-to-workspace copy option: use an explicitly authorized `apply` for workspace writes. Copies preserve bytes and permission bits, do not inherit rename mappings or summaries, and leave their source intact. `create` can stage a replacement for a real workspace file if that path is not already staged. To edit an existing proposal, use `write`.
+
+`rename` requires a staged source and a new `--to` path. It moves the file's summary and preserves the original workspace path in the rename manifest, including across repeated renames. Renaming back to the original path removes the rename mapping. New proposals without a workspace original remain new files. The real workspace file stays in place until an authorized apply.
+
+`delete` without `--workspace` discards the exact staged proposal, removes its file summary and manifest entry, or cancels a pending deletion. `delete --workspace` instead records `_deletions` for an existing real file and removes any staged replacement; the real file remains untouched until apply. It rejects overlaps with pending renames: discard those proposals first. After plain delete, revise only the session summary because the file summary was removed; after `delete --workspace`, summarize the deletion path and session as usual.
+
+Create, copy, and rename refuse staged destination collisions and pending-operation conflicts. Rename also refuses unrelated workspace destination collisions. These APIs reject traversal, symlinks, special files, and staging inside the workspace. They validate relevant metadata before editing. Publishing new files uses filesystem hard links to avoid replacing an existing destination, so the staging filesystem must support hard links. There is no multi-file transaction or cross-process locking guarantee; do not run simultaneous edits to the same session.
+
+---
+
+### Maintaining Change Summaries
+
+Immediately after each modification, update that file's summary and the session summary before making another edit. Summaries describe the cumulative proposal in one sentence when possible, with at most three short sentences each. Keep detailed review notes and validation in `staged_changes.md`.
+
+```bash
+staged summarize -f src/example.py -m 'Handle empty input without raising an error.' --summary 'Make input handling tolerate empty values.'
+staged summarize -m 'Make input handling tolerate empty values.'
+staged summarize --json                  # Read the complete summaries object
+staged summarize -f src/example.py      # Read this file and its session summary
+staged summarize -f src/example.py --stdin < summary.txt
+staged summarize -f src/example.py --clear
+```
+
+`-m` is short for `--message`. Omit `-f` to update the session summary; use an exact relative path to update a file summary. For a rename, use the destination; for a deletion, use the original path. Pair a file update with `--summary` to update both atomically. `--message`, `--stdin`, and `--clear` are mutually exclusive. Empty text clears the selected summary; a read without update flags does not create metadata. `--json` always returns the complete object, including after an update.
+
+The CLI stores agent-authored summaries in `summaries.json` beside `staging/`, preserving unrelated entries:
+
+```json
+{
+  "session": "Make input handling tolerate empty values.",
+  "files": {
+    "src/example.py": "Handle empty input without raising an error."
+  }
+}
+```
+
+The CLI does not generate summaries or enforce sentence counts. Older sessions display `(no summary yet)` until summaries are supplied. Agents using an older CLI can maintain this JSON directly after each edit.
+
+Cleaning a file removes its summary; cleaning all changes or the last file also clears the session summary. Applying leaves summaries available for review. Migration carries the selected file summaries and removes stale destination summaries when an incoming file has none. A full migration into an empty session also copies the source session summary if the destination has none; partial migrations preserve the destination session summary. After partial cleanup or migration, revise the session summary immediately to describe the current proposal.
+
+---
+
 ## Managing Sessions
 
 ### Shell Binding
@@ -219,7 +345,7 @@ staged use --clear                    # Clear session and tool bindings
 ### Session Discovery
 
 ```bash
-staged --sessions                       # List sessions for current workspace
+staged --sessions                       # List sessions with their change summaries
 staged -R                               # List all sessions across all workspaces
 staged --session other-id diff -f f.py  # One-time session override
 ```
@@ -253,13 +379,13 @@ staged set --repo --default-session <id>  # Set repository-level default
 
 ```bash
 staged                          # Concise overview
-staged -v                       # Verbose overview (paths, sizes, timestamps)
+staged diff -v                  # Session and file summaries, paths, sizes, timestamps
 staged diff -f src/example.py   # Open visual diff in configured editor
-staged diff --all               # Review all pending changes sequentially
+staged diff --all -v            # Print summaries and review all pending changes
 staged diff -f src/example.py --tool cli # Open terminal diff
 ```
 
-- `staged diff` opens a side-by-side diff in your configured GUI editor. It does not modify workspace files unless `-a` is passed.
+- `staged diff` without a selection shows the overview; add `-v` / `--verbose` for session and per-file summaries. With `-f <path>` or `--all`, it opens diffs in your configured editor, and `-v` prints summaries before each diff. Cross-session verbose review labels both sessions and their file summaries. It does not modify workspace files unless `-a` is passed.
 - Additions and deletions are compared against an empty placeholder file so GUI editors can display a two-sided diff.
 - `--tool cli` invokes `difft` (Difftastic) if available, falling back to `git diff --no-index`, then standard `diff`.
 
@@ -508,6 +634,7 @@ staged install-completion --shell powershell
 - **Setup Prompt**: Remembers declines per shell. Skips CI, redirected streams, help, and machine output. Set `STAGED_NO_PROMPT=1` to disable it.
 - **Suggestions**: Commands, supported options, session IDs, and editor IDs.
 - **Substring Matching**: Tab-completion matches any case-insensitive substring on `-f` (e.g., `staged diff -f btn<Tab>`).
+- **Ambiguous Zsh Matches**: The first Tab lists matching files without replacing the typed query. Press Tab again to select the first match, and further Tabs to cycle. A unique match completes immediately.
 
 ---
 
@@ -529,7 +656,7 @@ staged --help-all
 | `-s <id>`, `--session <id>` | Select session by ID or prefix; with `use`, binds to shell      |
 | `--root <path>`             | Override staging root; with `set`, saves as default             |
 | `--shell <name>`            | Select Bash, Zsh, or PowerShell for setup                       |
-| `-v`, `--verbose`           | Include absolute paths, file sizes, and timestamps              |
+| `-v`, `--verbose`           | Include session/file summaries and overview paths, sizes, timestamps              |
 | `-h`, `--help`              | Show help without running an operation                          |
 
 _(After `path`, `-s` means `--staged`; use `--session <id>` for session selection.)_
@@ -550,6 +677,13 @@ _(After `path`, `-s` means `--staged`; use `--session <id>` for session selectio
 | Command              | Key Options                                                          | Description                                                       |
 | -------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | `staged`             | `[-v]`, `[--sessions]`, `[-R]`                                       | Show overview of active session, workspace sessions, or all roots |
+| `read` | `-f <path>`, `[--workspace]`, `[--offset <n>]`, `[--length <n>]`, `[--start-line <n>]`, `[--end-line <n>]`, `[--json]` | Read exact file contents or ranges |
+| `write` | `-f <path>`, `(--text <text>\|--stdin)`, `[--offset <n>]`, `[--delete-count <n>]`, `[--start-line <n>]`, `[--end-line <n>]`, `[--append]`, `[--from-workspace]`, `[--expect-sha256 <hash>]`, `[--json]` | Write complete files or edit ranges inside staging |
+| `create` | `-f <path>`, `[--text <contents>\|--stdin]`, `[--json]` | Create a new staged file, refusing existing destinations |
+| `copy` | `-f <source>`, `[--workspace]`, `[--to <destination>]`, `[--json]` | Copy workspace or staged contents into staging |
+| `rename` | `-f <source>`, `--to <destination>`, `[--json]` | Move a staged proposal and its rename metadata |
+| `delete` | `-f <path>`, `[--workspace]`, `[--json]` | Discard a staged proposal, or propose deletion of a workspace file |
+| `summarize` | `[-f <path>]`, `[-m <message>\|--stdin\|--clear]`, `[--summary <message>]`, `[--json]` | Read or update session and file summaries |
 | `init`               | `[id]`, `[--json]`, `[--root <p>]`                                   | Initialize or reuse a staging session                             |
 | `use`                | `--session <id>`, `--tool <id>`, `--clear`                           | Bind session or tool to current shell                             |
 | `diff`               | `-f <f>`, `--all`, `-a`, `-c`, `-ac`, `--between <a> <b>`            | Review or apply visual diffs in editor                            |
@@ -562,6 +696,7 @@ _(After `path`, `-s` means `--staged`; use `--session <id>` for session selectio
 | `set-tool`           | `<id>`, `--name`, `--diff-cmd`, `--open-cmd`                         | Register custom editor adapter                                    |
 | `install-skill`      | `[--tool]`, `[--default]`, `[--target-dir]`, `[--configure-sandbox]` | Install `/stage` skill for agent harness                          |
 | `install-completion` | `[--shell bash\|zsh\|powershell]`                                    | Install tab completion                                            |
+| `uninstall` | `[--yes] [--keep-sessions\|--remove-sessions]` | Remove the CLI and integrations; optionally delete known sessions |
 | `install-launcher`   |                                                                      | Install the standalone Windows launcher                           |
 
 ---

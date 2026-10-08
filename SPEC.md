@@ -1,6 +1,6 @@
 # Unified staging engine and `/stage` skill specification
 
-Version 2.0.0 · revised October 6, 2026 · package `@melchi/staged`
+Version 2.0.0 · revised October 7, 2026 · package `@melchi/staged`
 
 This specification defines the architectural and behavioral contract of `staged` and the `/stage` skill.
 
@@ -68,6 +68,7 @@ Additional discovery roots are configured via `session_roots`. Discovery is expl
   .workspace          # Absolute workspace path (plain text)
   session.json        # Origin branch, creation timestamp, migration provenance
   renames.json        # Operation manifest (renames, relocations, deletions)
+  summaries.json      # Agent-authored session string and per-path file summaries
   staged_changes.md   # Agent-maintained review dashboard
   .index.json         # Derived file inventory (not authoritative for apply)
   .review/            # Empty placeholder files for GUI diff viewers
@@ -128,11 +129,19 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 | Command                  | Action                   | Contract                                                                    |
 | ------------------------ | ------------------------ | --------------------------------------------------------------------------- |
 | `staged`, `staged diff`  | Overview                 | Print workspace, session ID, tool, branch, and status summary               |
-| `staged -v`              | Verbose Overview         | Include absolute paths, file sizes, and modification timestamps             |
-| `staged --sessions`      | Local List               | List sessions associated with current workspace                             |
+| `staged -v`              | Verbose Overview         | Include session/file summaries, absolute paths, sizes, and timestamps             |
+| `staged --sessions`      | Local List               | List sessions associated with current workspace, including session summaries                             |
 | `staged --list`          | File List                | Print proposed file paths, one per line                                     |
 | `staged --help-all`      | Full Help                | Show every command and public option                                        |
 | `staged -R`              | Global List              | List all sessions across all configured workspaces and roots                |
+| `read -f <path>` | Read File | Read exact byte or line ranges; `--workspace` selects originals |
+| `write -f <path>` | Write File | Replace, insert, or append contents inside staging only |
+| `create -f <path>` | Create File | Create an empty or populated staged file without replacement |
+| `copy -f <source> [--workspace] [--to <path>]` | Copy File | Read staged/workspace contents and create a staged copy |
+| `rename -f <source> --to <path>` | Rename File | Move a staged file and preserve its origin and summary |
+| `delete -f <path> [--workspace]` | Delete Proposal | Discard a proposal by default; with `--workspace`, record deletion for later apply |
+| `summarize [-f <path>] [-m <message>]` | Summaries | Read or update concise session or exact-path file summaries |
+| `diff -v`, `diff --verbose` | Verbose Review | Show session and file summaries in the overview or before selected diffs |
 | `init [id]`              | Initialize               | Create or reuse session; bind to active shell                               |
 | `diff -f <f>`            | File Diff                | Open visual diff in configured editor                                       |
 | `diff --all`             | Bulk Diff                | Open visual diff sequentially for all pending changes                       |
@@ -151,6 +160,7 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 | `set-tool <id>`          | Register Tool            | Register custom editor CLI adapter                                          |
 | `install-skill`          | Install Skill            | Copy `SKILL.md` to harness skill directory                                  |
 | `install-completion`     | Install Shell Completion | Configure Bash, Zsh, or PowerShell tab-completion; no launcher installation |
+| `uninstall` | Uninstall | Confirm tool/integration removal; separately opt into deleting sessions across known roots and repositories. `--yes` alone keeps sessions in noninteractive runs. |
 | `install-launcher`       | Install Windows Launcher | Write `staged.cmd`; leave PATH unchanged                                    |
 
 ---
@@ -161,6 +171,42 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 - **Positional Rejection**: Positional filenames and positional `all` are rejected.
 - **Combined Flags**: `-ac`, `-ca`, `-a -c`, and `-c -a` apply first, then clean. Clean runs only if apply succeeds.
 - **Path Flag Scope**: In `staged path`, `-s` denotes `--staged`. Session overrides require `--session <id>`.
+
+---
+
+### File Access Contract
+
+- **Scope**: Exact normalized relative paths. Reads select staging or workspace; writes select staging only. Symlinks, reparse points, special files, traversal, and Git metadata are rejected.
+- **Ranges**: Zero-based bytes or one-based inclusive lines. Modes cannot be mixed. Invalid write ranges fail without replacing the target.
+- **Write Modes**: No range replaces the file. `--offset` inserts unless `--delete-count` is supplied. `--start-line` inserts unless `--end-line` is supplied. `--append` writes at EOF.
+- **Input**: Explicit `--text` (UTF-8) or `--stdin` (bytes). Newlines are preserved, never synthesized; lines are LF-delimited.
+- **Workspace Seed**: `--from-workspace` copies a missing staged file before editing. Existing staged files and deletion entries are not overwritten implicitly.
+- **Integrity**: Atomic target replacement; preserve existing file permissions. Optional `--expect-sha256` rejects stale content. No cross-process locking guarantee.
+- **Machine Output**: Raw read bytes or `--json` with the full-file SHA-256. JSON reads return UTF-8 text or Base64 with an encoding marker. No setup prompts or binding updates.
+- **Permissions**: Host filesystem rules remain authoritative. The skill describes usage; it does not grant access or restrict other CLI commands.
+
+---
+
+### Managed File Operations
+
+- **Boundaries**: `create`, `copy`, `rename`, and `delete` accept exact `-f` paths and `--json`. Physical writes and deletions are confined to staging and session metadata. `copy --workspace` reads workspace contents; its destination remains staged. There is no option to copy into the workspace. All workspace writes use authorized apply.
+- **Create**: Optional, mutually exclusive `--text` or `--stdin` supplies contents; neither means empty. Refuse an existing staged destination or pending operation, but allow creating a staged replacement for a workspace file.
+- **Copy**: Source defaults to staging; `--workspace` reads from the workspace. Optional `--to` names the new staged destination and defaults to the source path. Preserve bytes and permission bits; leave the source intact. Do not copy rename mappings or summaries.
+- **Rename**: Require a staged source and `--to`. Refuse existing staged destinations, unrelated workspace destination files, and operation conflicts. Preserve the original workspace source in `renames.json`; chained staging moves collapse to that original. Moving back to the original path removes the mapping. New files without an original stay additions. Move the file summary to the new path.
+- **Delete**: Without `--workspace`, discard the exact staged proposal or cancel a pending deletion, remove its manifest entry and file summary, and clear the session summary if no proposals remain. With `--workspace`, require an existing regular workspace file, discard any staged replacement, and record its path in `_deletions` for later apply. Never unlink the workspace file in this command. Reject overlaps with pending renames. Summarize deletion proposals afterward; revise the session summary after discarding a proposal.
+- **Validation**: Reject traversal, symlinks/reparse points, special files, staging inside the workspace, and relevant malformed metadata before mutation. Create/copy publish completed files using hard links without overwriting existing destinations; rename uses link/unlink to avoid clobbering a destination. The staging filesystem must support hard links. Atomicity does not extend across file and metadata updates, and concurrent edits to one session are unsupported.
+- **Output**: JSON contains `operation` and `path`; create/copy/rename include `size` and `sha256`; copy/rename also include `source` and `source_root` (`staged` or `workspace`). Delete includes `mode` (`discard` or `propose`). Commands emit no setup prompts.
+
+---
+
+### Summary Contract
+
+- **Storage**: Optional `summaries.json` beside `staging/`, with `{"session": "...", "files": {"relative/path": "..."}}`. Missing fields default to an empty string/object. Session and file summaries must be strings; paths follow the same normalized, symlink-free relative-path rules as proposals. Malformed metadata is reported rather than silently replaced. Unrelated keys and file entries survive updates.
+- **Editing**: `staged summarize -m <message>` updates the session; `staged summarize -f <path> -m <message>` updates a file. `--message` aliases `-m`; `--stdin` reads text; `--clear` or empty text clears the selected summary. `-f` must name an existing proposal exactly, including rename destinations and deletion originals. `--summary <message>` may accompany a file update to replace both summaries in one atomic metadata write. No cross-process locking guarantee.
+- **Reading**: With no update flags, print the session summary and selected file summaries. `--json` returns the entire summaries object, including after an update. Reading missing metadata does not create it.
+- **Display**: `--sessions` and `-R` always show session summaries. `diff -v` / `--verbose` shows session and per-file summaries, including with `-f` or `--all`; cross-session comparisons label both sides. Normal diffs remain unchanged. Missing or blank summaries display `(no summary yet)`. Completion remains machine-readable.
+- **Lifecycle**: Apply retains summaries. Clean removes selected file summaries and clears the session summary when all changes are removed. Migration copies selected file summaries, removing replaced destination entries if the source has none. A full migration into an empty destination copies the session summary only when the destination has no summary; partial or merged migrations retain the destination summary for the author to revise.
+- **Agent Workflow**: Immediately after every file modification or rename/deletion manifest change, update the affected file summary and the session summary before any further modification. Summaries reflect the current cumulative proposal, generally in one sentence and at most three short sentences each; do not defer them to a batch at the end. Immediately revise session summaries after partial cleanup or migration. Sentence length guidance belongs to the skill; the CLI does not infer summaries or enforce sentence counts.
 
 ---
 
@@ -263,7 +309,7 @@ The bundled `SKILL.md` requires agents to:
 
 ## 8. Shells, Operating Systems, and Distribution
 
-- **Completions**: Public options follow the CLI parser. Bash, Zsh, and PowerShell support session/tool IDs and case-insensitive substring completion on `-f`.
+- **Completions**: Public options follow the CLI parser. Bash, Zsh, and PowerShell support session/tool IDs and case-insensitive substring completion on `-f`. In Zsh, the first Tab on an ambiguous file query lists matches while preserving the input; subsequent Tabs start menu selection and cycle through matches. Unique matches complete immediately.
 - **Completion Setup**: Interactive `staged` and `init` offer missing completion setup once per shell. Bash/Zsh update startup files; PowerShell prints a profile loader.
 - **Launcher Setup**: On Windows, explicit `--shell powershell` offers `staged.cmd` once when no launcher is available. Installation requires acceptance or `install-launcher`; PATH is unchanged.
 - **Setup Prompts**: Remember declines. Skip help, machine output, CI, redirected streams, and `STAGED_NO_PROMPT=1`.
