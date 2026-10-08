@@ -305,7 +305,7 @@ staged summarize -f src/example.py --stdin < summary.txt
 staged summarize -f src/example.py --clear
 ```
 
-`-m` is short for `--message`. Omit `-f` to update the session summary; use an exact relative path to update a file summary. For a rename, use the destination; for a deletion, use the original path. Pair a file update with `--summary` to update both atomically. `--message`, `--stdin`, and `--clear` are mutually exclusive. Empty text clears the selected summary; a read without update flags does not create metadata. `--json` always returns the complete object, including after an update.
+`-m` is short for `--message`. Omit `-f` to update the session summary; use an exact relative path to update a file summary. For a rename, use the destination; for a deletion, use the original path. Pair a file update with `--summary` to update both atomically. `--message`, `--stdin`, and `--clear` are mutually exclusive. `--stdin` expects UTF-8 text on every platform; invalid bytes leave the summaries unchanged. Empty text clears the selected summary; a read without update flags does not create metadata. `--json` always returns the complete object, including after an update.
 
 The CLI stores agent-authored summaries in `summaries.json` beside `staging/`, preserving unrelated entries:
 

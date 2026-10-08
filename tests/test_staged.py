@@ -37,7 +37,7 @@ SHIM_TEMPLATES = {
 }
 WINDOWS_SHIM_TEMPLATES = {
     'staged.cmd': '@echo off\r\n"{python}" "{launcher}" "{script}" "{cache}" %*\r\n',
-    'npm.cmd': '@echo off\r\nif "%1"=="root" (echo {npm_root}& exit /b 0)\r\necho npm is disabled in tests 1>&2\r\nexit /b 1\r\n',
+    'npm.cmd': '@echo off\r\nif "%~1"=="root" (echo {npm_root}& exit /b 0)\r\necho npm is disabled in tests 1>&2\r\nexit /b 1\r\n',
 }
 TEMPLATE_BRANCH = 'feature/test'
 
@@ -73,15 +73,17 @@ class _Support:
         templates = WINDOWS_SHIM_TEMPLATES if os.name == 'nt' else SHIM_TEMPLATES
         for name, template in templates.items():
             shim = cls.bin / name
-            shim.write_text(template.format(**values))
+            shim.write_bytes(template.format(**values).encode('utf-8'))
             shim.chmod(0o755)
         cls.repo = cls.directory / 'template-repo'
         cls.repo.mkdir()
         env = isolated_env()
         for args in (['init', '-q'], ['symbolic-ref', 'HEAD', 'refs/heads/' + TEMPLATE_BRANCH],
+                     # Keep background Git processes from changing the fixture while it is copied.
+                     ['config', 'maintenance.auto', 'false'], ['config', 'gc.auto', '0'],
                      ['config', 'user.name', 'Test'], ['config', 'user.email', 'test@example.invalid']):
             subprocess.run(['git', '-C', str(cls.repo)] + args, env=env, capture_output=True, check=True)
-        (cls.repo / 'existing.txt').write_text('original\n')
+        (cls.repo / 'existing.txt').write_bytes(b'original\n')
         subprocess.run(['git', '-C', str(cls.repo), 'add', '.'], env=env, capture_output=True, check=True)
         subprocess.run(['git', '-C', str(cls.repo), 'commit', '-qm', 'initial'], env=env,
                        capture_output=True, check=True)
@@ -131,7 +133,8 @@ class CLI(unittest.TestCase):
     def propose(self, key='session-a', rel='existing.txt', text='proposed\n'):
         path = self.init(key) / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
+        # Byte-range tests need the same UTF-8/LF fixtures on every platform.
+        path.write_bytes(text.encode('utf-8'))
         return path
 
     def manifest(self, data, key='session-a'):
@@ -344,6 +347,19 @@ class CLI(unittest.TestCase):
         self.run_cli('summarize', '-f', 'nested/existing.txt', '--summary', 'Invalid.', ok=False)
         self.run_cli('summarize', '-m', 'Invalid.', '--clear', ok=False)
         self.assertEqual(json.loads(self.run_cli('summarize', '--json').stdout)['files'], {})
+
+    def test_summary_stdin_uses_utf8_and_rejects_invalid_bytes_without_mutation(self):
+        self.propose()
+        # Reproduce Windows redirected stdin even on UTF-8 hosts.
+        with patch.dict(self.env, PYTHONIOENCODING='cp1252'):
+            result = self.file_api('summarize', '--stdin', '--json',
+                                   data='  Improve café output.\r\n'.encode('utf-8'))
+        self.assertEqual(json.loads(result.stdout)['session'], 'Improve café output.')
+        metadata = self.root / 'session-a/summaries.json'
+        before = metadata.read_bytes()
+        result = self.file_api('summarize', '--stdin', data=b'\xff', ok=False)
+        self.assertIn(b'Summary input must be UTF-8', result.stderr)
+        self.assertEqual(metadata.read_bytes(), before)
 
     def test_sessions_show_summaries_without_polluting_completion(self):
         self.init('legacy')
