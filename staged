@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Isolated proposal files, explicit review and apply. Python 3.8+; no dependencies."""
 import argparse
+import base64
+import hashlib
+import io
 import fnmatch
 import glob
+import hashlib
 import json
 import ntpath
 import os
@@ -28,7 +32,7 @@ GLOBAL_STATE_FILE = CONFIG_DIR / 'state.json'
 DEFAULT_PROTECTED_BRANCHES = []
 STATUS_COLORS = {'APPLIED': '32', 'MODIFIED': '33', 'NEW FILE': '36', 'RENAMED': '35',
                  'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
-COMMANDS = ['init', 'diff', 'apply', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher']
+COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'init', 'diff', 'apply', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
 
 
 def is_reserved_windows_name(name):
@@ -313,8 +317,23 @@ class Session:
         for rel in self.deletions:
             safe_path(self.workspace, rel)
 
+    def summaries(self):
+        data = load_json(safe_path(self.directory, 'summaries.json'))
+        if not isinstance(data.get('session', ''), str) or not isinstance(data.get('files', {}), dict):
+            raise StagedError('summaries.json requires a session string and a files object.')
+        for rel, summary in data.get('files', {}).items():
+            safe_path(self.staging, rel)
+            if not isinstance(summary, str):
+                raise StagedError('File summaries must be strings: ' + rel)
+        data.setdefault('session', '')
+        data.setdefault('files', {})
+        return data
+
+    def save_summaries(self, data):
+        save_json(safe_path(self.directory, 'summaries.json'), data)
+
     def modified(self):
-        paths = [self.staging, self.directory / 'session.json', self.directory / 'renames.json'] + list(self.files().values())
+        paths = [self.staging, self.directory / 'session.json', self.directory / 'renames.json', self.directory / 'summaries.json'] + list(self.files().values())
         return max(p.stat().st_mtime for p in paths if not p.is_symlink() and p.exists())
 
     def files(self, fresh=False):
@@ -509,6 +528,7 @@ class ToolAdapter:
         if not isinstance(paths, list):
             raise StagedError('additionalReadwritePaths must be a list in ' + str(sandbox))
         if str(root) not in paths:
+            record_install('permissions', [str(sandbox), 'additionalReadwritePaths', str(root)])
             paths.append(str(root))
         cli = Path(HOME) / '.cursor/cli-config.json'
         settings = load_json(cli)
@@ -520,6 +540,7 @@ class ToolAdapter:
             raise StagedError('permissions.allow must be a list in ' + str(cli))
         for token in ('Read({}/**)'.format(root), 'Write({}/**)'.format(root)):
             if token not in allowed:
+                record_install('permissions', [str(cli), 'permissions.allow', token])
                 allowed.append(token)
         save_json(sandbox, data)
         save_json(cli, settings)
@@ -542,6 +563,7 @@ class ToolAdapter:
         if not source.is_file():
             raise StagedError('Missing bundled skill: ' + str(source))
         copy_atomic(source, target / 'SKILL.md')
+        record_installed_file(target / 'SKILL.md')
         return target / 'SKILL.md'
 
 
@@ -590,12 +612,59 @@ def init_session(ctx, key, root=None):
         session = Session(directory)
         if session.workspace != ctx.workspace:
             raise StagedError('Session belongs to a different workspace: ' + str(session.workspace))
+        record_install('roots', str(root))
         return session
     (directory / 'staging').mkdir(parents=True)
     write_text_file(directory / '.workspace', str(ctx.workspace) + '\n')
     save_json(directory / 'session.json', {'id': key, 'branch': get_git_branch(ctx.workspace), 'created_at': time.time()})
     save_json(directory / 'renames.json', {})
+    record_install('roots', str(root))
     return Session(directory)
+
+
+def summary_text(value):
+    # Keep multiline author input readable in terminal lists.
+    return ' '.join(value.split()) or '(no summary yet)'
+
+
+def show_session_summary(session, summaries):
+    print('Session summary ({}): {}'.format(session.id, summary_text(summaries['session'])), flush=True)
+
+
+def update_summary(session, args):
+    summaries = session.summaries()
+    if args.file is not None:
+        safe_path(session.staging, args.file)
+        if args.file not in session.paths(fresh=True):
+            raise StagedError('No staged change at exact path: ' + args.file)
+    if args.summary is not None and (args.file is None or not (args.message is not None or args.stdin or args.clear)):
+        raise StagedError('--summary requires a file summary update with --file and --message, --stdin or --clear.')
+    value = args.message
+    if args.stdin:
+        if sys.stdin.isatty():
+            raise StagedError('--stdin requires piped or redirected input; use --message for inline content.')
+        value = sys.stdin.read()
+    changed = value is not None or args.clear
+    if changed:
+        value = '' if args.clear else value.strip()
+        if args.file is None:
+            summaries['session'] = value
+        elif value:
+            summaries['files'][args.file] = value
+        else:
+            summaries['files'].pop(args.file, None)
+        if args.summary is not None:
+            summaries['session'] = args.summary.strip()
+        session.save_summaries(summaries)
+    if args.json:
+        print(json.dumps(summaries))
+    elif changed:
+        print('Updated summary: ' + (args.file or session.id))
+    else:
+        show_session_summary(session, summaries)
+        paths = [args.file] if args.file is not None else session.paths()
+        for rel in paths:
+            print('  {}: {}'.format(rel, summary_text(summaries['files'].get(rel, ''))))
 
 
 def overview(ctx, session):
@@ -606,6 +675,9 @@ def overview(ctx, session):
                          ('Git Branch:', color(branch or '(not a Git repository)', '31' if protected else '32')),
                          ('Staging:', session.staging)]:
         print('{} {}'.format(color('{:15}'.format(label), '1'), value))
+    summaries = session.summaries() if ctx.args.verbose else None
+    if summaries is not None:
+        show_session_summary(session, summaries)
     paths = session.paths()
     if not paths:
         print('No staged changes yet.')
@@ -613,6 +685,7 @@ def overview(ctx, session):
         status = session.status(rel)
         print('  {} {}'.format(status_token(status, width=9), rel))
         if ctx.args.verbose:
+            print('    Summary: {}'.format(summary_text(summaries['files'].get(rel, ''))))
             path = safe_path(session.staging, rel)
             print('    Staged:    {}'.format(path if path.exists() else '(deletion)'))
             print('    Workspace: {}'.format(session.original(rel)))
@@ -624,6 +697,9 @@ def overview(ctx, session):
 def review(ctx, session, target):
     tool = ctx.tool()
     terminal = tool.id in ('cli', 'codex', 'claudecode')
+    summaries = session.summaries() if ctx.args.verbose else None
+    if summaries is not None:
+        show_session_summary(session, summaries)
     for rel in selected(session, target):
         if target is None and session.status(rel) == 'APPLIED':
             continue
@@ -637,6 +713,8 @@ def review(ctx, session, target):
         left = original if original.is_file() else empty
         right = empty if rel in session.deletions else proposed
         print('Review {}: {}'.format(status_token(session.status(rel)), rel), flush=True)
+        if summaries is not None:
+            print('  Summary: {}'.format(summary_text(summaries['files'].get(rel, ''))), flush=True)
         run_editor(tool.get_diff_command(left, right), terminal)
 
 
@@ -769,6 +847,7 @@ def clean_session(ctx, session):
 
     target = ctx.args.file
     paths = selected(session, target)
+    summaries = session.summaries()
     if any(session.status(rel) != 'APPLIED' for rel in paths):
         confirm('Discard {} pending staged change(s) from {}?'.format(len(paths), session.id), ctx.args.yes)
     for rel in paths:
@@ -783,6 +862,12 @@ def clean_session(ctx, session):
     elif '_deletions' in session.manifest:
         session.manifest['_deletions'] = session.deletions
     session.save_manifest()
+    for rel in paths:
+        summaries['files'].pop(rel, None)
+    if target is None or not session.paths(fresh=True):
+        summaries['session'] = ''
+    if (session.directory / 'summaries.json').exists():
+        session.save_summaries(summaries)
     session.refresh_index()
     print('Cleaned {} staged change(s);'.format(len(paths)))
 
@@ -799,7 +884,12 @@ def cross_diff(ctx):
     if not paths:
         raise StagedError('No common staged files in the two sessions.')
     tool = ctx.tool()
+    summaries = [(s, s.summaries()) for s in (left, right)] if ctx.args.verbose else []
+    for session, data in summaries:
+        show_session_summary(session, data)
     for rel in paths:
+        for session, data in summaries:
+            print('  {} [{}]: {}'.format(rel, session.id, summary_text(data['files'].get(rel, ''))), flush=True)
         run_editor(tool.get_diff_command(safe_path(left.staging, rel), safe_path(right.staging, rel)),
                    tool.id in ('cli', 'codex', 'claudecode'))
 
@@ -824,6 +914,8 @@ def migrate(ctx):
     else:
         paths = selected(source, ctx.args.file)
     preflight(source, paths)
+    source_summaries, dest_summaries = source.summaries(), dest.summaries()
+    copy_session_summary = not dest.paths() and set(paths) == set(source.paths()) and not dest_summaries['session']
     # Validate the entire transfer before changing any destination files or manifest.
     conflicts = []
     manifest = dict(dest.manifest)
@@ -876,6 +968,15 @@ def migrate(ctx):
         manifest.pop('_deletions', None)
     dest.manifest, dest.deletions = manifest, sorted(deletions)
     dest.save_manifest()
+    for rel in paths:
+        if rel in source_summaries['files']:
+            dest_summaries['files'][rel] = source_summaries['files'][rel]
+        else:
+            dest_summaries['files'].pop(rel, None)
+    if copy_session_summary:
+        dest_summaries['session'] = source_summaries['session']
+    if any((s.directory / 'summaries.json').exists() for s in (source, dest)):
+        dest.save_summaries(dest_summaries)
     if not dest.metadata.get('migrated_from'):
         dest.metadata['migrated_from'] = []
     dest.metadata['migrated_from'].append({'session': source.id, 'branch': source.metadata.get('branch'), 'paths': paths})
@@ -949,6 +1050,345 @@ def upsert_shell_block(path, block, insert_before_compinit=False, move_to_end=Fa
 
 
 
+def nonnegative(value):
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected a non-negative integer')
+    if number < 0:
+        raise argparse.ArgumentTypeError('expected a non-negative integer')
+    return number
+
+
+def positive(value):
+    number = nonnegative(value)
+    if number == 0:
+        raise argparse.ArgumentTypeError('line numbers start at 1')
+    return number
+
+
+def content_hash(stream):
+    stream.seek(0)
+    digest = hashlib.sha256()
+    for block in iter(lambda: stream.read(1024 * 1024), b''):
+        digest.update(block)
+    stream.seek(0)
+    return digest.hexdigest()
+
+
+def file_version(path):
+    if not path.exists():
+        return None
+    info = path.stat()
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def range_path(session, relative, workspace=False):
+    # File APIs deliberately use exact paths rather than interactive fuzzy matching.
+    root = session.workspace if workspace else session.staging
+    if not workspace:
+        try:
+            root.resolve().relative_to(session.workspace.resolve())
+        except ValueError:
+            pass
+        else:
+            raise StagedError('Staging must reside outside the workspace.')
+    path = safe_path(root, relative)
+    for candidate in [path] + list(path.parents):
+        attributes = getattr(candidate.lstat(), 'st_file_attributes', 0) if candidate.exists() else 0
+        if attributes & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0):
+            raise StagedError('Reparse points are not supported: ' + str(candidate))
+        if candidate == root:
+            break
+    if path.exists() and not path.is_file():
+        raise StagedError('Expected a regular file: ' + relative)
+    return path
+
+
+def unused_staged_path(session, relative, moving=None):
+    target = range_path(session, relative)
+    if target.exists() or relative in session.paths(fresh=True):
+        raise StagedError('Staged destination already exists or has a pending operation: ' + relative)
+    if relative in [old for rel, old in session.manifest.items() if rel not in ('_deletions', moving)]:
+        raise StagedError('Destination is the source of a pending rename: ' + relative)
+    for parent in target.parents:
+        if parent == session.staging:
+            break
+        if parent.exists() and not parent.is_dir():
+            raise StagedError('Destination parent is not a directory: ' + str(parent))
+    return target
+
+
+def delete_file(session, args):
+    target = range_path(session, args.file)
+    safe_path(session.directory, 'renames.json')
+    summaries = session.summaries()
+    if args.workspace:
+        original = range_path(session, args.file, workspace=True)
+        if not original.is_file():
+            raise StagedError('Workspace file does not exist: ' + args.file)
+        rename_sources = [old for rel, old in session.manifest.items() if rel != '_deletions']
+        if args.file in session.manifest or args.file in rename_sources:
+            raise StagedError('Discard the overlapping rename proposal before proposing deletion: ' + args.file)
+    elif args.file not in session.paths(fresh=True):
+        raise StagedError('No staged proposal at exact path: ' + args.file)
+    if target.exists():
+        target.unlink()
+    session.manifest.pop(args.file, None)
+    deletions = set(session.deletions)
+    if args.workspace:
+        deletions.add(args.file)
+    else:
+        deletions.discard(args.file)
+    session.deletions = sorted(deletions)
+    if deletions:
+        session.manifest['_deletions'] = session.deletions
+    else:
+        session.manifest.pop('_deletions', None)
+    session.save_manifest()
+    summaries['files'].pop(args.file, None)
+    if not session.paths(fresh=True):
+        summaries['session'] = ''
+    if (session.directory / 'summaries.json').exists():
+        session.save_summaries(summaries)
+    if args.json:
+        print(json.dumps({'operation': 'delete', 'path': args.file,
+                          'mode': 'propose' if args.workspace else 'discard'}))
+    else:
+        print(('Proposed workspace deletion: ' if args.workspace else 'Discarded staged proposal: ') + args.file)
+
+
+def file_operation(session, args):
+    # All paths are exact, all destinations are staged, and metadata is checked
+    # before any proposal is changed. These APIs never imply permission to apply.
+    safe_path(session.directory, 'renames.json')
+    summaries = session.summaries()
+    command = args.command
+    source = None
+    if command == 'create':
+        destination = args.file
+    else:
+        source = range_path(session, args.file, command == 'copy' and args.workspace)
+        if not source.is_file():
+            raise StagedError('Source file does not exist: ' + args.file)
+        if not (command == 'copy' and args.workspace) and args.file in session.deletions:
+            raise StagedError('Source file is marked for deletion: ' + args.file)
+        destination = args.to or args.file
+    target = unused_staged_path(session, destination, args.file if command == 'rename' else None)
+    if source is not None and source == target:
+        raise StagedError('Source and destination must differ.')
+    manifest = dict(session.manifest)
+    if command == 'rename':
+        original = manifest.pop(args.file, args.file)
+        # A newly created proposal has no workspace source to rename. Existing
+        # proposals retain their original source, including across repeated moves.
+        original_path = range_path(session, original, workspace=True)
+        if original != destination and (original_path.is_file() or args.file in session.manifest):
+            manifest[destination] = original
+        resulting = (set(session.files(fresh=True)) - {args.file}) | {destination}
+        sources = [old for rel, old in manifest.items() if rel != '_deletions' and rel != old]
+        if len(sources) != len(set(sources)) or set(sources) & (resulting | set(session.deletions)):
+            raise StagedError('Rename would overlap another staged operation.')
+        # Do not silently replace an unrelated workspace file on later apply.
+        workspace_destination = range_path(session, destination, workspace=True)
+        if workspace_destination.exists() and destination != original:
+            raise StagedError('Rename destination already exists in the workspace: ' + destination)
+    if command == 'create' and args.stdin and sys.stdin.isatty():
+        raise StagedError('--stdin requires piped or redirected input; use --text for inline content.')
+    before = file_version(source) if source is not None else None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if command == 'rename':
+        unused_staged_path(session, destination, args.file)
+        range_path(session, args.file)
+        if file_version(source) != before:
+            raise StagedError('Source changed; retry the operation.')
+        os.link(source, target)
+        try:
+            source.unlink()
+        except OSError:
+            target.unlink()
+            raise
+        session.manifest = manifest
+        session.save_manifest()
+        previous = summaries['files'].pop(args.file, None)
+        summaries['files'].pop(destination, None)
+        if previous is not None:
+            summaries['files'][destination] = previous
+    else:
+        descriptor, temporary = tempfile.mkstemp(prefix='.staged-file-', dir=str(target.parent))
+        try:
+            with os.fdopen(descriptor, 'wb') as output:
+                if source is not None:
+                    with source.open('rb') as stream:
+                        shutil.copyfileobj(stream, output, 1024 * 1024)
+                elif args.stdin:
+                    shutil.copyfileobj(sys.stdin.buffer, output, 1024 * 1024)
+                else:
+                    output.write((args.text or '').encode('utf-8'))
+            if source is not None:
+                os.chmod(temporary, stat.S_IMODE(source.stat().st_mode))
+                range_path(session, args.file, args.workspace)
+                if file_version(source) != before:
+                    raise StagedError('Source changed while copying; retry the operation.')
+            unused_staged_path(session, destination)
+            # Publish without replacing a concurrently created destination.
+            os.link(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        summaries['files'].pop(destination, None)
+    if (session.directory / 'summaries.json').exists():
+        session.save_summaries(summaries)
+    if args.json:
+        with target.open('rb') as stream:
+            digest = content_hash(stream)
+        result = {'operation': command, 'path': destination, 'size': target.stat().st_size, 'sha256': digest}
+        if source is not None:
+            result.update(source=args.file, source_root='workspace' if command == 'copy' and args.workspace else 'staged')
+        print(json.dumps(result))
+    else:
+        print('{} staged file: {}'.format({'create': 'Created', 'copy': 'Copied', 'rename': 'Renamed'}[command], destination))
+
+
+def selected_range(stream, args, writing=False):
+    stream.seek(0, os.SEEK_END)
+    size = stream.tell()
+    if args.start_line is not None:
+        # Lines are LF-delimited bytes; preserve CRLF and unterminated final lines.
+        stream.seek(0)
+        line = 1
+        while line < args.start_line:
+            if not stream.readline():
+                raise StagedError('Start line is past the end of the file.')
+            line += 1
+        start = stream.tell()
+        if writing and args.end_line is None:
+            return start, start, size  # Insert before the requested line (EOF allowed).
+        if args.end_line is None:
+            return start, size, size
+        for _ in range(args.end_line - args.start_line + 1):
+            if not stream.readline():
+                raise StagedError('End line is past the end of the file.')
+        return start, stream.tell(), size
+    if writing and args.append:
+        return size, size, size
+    start = args.offset if args.offset is not None else 0
+    count = args.delete_count if writing else args.length
+    if writing and args.offset is None:
+        return 0, size, size  # No range means replace the complete file.
+    if writing:
+        end = start + (count or 0)
+    else:
+        end = min(size, start + count) if count is not None else size
+    if start > size or end > size:
+        raise StagedError('Byte range is past the end of the file.')
+    return start, end, size
+
+
+def copy_bytes(source, target, count):
+    while count:
+        block = source.read(min(count, 1024 * 1024))
+        if not block:
+            raise StagedError('File changed while reading; retry the operation.')
+        target.write(block)
+        count -= len(block)
+
+
+def read_file_range(session, args):
+    path = range_path(session, args.file, args.workspace)
+    before = file_version(path)
+    if before is None:
+        raise StagedError('File does not exist: ' + args.file)
+    with path.open('rb') as stream:
+        start, end, size = selected_range(stream, args)
+        if args.json:
+            digest = content_hash(stream)
+            stream.seek(start)
+            data = stream.read(end - start)
+            try:
+                content, encoding = data.decode('utf-8'), 'utf-8'
+            except UnicodeDecodeError:
+                content, encoding = base64.b64encode(data).decode('ascii'), 'base64'
+            if file_version(path) != before or len(data) != end - start:
+                raise StagedError('File changed while reading; retry the operation.')
+            print(json.dumps({'path': args.file, 'source': 'workspace' if args.workspace else 'staged',
+                              'offset': start, 'length': len(data), 'size': size, 'sha256': digest,
+                              'encoding': encoding, 'content': content, 'next_offset': end, 'eof': end == size}))
+        else:
+            stream.seek(start)
+            copy_bytes(stream, sys.stdout.buffer, end - start)
+
+
+def write_file_range(session, args):
+    target = range_path(session, args.file)
+    if args.file in session.deletions:
+        raise StagedError('File is marked for deletion; remove its deletion entry before writing.')
+    before = file_version(target)
+    source = target
+    if args.from_workspace:
+        if before is not None:
+            raise StagedError('A staged file already exists; omit --from-workspace to edit it.')
+        source = range_path(session, args.file, workspace=True)
+        if not source.is_file():
+            raise StagedError('Workspace source does not exist: ' + args.file)
+    source_version = file_version(source)
+    # Keep the source open while streaming the replacement into a temporary file.
+    original = source.open('rb') if source_version is not None else io.BytesIO()
+    with original:
+        if args.expect_sha256 and content_hash(original) != args.expect_sha256.lower():
+            raise StagedError('File content changed: SHA-256 does not match; read again before writing.')
+        start, end, size = selected_range(original, args, writing=True)
+        if args.stdin and sys.stdin.isatty():
+            raise StagedError('--stdin requires piped or redirected input; use --text for inline content.')
+        mode = stat.S_IMODE(source.stat().st_mode) if source_version is not None else None
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix='.staged-write-', dir=str(target.parent))
+        try:
+            with os.fdopen(descriptor, 'wb') as output:
+                original.seek(0)
+                copy_bytes(original, output, start)
+                if args.stdin:
+                    shutil.copyfileobj(sys.stdin.buffer, output, 1024 * 1024)
+                else:
+                    output.write(args.text.encode('utf-8'))
+                original.seek(end)
+                copy_bytes(original, output, size - end)
+            if mode is not None:
+                os.chmod(temporary, mode)
+            # Catch changes during input collection as well as stale caller hashes.
+            range_path(session, args.file)
+            if file_version(target) != before or file_version(source) != source_version:
+                raise StagedError('File changed while writing; read again before retrying.')
+            # Close the source before replacing it, including on Windows.
+            original.close()
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    if args.json:
+        with target.open('rb') as result:
+            digest = content_hash(result)
+        print(json.dumps({'path': args.file, 'size': target.stat().st_size, 'sha256': digest,
+                          'created': before is None, 'from_workspace': args.from_workspace}))
+    else:
+        print('Wrote staged file: ' + args.file)
+
+
+def validate_file_range_args(parser, args):
+    if args.start_line is not None and (args.offset is not None or getattr(args, 'length', None) is not None
+                                       or getattr(args, 'delete_count', None) is not None or getattr(args, 'append', False)):
+        parser.error('line ranges cannot be combined with byte ranges or --append')
+    if args.end_line is not None and (args.start_line is None or args.end_line < args.start_line):
+        parser.error('--end-line requires --start-line and must not precede it')
+    if args.command == 'write':
+        if args.delete_count is not None and args.offset is None:
+            parser.error('--delete-count requires --offset')
+        if args.append and args.offset is not None:
+            parser.error('--append cannot be combined with --offset')
+        if args.expect_sha256 and not re.fullmatch('[0-9a-fA-F]{64}', args.expect_sha256):
+            parser.error('--expect-sha256 requires a 64-character hexadecimal digest')
+
+
 def make_parser():
     def globals_on(parser, path_command=False, clean_command=False):
         parser.add_argument('-t', '--tool', default=argparse.SUPPRESS, help='editor adapter ID')
@@ -958,7 +1398,7 @@ def make_parser():
         parser.add_argument('--root', default=argparse.SUPPRESS, help='staging root (outside the workspace)')
         parser.add_argument('--shell', choices=['bash', 'zsh', 'powershell'], default=argparse.SUPPRESS,
                             help='shell for setup; powershell offers an optional Windows launcher')
-        parser.add_argument('-v', '--verbose', action='store_true', default=argparse.SUPPRESS, help='include absolute paths, file sizes, and timestamps in the overview')
+        parser.add_argument('-v', '--verbose', action='store_true', default=argparse.SUPPRESS, help='include session/file summaries in diff and overview, plus overview paths, sizes and timestamps')
     parser = argparse.ArgumentParser(
         prog='staged', description=__doc__,
         epilog='Run staged <command> --help for command options, or staged --help-all for the full reference. '
@@ -974,6 +1414,13 @@ def make_parser():
     subs = parser.add_subparsers(dest='command')
     command_parsers = {}
     descriptions = {
+        'read': 'Read exact file ranges from staging or the workspace.',
+        'write': 'Write or splice file contents inside staging only.',
+        'create': 'Create a new staged file without replacing an existing proposal.',
+        'copy': 'Copy a staged or workspace file to a new staged destination.',
+        'rename': 'Rename a staged file and maintain its proposal metadata.',
+        'delete': 'Discard a staged proposal, or record a workspace deletion for later apply.',
+        'summarize': 'Read or update concise session and file change summaries.',
         'init': 'Create an isolated session and record its workspace and branch.',
         'diff': 'Review proposed files, apply with -a, clean with -c, or apply then clean with -ac.',
         'apply': 'Apply proposed files, renames and deletions to the workspace.',
@@ -987,6 +1434,7 @@ def make_parser():
         'install-skill': 'Install /stage for an agent harness.',
         'install-completion': 'Install shell completions for bash, zsh, or powershell.',
         'install-launcher': 'Install the standalone Windows command launcher (PATH unchanged).',
+        'uninstall': 'Remove installed integrations and CLI; optionally delete all known sessions.',
     }
     for name in COMMANDS:
         command = subs.add_parser(name, description=descriptions[name], help=descriptions[name])
@@ -1000,6 +1448,47 @@ def make_parser():
         if name == 'clean':
             selection.add_argument('-s', '--session', nargs='?', const=True, dest='clean_session', default=argparse.SUPPRESS,
                                    metavar='id', help='discard the entire session directory (active session when omitted)')
+    for name in ('read', 'write'):
+        p = command_parsers[name]
+        p.add_argument('-f', '--file', required=True, help='exact relative file path (no fuzzy matching)')
+        p.add_argument('--offset', type=nonnegative, help='zero-based byte offset')
+        p.add_argument('--start-line', type=positive, help=('one-based first line to read' if name == 'read'
+                       else 'one-based first line; without --end-line, insert before it'))
+        p.add_argument('--end-line', type=positive, help=('inclusive last line (default: EOF)' if name == 'read'
+                       else 'inclusive last line to replace'))
+        p.add_argument('--json', action='store_true', help='print structured output including the full-file SHA-256')
+    p = command_parsers['read']
+    p.add_argument('--workspace', action='store_true', help='read the workspace original instead of staging')
+    p.add_argument('--length', type=nonnegative, help='maximum number of bytes to read (default: through EOF)')
+    p = command_parsers['write']
+    payload = p.add_mutually_exclusive_group(required=True)
+    payload.add_argument('--stdin', action='store_true', help='read replacement bytes from standard input')
+    payload.add_argument('--text', help='replacement UTF-8 text; empty text is allowed')
+    p.add_argument('--delete-count', type=nonnegative, help='bytes to replace at --offset (default: 0, insert)')
+    p.add_argument('--append', action='store_true', help='append input bytes at EOF')
+    p.add_argument('--from-workspace', action='store_true', help='seed a missing staged file from the workspace before editing')
+    p.add_argument('--expect-sha256', help='reject the edit if the full source file hash differs')
+    for name in ('create', 'copy', 'rename', 'delete'):
+        p = command_parsers[name]
+        p.add_argument('-f', '--file', required=True, help='exact relative file path (no fuzzy matching)')
+        p.add_argument('--json', action='store_true', help='print structured operation results')
+    command_parsers['delete'].add_argument('--workspace', action='store_true', help='record a workspace deletion for later apply; never delete the workspace file now')
+    p = command_parsers['create']
+    payload = p.add_mutually_exclusive_group()
+    payload.add_argument('--text', help='initial UTF-8 contents (default: empty file)')
+    payload.add_argument('--stdin', action='store_true', help='read initial bytes from standard input')
+    p = command_parsers['copy']
+    p.add_argument('--workspace', action='store_true', help='read the source from the real workspace; destination stays in staging')
+    p.add_argument('--to', help='new staged destination path (default: source path)')
+    command_parsers['rename'].add_argument('--to', required=True, help='new staged destination path')
+    p = command_parsers['summarize']
+    p.add_argument('-f', '--file', help='exact proposed path; use rename destination or deleted original path')
+    payload = p.add_mutually_exclusive_group()
+    payload.add_argument('-m', '--message', help='summary text, usually one sentence and at most three')
+    payload.add_argument('--stdin', action='store_true', help='read summary text from standard input')
+    payload.add_argument('--clear', action='store_true', help='clear the selected session or file summary')
+    p.add_argument('--summary', help='update the session summary alongside a file summary')
+    p.add_argument('--json', action='store_true', help='print the complete structured summaries object')
     p = command_parsers['init']
     p.add_argument('id', nargs='?', help='conversation ID; generates a UUID when omitted')
     p.add_argument('--json', action='store_true', help='print machine-readable session paths')
@@ -1043,6 +1532,11 @@ def make_parser():
     p.add_argument('--default', action='store_true', help='install in the user-level skill directory (default)')
     p.add_argument('--target-dir', help='explicit directory containing the installed SKILL.md')
     p.add_argument('--configure-sandbox', action='store_true', help='merge staging-root permissions where supported')
+    p = command_parsers['uninstall']
+    p.add_argument('-y', '--yes', action='store_true', help='confirm uninstall (does not opt into session deletion)')
+    group = p.add_mutually_exclusive_group()
+    group.add_argument('--remove-sessions', action='store_true', help='delete sessions across all known roots and repositories')
+    group.add_argument('--keep-sessions', action='store_true', help='keep sessions without prompting')
     return parser, command_parsers
 
 
@@ -1138,6 +1632,7 @@ def install_launcher():
     python = sys.executable.replace('%', '%%')
     engine = str(REPO_ROOT / 'staged').replace('%', '%%')
     write_text_file(launcher, '@echo off\n"{}" "{}" %*\n'.format(python, engine))
+    record_installed_file(launcher)
     print('Launcher: {}. Add {} to your user PATH.'.format(launcher, launcher.parent))
 
 
@@ -1216,11 +1711,238 @@ def install_completion(shell=None):
         print("Load in PowerShell (add to $PROFILE to persist): . '{}'".format(str(target).replace("'", "''")))
     else:
         raise StagedError('Choose --shell bash, zsh or powershell.')
+    record_installed_file(target)
+    profiles = [Path(HOME) / '.bashrc', Path(HOME) / '.bash_profile'] if shell == 'bash' else ([zsh_rc()] if shell == 'zsh' else [])
+    for profile in profiles:
+        record_install('profiles', str(profile))
     print('Installed: {}'.format(target))
     if shell == 'zsh':
         print('Activate in your current shell: source {} (or open a new terminal).'.format(shlex.quote(str(zsh_rc()))))
     elif shell == 'bash':
         print('Activate in your current shell: source {} (or open a new terminal).'.format(shlex.quote(str(target))))
+
+
+def record_install(key, value):
+    """Remember nonstandard install locations so uninstall can find them later."""
+    path = CONFIG_DIR / 'installations.json'
+    data = load_json(path)
+    values = data.setdefault(key, [])
+    if value not in values:
+        values.append(value)
+        save_json(path, data)
+
+
+def record_installed_file(path):
+    path = Path(path)
+    receipt = CONFIG_DIR / 'installations.json'
+    data = load_json(receipt)
+    data.setdefault('files', {})[str(path.absolute())] = hashlib.sha256(path.read_bytes()).hexdigest()
+    save_json(receipt, data)
+
+
+def uninstall_sessions(ctx, receipt):
+    roots = [DATA_DIR] + ctx.roots()
+    for settings in (ctx.global_state, ctx.local):
+        roots.extend(Path(p).expanduser() for p in settings.get('session_roots', []))
+        if settings.get('staging_root'):
+            roots.append(Path(settings['staging_root']).expanduser())
+    roots.extend(Path(p).expanduser() for p in receipt.get('roots', []))
+    roots.extend(Path(tool.root).expanduser() for tool in ctx.registry.values() if tool.root)
+    sessions = []
+    for root in dict.fromkeys(p.resolve() for p in roots):
+        if not root.is_dir():
+            continue
+        for directory in sorted(root.iterdir()):
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            marker = directory / '.workspace'
+            if marker.is_symlink() or not marker.is_file() or not (directory / 'staging').is_dir():
+                continue
+            workspace = Path(marker.read_text(encoding='utf-8').strip())
+            # A session must never contain the workspace it claims to protect.
+            if not workspace.is_absolute() or directory == ctx.workspace or directory in ctx.workspace.parents:
+                continue
+            if directory == workspace.resolve() or directory in workspace.resolve().parents:
+                continue
+            if directory not in sessions:
+                sessions.append(directory)
+    return [directory for directory in sessions if not any(parent in sessions for parent in directory.parents)]
+
+
+def npm_uninstall_command():
+    """Use npm only when its global package resolves to this running installation."""
+    npm = shutil.which('npm')
+    if not npm:
+        return None
+    # npm.cmd needs cmd.exe on Windows. Keep all arguments fixed and validate the executable.
+    def command(*args):
+        tokens = [npm] + list(args)
+        if os.name == 'nt' and npm.lower().endswith(('.cmd', '.bat')):
+            if any(ch in npm for ch in '\r\n%"&|<>^!'):
+                raise StagedError('Cannot safely run npm launcher: ' + npm)
+            shell = subprocess.list2cmdline([os.environ.get('COMSPEC', 'cmd.exe')])
+            return '{} /d /s /c "{}"'.format(shell, ' '.join('"{}"'.format(t) for t in tokens))
+        return tokens
+    result = subprocess.run(command('root', '--global'), capture_output=True, text=True)
+    if result.returncode:
+        raise StagedError('Cannot inspect npm global installation: ' + result.stderr.strip())
+    value = result.stdout.strip()
+    if not value or not Path(value).is_absolute():
+        raise StagedError('npm returned an invalid global package directory.')
+    package = Path(value) / '@melchi/staged'
+    if package.exists() and package.resolve() == REPO_ROOT:
+        return command('uninstall', '--global', '--ignore-scripts', '@melchi/staged')
+    return None
+
+
+def windows_launcher_path_edit():
+    if sys.platform != 'win32':
+        return None
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment') as key:
+            value, kind = winreg.QueryValueEx(key, 'Path')
+    except FileNotFoundError:
+        return None
+    target = ntpath.normcase(ntpath.normpath(str(CONFIG_DIR / 'bin')))
+    parts = value.split(';')
+    kept = [part for part in parts if ntpath.normcase(ntpath.normpath(
+        os.path.expandvars(part.strip().strip('"')))) != target]
+    return (';'.join(kept), kind) if kept != parts else None
+
+
+def uninstall(ctx):
+    receipt = load_json(CONFIG_DIR / 'installations.json')
+    sessions = uninstall_sessions(ctx, receipt)
+    npm_command = npm_uninstall_command()
+    # Recognize legacy default installs; receipts also cover custom paths and old versions.
+    files = dict(receipt.get('files', {}))
+    skill_source = REPO_ROOT / 'SKILL.md'
+    if skill_source.is_file():
+        digest = hashlib.sha256(skill_source.read_bytes()).hexdigest()
+        for location in ('.cursor/skills', '.claude/skills', '.agents/skills',
+                         '.codeium/windsurf/skills', '.gemini/config/skills'):
+            files.setdefault(str(Path(HOME) / location / 'stage/SKILL.md'), digest)
+    for name in ('staged.bash', '_staged', 'staged.ps1'):
+        source = REPO_ROOT / 'completions' / name
+        if source.is_file():
+            files.setdefault(str(CONFIG_DIR / 'completions' / name), hashlib.sha256(source.read_bytes()).hexdigest())
+    launcher = CONFIG_DIR / 'bin/staged.cmd'
+    legacy_launcher = '@echo off\n"{}" "{}" %*\n'.format(
+        sys.executable.replace('%', '%%'), str(REPO_ROOT / 'staged').replace('%', '%%'))
+    files.setdefault(str(launcher), hashlib.sha256(legacy_launcher.replace('\n', os.linesep).encode()).hexdigest())
+    removable = []
+    for value, digest in files.items():
+        path = Path(value)
+        # Never remove a source file when someone installed directly over the checkout.
+        if path.resolve() == REPO_ROOT or REPO_ROOT in path.resolve().parents:
+            if not path.is_symlink():
+                continue
+        if path.is_symlink() and (not path.exists() or path.resolve() in
+                [REPO_ROOT / 'completions' / name for name in ('staged.bash', '_staged', 'staged.ps1')]):
+            removable.append(path)
+        elif path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest:
+            removable.append(path)
+        elif path.exists():
+            print('Keeping modified installation: ' + str(path))
+    candidates = [Path(HOME) / '.local/bin/staged']
+    found = shutil.which('staged')
+    if found:
+        candidates.append(Path(found))
+    for path in candidates:
+        if path.is_symlink() and path.resolve() == REPO_ROOT / 'staged' and path not in removable:
+            removable.append(path)
+    profiles = {Path(HOME) / '.bashrc', Path(HOME) / '.bash_profile', zsh_rc()}
+    profiles.update(Path(p) for p in receipt.get('profiles', []))
+    pattern = re.compile(r'(?m)^' + re.escape(COMPLETION_MARKER_START) + r'\n.*?^' +
+                         re.escape(COMPLETION_MARKER_END) + r'[^\S\n]*\n?', re.DOTALL)
+    # PowerShell installers print an exact loader to add manually to a profile.
+    powershell_dirs = [Path(HOME) / 'Documents' / name for name in ('PowerShell', 'WindowsPowerShell')]
+    powershell_dirs.append(Path(os.environ.get('XDG_CONFIG_HOME', Path(HOME) / '.config')) / 'powershell')
+    if os.environ.get('OneDrive'):
+        powershell_dirs.extend(Path(os.environ['OneDrive']) / 'Documents' / name for name in ('PowerShell', 'WindowsPowerShell'))
+    for directory in powershell_dirs:
+        if directory.is_dir():
+            profiles.update(directory.glob('*profile.ps1'))
+    loader = ". '{}'".format(str(CONFIG_DIR / 'completions/staged.ps1').replace("'", "''"))
+    profile_edits = []
+    for profile in sorted(profiles):
+        if profile.is_file():
+            content = profile.read_text(encoding='utf-8')
+            updated = pattern.sub('', content)
+            if profile.suffix == '.ps1':
+                updated = ''.join(line for line in updated.splitlines(keepends=True) if line.strip() != loader)
+            if content != updated:
+                profile_edits.append((profile, updated))
+    path_edit = windows_launcher_path_edit()
+    print('Uninstall staged: {} installed files, {} shell profiles, global settings and shell bindings.'.format(
+        len(removable), len(profile_edits)))
+    if npm_command:
+        print('Remove the global npm package @melchi/staged.')
+    else:
+        print('Source checkout is retained: ' + str(REPO_ROOT))
+    for directory in sessions:
+        print('Session: ' + str(directory))
+    confirm('Uninstall staged?', ctx.args.yes)
+    remove_sessions = ctx.args.remove_sessions
+    if sessions and not remove_sessions and not ctx.args.keep_sessions:
+        if sys.stdin.isatty():
+            remove_sessions = input('Also permanently delete all {} listed sessions? [y/N] '.format(len(sessions))).strip().lower() in ('y', 'yes')
+        else:
+            print('Keeping sessions; pass --remove-sessions to delete them.')
+    # Run the package manager first: a permissions failure must leave cleanup retryable.
+    if npm_command:
+        result = subprocess.run(npm_command)
+        if result.returncode:
+            raise StagedError('npm uninstall failed; settings and sessions were kept. Retry with the required npm permissions.')
+    if path_edit is not None:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment', 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, 'Path', 0, path_edit[1], path_edit[0])
+        print('Removed standalone launcher directory from user PATH.')
+    for profile, content in profile_edits:
+        # Preserve permissions and follow a user's profile symlink rather than replacing it.
+        profile.write_text(content, encoding='utf-8')
+        print('Removed completion hook: ' + str(profile))
+    for value, field, token in receipt.get('permissions', []):
+        path = Path(value)
+        if not path.is_file():
+            continue
+        data = load_json(path)
+        parent = data
+        for key in field.split('.')[:-1]:
+            parent = parent.get(key, {}) if isinstance(parent, dict) else {}
+        key = field.split('.')[-1]
+        if isinstance(parent, dict) and isinstance(parent.get(key), list) and token in parent[key]:
+            parent[key].remove(token)
+            save_json(path, data)
+    for path in removable:
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+            print('Removed: ' + str(path))
+        # Only remove an empty directory owned by the skill or completion installer.
+        if path.name == 'SKILL.md' or path.parent in (CONFIG_DIR / 'completions', CONFIG_DIR / 'bin'):
+            if path.parent.is_dir() and not path.parent.is_symlink() and not any(path.parent.iterdir()):
+                path.parent.rmdir()
+    if remove_sessions:
+        for directory in sessions:
+            shutil.rmtree(directory)
+            print('Deleted session: ' + str(directory))
+    for name in ('state.json', 'completion-setup.json', 'launcher-setup.json', 'installations.json'):
+        path = CONFIG_DIR / name
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+    bindings = CONFIG_DIR / 'shell_sessions'
+    if bindings.is_dir() and not bindings.is_symlink():
+        for path in bindings.glob('*.json'):
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+        if not any(bindings.iterdir()):
+            bindings.rmdir()
+    if CONFIG_DIR.is_dir() and not CONFIG_DIR.is_symlink() and not any(CONFIG_DIR.iterdir()):
+        CONFIG_DIR.rmdir()
+    print('Uninstall complete. {} {} sessions.'.format('Deleted' if remove_sessions else 'Kept', len(sessions)))
+    print('Open a new terminal to refresh PATH and clear loaded completions.')
 
 
 def set_preferences(ctx):
@@ -1264,6 +1986,8 @@ def main(argv=None):
         (commands.get(command) or parser).print_help()
         return
     args = parser.parse_args(argv)
+    if args.command in ('read', 'write'):
+        validate_file_range_args(commands[args.command], args)
     if args.command == 'diff' and (args.apply or args.clean or args.between or args.compare_session):
         if args.file is None and not args.all:
             commands['diff'].error('choose --file <file> or --all')
@@ -1273,6 +1997,9 @@ def main(argv=None):
     if not argv or (args.command == 'init' and not args.json):
         offer_completion_install(args.shell)
     ctx = Context(args)
+    if args.command == 'uninstall':
+        uninstall(ctx)
+        return
     if args.complete_tools:
         print('\n'.join(sorted(ctx.registry)))
         return
@@ -1292,6 +2019,7 @@ def main(argv=None):
             print('{}\t{}\t{}\n\t{}'.format(
                 color(session.id.ljust(id_width), '36'), color(count.ljust(count_width), '33'),
                 color(session.workspace, '1'), color(session.staging, '2')))
+            print('\tSummary: {}'.format(summary_text(session.summaries()['session'])))
         return
     if args.complete_open or args.complete_meta:
         try:
@@ -1306,6 +2034,19 @@ def main(argv=None):
         except StagedError as exc:
             if not str(exc).startswith('No staging session'):
                 raise
+        return
+    if args.command == 'delete':
+        delete_file(ctx.active(notify=False), args)
+        return
+    if args.command in ('create', 'copy', 'rename'):
+        file_operation(ctx.active(notify=False), args)
+        return
+    if args.command == 'summarize':
+        update_summary(ctx.active(notify=False), args)
+        return
+    if args.command in ('read', 'write'):
+        session = ctx.active(notify=False)
+        (read_file_range if args.command == 'read' else write_file_range)(session, args)
         return
     if args.shell == 'powershell' and args.command != 'path' and not getattr(args, 'json', False):
         offer_launcher_install()
