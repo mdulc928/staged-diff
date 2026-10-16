@@ -141,7 +141,7 @@ staged open --meta -f staged_changes.md --tool cli
 >
 > - **File vs. bulk selection**: Use `-f` / `--file <path>` for a single file and `--all` for bulk operations (or `--session` with `clean` to discard an entire session). Positional filenames and positional `all` are no longer accepted.
 > - **Actions require a target**: `apply`, `clean`, `migrate`, and `diff` actions/comparisons require an explicit selection; running `staged diff` alone shows the overview.
-> - **Metadata editing**: `staged open` searches staged files by default; pass `--meta` to search and edit session metadata only (such as `staged_changes.md`).
+> - **Metadata files**: `read`, `write`, `create`, `copy`, `rename`, `delete`, `path`, and `open` accept `--meta` for session files such as `staged_changes.md`. `staged open` searches staged files unless `--meta` is set.
 
 Agents can also manage proposal files directly through the CLI without touching your working tree:
 
@@ -152,16 +152,18 @@ staged copy -f src/example.py --to src/variant.py
 staged rename -f src/example.py --to src/renamed.py
 staged delete -f src/variant.py                  # Discard staged proposal
 staged delete -f src/obsolete.py --workspace     # Propose deletion for later apply
+staged write --meta -f staged_changes.md --text '# Review notes'
 ```
 
-All staged modifications stay isolated in staging until applied. Agents can also attach concise explanations to proposals:
+All staged modifications stay isolated in staging until applied. `--meta` reads and writes session notes beside `staging/` (for example `staged_changes.md`) so agents do not need a separate file tool for them. Agents attach concise explanations with `summarize`, and read them back with `--summary`:
 
 ```bash
-staged summarize -f example.py -m 'Handle empty input without raising an error.'
-staged summarize -m 'Make input handling tolerate empty values.'
+staged summarize -f example.py -m 'Handle empty input without raising an error.' --session-message 'Make input handling tolerate empty values.'
+staged --summary
+staged --summary -f example.py
 ```
 
-These summaries surface in `staged --sessions` and `staged diff -v`, giving you quick context on what changed and why before you review the full diff.
+`staged --summary` prints the session summary and each file summary, grouped by status with a blank line between groups. Those summaries also surface in `staged --sessions` and `staged diff -v`.
 
 **The tool does more:** compare sessions, migrate staged changes, clean up files, configure your favorite editor, and more.
 
