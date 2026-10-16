@@ -209,13 +209,13 @@ class CLI(unittest.TestCase):
 
     def test_managed_rename_tracks_origin_summary_and_can_move_back(self):
         path = self.propose()
-        self.run_cli('summarize', '-f', 'existing.txt', '-m', 'Revise greeting.', '--summary', 'Improve greetings.')
+        self.run_cli('summarize', '-f', 'existing.txt', '-m', 'Revise greeting.', '--session-message', 'Improve greetings.')
         result = json.loads(self.file_api('rename', '-f', 'existing.txt', '--to', 'nested/renamed.txt', '--json').stdout)
         self.assertEqual(result['operation'], 'rename')
         self.assertFalse(path.exists())
         self.assertTrue((self.repo / 'existing.txt').exists())
         self.assertEqual(json.loads((self.root / 'session-a/renames.json').read_text()), {'nested/renamed.txt': 'existing.txt'})
-        summaries = json.loads(self.run_cli('summarize', '--json').stdout)
+        summaries = json.loads(self.run_cli('--summary', '--json').stdout)
         self.assertEqual(summaries['files'], {'nested/renamed.txt': 'Revise greeting.'})
         self.file_api('rename', '-f', 'nested/renamed.txt', '--to', 'second.txt')
         self.assertEqual(json.loads((self.root / 'session-a/renames.json').read_text()), {'second.txt': 'existing.txt'})
@@ -242,15 +242,15 @@ class CLI(unittest.TestCase):
     def test_managed_delete_discards_without_workspace_deletion(self):
         self.propose()
         self.propose(rel='keep.txt')
-        self.run_cli('summarize', '-f', 'existing.txt', '-m', 'Change greeting.', '--summary', 'Two changes.')
+        self.run_cli('summarize', '-f', 'existing.txt', '-m', 'Change greeting.', '--session-message', 'Two changes.')
         result = json.loads(self.file_api('delete', '-f', 'existing.txt', '--json').stdout)
         self.assertEqual(result, {'operation': 'delete', 'path': 'existing.txt', 'mode': 'discard'})
         self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
         self.assertFalse((self.root / 'session-a/staging/existing.txt').exists())
-        data = json.loads(self.run_cli('summarize', '--json').stdout)
+        data = json.loads(self.run_cli('--summary', '--json').stdout)
         self.assertEqual(data, {'session': 'Two changes.', 'files': {}})
         self.file_api('delete', '-f', 'keep.txt')
-        self.assertEqual(json.loads(self.run_cli('summarize', '--json').stdout)['session'], '')
+        self.assertEqual(json.loads(self.run_cli('--summary', '--json').stdout)['session'], '')
         self.file_api('delete', '-f', 'existing.txt', ok=False)
 
     def test_managed_delete_proposes_and_cancels_or_applies(self):
@@ -339,12 +339,12 @@ class CLI(unittest.TestCase):
         path = self.root / 'session-a/summaries.json'
         path.write_text(json.dumps({'extra': 1, 'files': {'other.txt': 'Another change.'}}))
         result = self.run_cli('summarize', '-f', 'existing.txt', '-m', 'Revise the greeting.',
-                              '--summary', 'Improve greetings.', '--json')
+                              '--session-message', 'Improve greetings.', '--json')
         data = json.loads(result.stdout)
         self.assertEqual(data['session'], 'Improve greetings.')
         self.assertEqual(data['files'], {'existing.txt': 'Revise the greeting.', 'other.txt': 'Another change.'})
         self.assertEqual(data['extra'], 1)
-        self.assertEqual(json.loads(self.run_cli('summarize', '--json').stdout), data)
+        self.assertEqual(json.loads(self.run_cli('--summary', '--json').stdout), data)
         self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
         self.assertFalse((self.root / 'session-a/staging/summaries.json').exists())
         self.run_cli('summarize', '-f', 'existing.txt', '--clear')
@@ -356,13 +356,13 @@ class CLI(unittest.TestCase):
     def test_summary_stdin_and_exact_paths_and_invalid_combinations(self):
         self.propose(rel='nested/existing.txt')
         self.file_api('summarize', '--stdin', data='  Improve café output.\n'.encode())
-        self.assertEqual(json.loads(self.run_cli('summarize', '--json').stdout)['session'], 'Improve café output.')
+        self.assertEqual(json.loads(self.run_cli('--summary', '--json').stdout)['session'], 'Improve café output.')
         for rel in ('existing', 'existing.txt', '../escape', '/tmp/escape', '.git/config', 'nested//existing.txt'):
             self.run_cli('summarize', '-f', rel, '-m', 'Invalid.', ok=False)
-        self.run_cli('summarize', '--summary', 'Invalid.', ok=False)
-        self.run_cli('summarize', '-f', 'nested/existing.txt', '--summary', 'Invalid.', ok=False)
+        self.run_cli('summarize', '--session-message', 'Invalid.', ok=False)
+        self.run_cli('summarize', '-f', 'nested/existing.txt', '--session-message', 'Invalid.', ok=False)
         self.run_cli('summarize', '-m', 'Invalid.', '--clear', ok=False)
-        self.assertEqual(json.loads(self.run_cli('summarize', '--json').stdout)['files'], {})
+        self.assertEqual(json.loads(self.run_cli('--summary', '--json').stdout)['files'], {})
 
     def test_summary_stdin_uses_utf8_and_rejects_invalid_bytes_without_mutation(self):
         self.propose()
@@ -382,8 +382,9 @@ class CLI(unittest.TestCase):
         self.run_cli('summarize', '--session', 'legacy', '-m', 'Improve greetings.\nKeep them concise.')
         self.init('empty')
         output = self.run_cli('--sessions').stdout
-        self.assertIn('Summary: Improve greetings. Keep them concise.', output)
-        self.assertIn('Summary: (no summary yet)', output)
+        self.assertIn('Improve greetings. Keep them concise.', output)
+        self.assertIn('(no summary yet)', output)
+        self.assertIn('\n\n', output)
         self.assertIn('Improve greetings.', self.run_cli('-R').stdout)
         self.assertEqual(set(self.run_cli('--complete-sessions').stdout.splitlines()), {'legacy', 'empty'})
         self.assertFalse((self.root / 'empty/summaries.json').exists())
@@ -392,12 +393,14 @@ class CLI(unittest.TestCase):
         self.propose()
         self.propose(rel='other.txt')
         self.run_cli('summarize', '-f', 'existing.txt', '-m', 'Revise the greeting.',
-                     '--summary', 'Improve greetings.')
+                     '--session-message', 'Improve greetings.')
         for flags in [('diff', '-v'), ('diff', '--verbose'), ('-v', 'diff')]:
             output = self.run_cli(*flags).stdout
-            self.assertIn('Session summary (session-a): Improve greetings.', output)
-            self.assertIn('Summary: Revise the greeting.', output)
-            self.assertIn('Summary: (no summary yet)', output)
+            self.assertIn('Improve greetings.', output)
+            self.assertIn('Revise the greeting.', output)
+            self.assertIn('(no summary yet)', output)
+            self.assertLess(output.index('Improve greetings.'), output.index('Revise the greeting.'))
+            self.assertIn('\n\n', output)
             self.assertIn('Workspace:', output)
         self.assertNotIn('Revise the greeting.', self.run_cli('diff').stdout)
         output = self.run_cli('diff', '-v', '-f', 'existing.txt').stdout
@@ -407,34 +410,39 @@ class CLI(unittest.TestCase):
         self.assertNotIn('other.txt', output)
         self.assertNotIn('Revise the greeting.', self.run_cli('diff', '-f', 'existing.txt').stdout)
         self.assertIn('Revise the greeting.', self.run_cli('diff', '--all', '-v').stdout)
+        colored = self.run_cli('-v', env=dict(self.env, FORCE_COLOR='1')).stdout
+        self.assertIn('\x1b[36m', colored)
+        self.assertIn('Revise the greeting.', colored)
 
     def test_summary_supports_rename_and_deletion_and_clean(self):
         self.propose(rel='renamed.txt')
         self.manifest({'renamed.txt': 'old.txt', '_deletions': ['existing.txt']})
         for rel in ('renamed.txt', 'existing.txt'):
             self.run_cli('summarize', '-f', rel, '-m', 'Explain ' + rel,
-                         '--summary', 'Restructure files.')
+                         '--session-message', 'Restructure files.')
         output = self.run_cli('diff', '-v', '--all').stdout
         self.assertIn('Explain renamed.txt', output)
         self.assertIn('Explain existing.txt', output)
         self.run_cli('clean', '-f', 'renamed.txt', '-y')
-        data = json.loads(self.run_cli('summarize', '--json').stdout)
+        data = json.loads(self.run_cli('--summary', '--json').stdout)
         self.assertEqual(data['files'], {'existing.txt': 'Explain existing.txt'})
         self.assertEqual(data['session'], 'Restructure files.')
         self.run_cli('clean', '--all', '-y')
-        self.assertEqual(json.loads(self.run_cli('summarize', '--json').stdout), {'session': '', 'files': {}})
+        self.assertEqual(json.loads(self.run_cli('--summary', '--json').stdout), {'session': '', 'files': {}})
         self.assertTrue((self.repo / 'existing.txt').exists())
 
     def test_verbose_cross_session_diff_labels_both_summaries(self):
         for key in ('one', 'two'):
             self.propose(key=key, text=key + '\n')
             self.run_cli('summarize', '--session', key, '-f', 'existing.txt', '-m', key + ' file.',
-                         '--summary', key + ' session.')
+                         '--session-message', key + ' session.')
         for flags in [('--between', 'one', 'two'), ('--session', 'one', '--compare-session', 'two')]:
             output = self.run_cli('diff', '-v', '--all', *flags).stdout
             for key in ('one', 'two'):
-                self.assertIn('Session summary ({}): {} session.'.format(key, key), output)
-                self.assertIn('existing.txt [{}]: {} file.'.format(key, key), output)
+                self.assertIn(key + ' session.', output)
+                self.assertIn('[' + key + ']', output)
+                self.assertIn(key + ' file.', output)
+                self.assertLess(output.index(key + ' session.'), output.index(key + ' file.'))
             self.assertIn('-one', output)
             self.assertIn('+two', output)
 
@@ -443,17 +451,17 @@ class CLI(unittest.TestCase):
         self.propose('source', rel='two.txt')
         for rel in ('one.txt', 'two.txt'):
             self.run_cli('summarize', '--session', 'source', '-f', rel, '-m', 'Explain ' + rel,
-                         '--summary', 'Both files.')
+                         '--session-message', 'Both files.')
         self.run_cli('migrate', '--from', 'source', '--to', 'whole', '--all')
-        self.assertEqual(json.loads(self.run_cli('summarize', '--session', 'whole', '--json').stdout),
-                         json.loads(self.run_cli('summarize', '--session', 'source', '--json').stdout))
+        self.assertEqual(json.loads(self.run_cli('--session', 'whole', '--summary', '--json').stdout),
+                         json.loads(self.run_cli('--session', 'source', '--summary', '--json').stdout))
         self.run_cli('migrate', '--from', 'source', '--to', 'partial', '-f', 'one.txt')
-        data = json.loads(self.run_cli('summarize', '--session', 'partial', '--json').stdout)
+        data = json.loads(self.run_cli('--session', 'partial', '--summary', '--json').stdout)
         self.assertEqual(data, {'session': '', 'files': {'one.txt': 'Explain one.txt'}})
         self.run_cli('summarize', '--session', 'partial', '-m', 'My selection.')
         self.run_cli('summarize', '--session', 'source', '-f', 'one.txt', '--clear')
         self.run_cli('migrate', '--from', 'source', '--to', 'partial', '-f', 'one.txt', '--force')
-        self.assertEqual(json.loads(self.run_cli('summarize', '--session', 'partial', '--json').stdout),
+        self.assertEqual(json.loads(self.run_cli('--session', 'partial', '--summary', '--json').stdout),
                          {'session': 'My selection.', 'files': {}})
 
     def test_malformed_summary_and_symlink_are_rejected_before_mutation(self):
@@ -480,9 +488,139 @@ class CLI(unittest.TestCase):
     def test_summary_help_and_completion(self):
         self.assertIn('summarize', self.run_cli('--complete-options').stdout.splitlines())
         options = self.run_cli('--complete-options', 'summarize').stdout.splitlines()
-        for flag in ('-m', '--message', '--stdin', '--clear', '--summary', '--json', '--file'):
+        for flag in ('-m', '--message', '--stdin', '--clear', '--session-message', '--json', '--file'):
             self.assertIn(flag, options)
+        self.assertNotIn('--summary', options)
+        self.assertIn('--summary', self.run_cli('--complete-options').stdout.splitlines())
         self.assertIn('summaries', self.run_cli('diff', '--help').stdout)
+
+    def test_meta_is_accepted_everywhere_file_selection_is_supported(self):
+        parser = staged.make_parser()[0]
+        commands = [
+            ['--summary', '--meta', '-f', 'existing.txt'],
+            ['read', '--meta', '-f', 'notes.md'],
+            ['write', '--meta', '-f', 'notes.md', '--text', 'notes'],
+            ['create', '--meta', '-f', 'notes.md'],
+            ['copy', '--meta', '-f', 'notes.md', '--to', 'copy.md'],
+            ['rename', '--meta', '-f', 'notes.md', '--to', 'review.md'],
+            ['delete', '--meta', '-f', 'notes.md'],
+            ['summarize', '--meta', '-f', 'existing.txt', '-m', 'Summary.'],
+            ['diff', '--meta', '-f', 'existing.txt'],
+            ['apply', '--meta', '-f', 'existing.txt'],
+            ['clean', '--meta', '-f', 'existing.txt'],
+            ['migrate', '--meta', '--from', 'source', '-f', 'existing.txt'],
+            ['path', '--meta', '-f', 'notes.md'],
+            ['open', '--meta', '-f', 'notes.md'],
+        ]
+        for argv in commands:
+            with self.subTest(argv=argv):
+                self.assertTrue(parser.parse_args(argv).meta)
+        with patch('sys.stderr'), self.assertRaises(SystemExit):
+            parser.parse_args(['set', '--meta'])
+
+    def test_summary_view_is_separate_from_writing(self):
+        self.propose()
+        self.propose(rel='other.txt')
+        self.run_cli('summarize', ok=False)
+        self.run_cli('--json', ok=False)
+        self.run_cli('--summary', '--sessions', ok=False)
+        self.assertFalse((self.root / 'session-a/summaries.json').exists())
+        message = 'Handle empty input without raising an error. ' * 4
+        self.run_cli('summarize', '-f', 'existing.txt', '-m', message,
+                     '--session-message', 'Tolerate empty values across the proposal.')
+        plain = self.run_cli('--summary').stdout
+        self.assertLess(plain.index('Tolerate empty values'), plain.index('existing.txt'))
+        self.assertLess(plain.index('existing.txt'), plain.index('Handle empty input'))
+        self.assertIn('\n\n', plain)
+        self.assertIn('other.txt', plain)
+        self.assertIn('(no summary yet)', plain)
+        self.assertNotIn('\x1b[', plain)
+        colored = self.run_cli('--summary', env=dict(self.env, FORCE_COLOR='1', COLUMNS='48')).stdout
+        self.assertIn('\x1b[', colored)
+        body = colored[colored.index('Handle empty input'):]
+        first = body.split('\n', 1)[0]
+        self.assertLess(len(first), len(message.strip()))
+        self.assertIn('\n\n', body)
+        self.run_cli('--summary', 'existing.txt', ok=False)
+        one = self.run_cli('--summary', '-f', 'existing.txt').stdout
+        self.assertIn('existing.txt', one)
+        self.assertNotIn('other.txt', one)
+        self.assertNotIn('Tolerate empty values', one)
+        selected = json.loads(self.run_cli('--summary', '-f', 'exist', '--json').stdout)
+        self.assertEqual(selected['path'], 'existing.txt')
+        self.assertTrue(selected['summary'].startswith('Handle empty input'))
+        self.assertIn('session', selected)
+
+    def test_summary_and_overview_separate_status_groups(self):
+        (self.repo / 'second.txt').write_text('original\n')
+        self.git('add', 'second.txt')
+        self.git('commit', '-qm', 'add second')
+        self.propose()
+        self.propose(rel='second.txt', text='changed\n')
+        self.propose(rel='fresh.txt', text='new\n')
+        self.run_cli('summarize', '-m', 'Group related proposals.')
+        plain = self.run_cli('--summary').stdout
+        self.assertLess(plain.index('Group related proposals.'), plain.index('fresh.txt'))
+        self.assertLess(plain.index('fresh.txt'), plain.index('existing.txt'))
+        self.assertLess(plain.index('existing.txt'), plain.index('second.txt'))
+        self.assertIn('[NEW FILE ] fresh.txt\n    (no summary yet)\n\n\n[MODIFIED ] existing.txt', plain)
+        self.assertIn('[MODIFIED ] existing.txt\n    (no summary yet)\n\n[MODIFIED ] second.txt', plain)
+        self.assertNotIn('[MODIFIED ] existing.txt\n    (no summary yet)\n\n\n[MODIFIED ] second.txt', plain)
+        overview = self.run_cli().stdout
+        self.assertIn('[NEW FILE ] fresh.txt\n\n  [MODIFIED ] existing.txt\n  [MODIFIED ] second.txt', overview)
+        verbose = self.run_cli('-v').stdout
+        self.assertIn('(no summary yet)\n    Staged:', verbose)
+        self.assertNotIn('(no summary yet)\n\n    Staged:', verbose)
+        self.assertRegex(verbose, r'Size: \d+ bytes; modified: .+\n\n\n  \[MODIFIED \]')
+
+    def test_meta_file_commands_edit_session_notes_only(self):
+        import hashlib
+        self.propose()
+        notes = 'Session notes\nwith two lines\n'
+        created = json.loads(self.file_api('create', '--meta', '-f', 'staged_changes.md', '--text', notes, '--json').stdout)
+        dashboard = self.root / 'session-a/staged_changes.md'
+        self.assertTrue(created['meta'])
+        self.assertEqual(dashboard.read_text(), notes)
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
+        self.assertEqual((self.root / 'session-a/staging/existing.txt').read_text(), 'proposed\n')
+        self.assertFalse((self.root / 'session-a/staging/staged_changes.md').exists())
+        read = json.loads(self.file_api('read', '--meta', '-f', 'staged_changes.md', '--json').stdout)
+        self.assertEqual(read['source'], 'meta')
+        self.assertEqual(read['content'], notes)
+        self.file_api('write', '--meta', '-f', 'staged_changes.md', '--append', '--text', 'more\n')
+        self.assertEqual(dashboard.read_text(), notes + 'more\n')
+        copied = json.loads(self.file_api('copy', '--meta', '-f', 'staged_changes.md', '--to', 'copy.md', '--json').stdout)
+        self.assertEqual(copied['source_root'], 'meta')
+        self.assertEqual((self.root / 'session-a/copy.md').read_text(), dashboard.read_text())
+        self.file_api('copy', '--meta', '-f', 'staged_changes.md', ok=False)
+        self.file_api('rename', '--meta', '-f', 'copy.md', '--to', 'review.md')
+        self.assertFalse((self.root / 'session-a/copy.md').exists())
+        self.assertTrue((self.root / 'session-a/review.md').is_file())
+        removed = json.loads(self.file_api('delete', '--meta', '-f', 'review.md', '--json').stdout)
+        self.assertEqual(removed['mode'], 'meta')
+        self.assertFalse((self.root / 'session-a/review.md').exists())
+        managed = self.root / 'session-a/summaries.json'
+        managed.write_text('{}\n')
+        before = managed.read_bytes()
+        for args in [('write', '--meta', '-f', 'summaries.json', '--text', 'nope'),
+                     ('write', '--meta', '-f', 'Summaries.json', '--text', 'nope'),
+                     ('create', '--meta', '-f', 'session.json', '--text', '{}'),
+                     ('delete', '--meta', '-f', 'renames.json'),
+                     ('create', '--meta', '-f', 'nested/notes.md', '--text', 'x'),
+                     ('write', '--meta', '--from-workspace', '-f', 'staged_changes.md', '--text', 'x'),
+                     ('read', '--meta', '--workspace', '-f', 'staged_changes.md')]:
+            self.file_api(*args, ok=False)
+        self.assertEqual(managed.read_bytes(), before)
+        self.assertEqual(dashboard.read_text(), notes + 'more\n')
+        listed = self.run_cli('--complete-meta').stdout.splitlines()
+        self.assertIn('staged_changes.md', listed)
+        self.assertIn('diff_viewer.md', listed)
+        self.assertNotIn('existing.txt', listed)
+        path = self.run_cli('path', '--meta', '-f', 'diff_viewer.md').stdout.strip()
+        self.assertEqual(path, str(self.root / 'session-a/diff_viewer.md'))
+        self.assertFalse((self.root / 'session-a/diff_viewer.md').exists())
+        digest = hashlib.sha256(dashboard.read_bytes()).hexdigest()
+        self.assertEqual(json.loads(self.file_api('read', '--meta', '-f', 'staged_changes.md', '--json').stdout)['sha256'], digest)
 
     def test_read_exact_byte_ranges_and_binary_json(self):
         import base64
@@ -1048,6 +1186,7 @@ class CLI(unittest.TestCase):
     def test_shell_completion_public_options_and_session_values(self):
         self.init('session-a')
         self.init('session-b')
+        self.propose(key='session-b')
         env = dict(self.env, PATH=str(SCRIPT.parent) + os.pathsep + self.env['PATH'])
         scripts = {
             'bash': ('staged.bash', r'''source "$1"
@@ -1071,13 +1210,22 @@ source "$completion_file"
 '''),
         }
         cases = [
-            ([''], ['--session', '--sessions', '--all-repos', '--verbose'], ['--file']),
-            (['read', ''], ['--start-line', '--end-line', '--offset', '--length', '--workspace', '--json'], ['--text']),
-            (['write', ''], ['--stdin', '--text', '--from-workspace', '--delete-count', '--expect-sha256'], ['--workspace']),
-            (['create', ''], ['--text', '--stdin', '--json'], ['--workspace', '--to']),
-            (['copy', ''], ['--workspace', '--to', '--json'], ['--text']),
-            (['rename', ''], ['--to', '--file', '--json'], ['--workspace']),
-            (['delete', ''], ['--workspace', '--file', '--json'], ['--to']),
+            ([''], ['--session', '--sessions', '--all-repos', '--verbose', '--summary', '--file'], []),
+            (['--summary', '-f', 'exist'], ['existing.txt'], ['session-a', 'session-b']),
+            (['--summary', '--meta', '-f', 'exist'], ['existing.txt'], ['staged_changes.md']),
+            (['read', '-f', 'exist'], ['existing.txt'], ['staged_changes.md', 'session.json']),
+            (['read', '--meta', '-f', ''], ['session.json', 'staged_changes.md'], ['existing.txt']),
+            (['write', '--meta', '-f', ''], ['staged_changes.md'], ['session.json', 'existing.txt']),
+            (['write', '--meta', ''], ['--file', '--text'], ['--from-workspace']),
+            (['read', '--workspace', ''], ['--file', '--length'], ['--meta']),
+            (['rename', '--meta', '--to', 'staged'], ['staged_changes.md'], ['session-a', 'session.json']),
+            (['diff', '--meta', '-f', 'exist'], ['existing.txt'], ['staged_changes.md']),
+            (['read', ''], ['--start-line', '--end-line', '--offset', '--length', '--workspace', '--json', '--meta'], ['--text']),
+            (['write', ''], ['--stdin', '--text', '--from-workspace', '--delete-count', '--expect-sha256', '--meta'], ['--workspace']),
+            (['create', ''], ['--text', '--stdin', '--json', '--meta'], ['--workspace', '--to']),
+            (['copy', ''], ['--workspace', '--to', '--json', '--meta'], ['--text']),
+            (['rename', ''], ['--to', '--file', '--json', '--meta'], ['--workspace']),
+            (['delete', ''], ['--workspace', '--file', '--json', '--meta'], ['--to']),
             (['copy', '-f', 'existing.txt', '--to', ''], [], ['session-a', 'session-b']),
             (['rename', '-f', 'existing.txt', '--to', ''], [], ['session-a', 'session-b']),
             (['migrate', '--from', 'session-a', '--to', ''], ['session-a', 'session-b'], ['--all']),

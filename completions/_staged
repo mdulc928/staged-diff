@@ -1,18 +1,17 @@
 #compdef staged
 _staged() {
   local -a candidates
-  local file_helper=--list
-  if (( ${words[(Ie)open]} )); then
-    file_helper=--complete-open
-    if (( ${words[(Ie)--meta]} )); then file_helper=--complete-meta; fi
-  fi
   case "${words[CURRENT-1]}" in
     --tool|-t) candidates=("${(@f)$(command staged --complete-tools 2>/dev/null)}") ;;
     --session|--from|--between|--compare-session|--default-session)
       candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}") ;;
     --to)
       if (( ${words[(Ie)copy]} || ${words[(Ie)rename]} )); then
-        candidates=()
+        if (( ${words[(Ie)--meta]} )); then
+          candidates=("${(@f)$(command staged --complete-files "${(@)words[2,CURRENT-1]}" 2>/dev/null)}")
+        else
+          candidates=()
+        fi
       else
         candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}")
       fi ;;
@@ -27,7 +26,7 @@ _staged() {
       fi ;;
     --branch-protection) candidates=(true false) ;;
     --file|-f)
-      candidates=("${(@f)$(command staged "$file_helper" 2>/dev/null)}")
+      candidates=("${(@f)$(command staged --complete-files "${(@)words[2,CURRENT-1]}" 2>/dev/null)}")
       local candidate query="${words[CURRENT]:l}"
       local -a matches=()
       for candidate in "${candidates[@]}"; do

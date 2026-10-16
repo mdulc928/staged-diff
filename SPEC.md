@@ -134,13 +134,14 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 | `staged --list`          | File List                | Print proposed file paths, one per line                                     |
 | `staged --help-all`      | Full Help                | Show every command and public option                                        |
 | `staged -R`              | Global List              | List all sessions across all configured workspaces and roots                |
-| `read -f <path>` | Read File | Read exact byte or line ranges; `--workspace` selects originals |
-| `write -f <path>` | Write File | Replace, insert, or append contents inside staging only |
-| `create -f <path>` | Create File | Create an empty or populated staged file without replacement |
-| `copy -f <source> [--workspace] [--to <path>]` | Copy File | Read staged/workspace contents and create a staged copy |
-| `rename -f <source> --to <path>` | Rename File | Move a staged file and preserve its origin and summary |
-| `delete -f <path> [--workspace]` | Delete Proposal | Discard a proposal by default; with `--workspace`, record deletion for later apply |
-| `summarize [-f <path>] [-m <message>]` | Summaries | Read or update concise session or exact-path file summaries |
+| `read -f <path> [--meta]` | Read File | Read exact byte or line ranges; `--workspace` selects originals; `--meta` selects a session file |
+| `write -f <path> [--meta]` | Write File | Replace, insert, or append contents inside staging, or in a session metadata file with `--meta` |
+| `create -f <path> [--meta]` | Create File | Create an empty or populated staged file, or a new session metadata file with `--meta`, without replacement |
+| `copy -f <source> [--workspace] [--to <path>] [--meta]` | Copy File | Copy staged, workspace, or metadata contents to a new destination |
+| `rename -f <source> --to <path> [--meta]` | Rename File | Move a staged file and preserve its origin and summary, or rename a metadata file with `--meta` |
+| `delete -f <path> [--workspace] [--meta]` | Delete Proposal | Discard a proposal by default; with `--workspace`, record deletion for later apply; with `--meta`, delete a metadata file |
+| `summarize [-f <path>] [-m <message>]` | Write Summaries | Update concise session or exact-path file summaries |
+| `staged --summary [-f <path>]` | Read Summaries | Print the session summary and file summaries, or one file selected with `-f` |
 | `diff -v`, `diff --verbose` | Verbose Review | Show session and file summaries in the overview or before selected diffs |
 | `init [id]`              | Initialize               | Create or reuse session; bind to active shell                               |
 | `diff -f <f>`            | File Diff                | Open visual diff in configured editor                                       |
@@ -150,7 +151,7 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 | `diff -f <f> -c`         | File Discard             | Discard single staged file instead of opening diff                          |
 | `diff --all -c`          | Bulk Discard             | Discard all staged files in session                                         |
 | `apply -f <f> \| --all`  | Explicit Apply           | Copy staged files to workspace (requires `-f` or `--all`)                   |
-| `path [-s\|-w] -f <f>`   | Print Path               | Print raw absolute path (`-s` staged, `-w` workspace)                       |
+| `path [-s\|-w\|--meta] -f <f>`   | Print Path               | Print raw absolute path (`-s` staged, `-w` workspace, `--meta` session file) |
 | `open [--meta] -f <f>`   | Open File                | Open staged file (or session root metadata with `--meta`)                   |
 | `clean -f <f> \| --all`  | Discard Changes          | Discard staged changes; prompts unless `-y` is passed                       |
 | `clean --session [<id>]` | Delete Session           | Remove session folder from disk and clear shell bindings                    |
@@ -168,6 +169,7 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 ### Selection Rules
 
 - **Strict Flags**: File operations require `-f <file>` / `--file <file>`. Bulk operations require `--all`. Session deletion requires `--session [<id>]`.
+- **Uniform Metadata Flag**: Every interface that accepts `-f` also accepts `--meta`. Commands that operate on session files (`read`, `write`, `create`, `copy`, `rename`, `delete`, `path`, and `open`) switch `-f` and `--to` to the metadata namespace. Proposal-only commands (`--summary`, `summarize`, `diff`, `apply`, `clean`, and `migrate`) accept but ignore `--meta`; their behavior and completions remain proposal-based.
 - **Positional Rejection**: Positional filenames and positional `all` are rejected.
 - **Combined Flags**: `-ac`, `-ca`, `-a -c`, and `-c -a` apply first, then clean. Clean runs only if apply succeeds.
 - **Path Flag Scope**: In `staged path`, `-s` denotes `--staged`. Session overrides require `--session <id>`.
@@ -176,7 +178,7 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 
 ### File Access Contract
 
-- **Scope**: Exact normalized relative paths. Reads select staging or workspace; writes select staging only. Symlinks, reparse points, special files, traversal, and Git metadata are rejected.
+- **Scope**: Exact normalized relative paths. Reads select staging or workspace; writes select staging only. `--meta` selects a top-level file beside `staging/` for read, write, create, copy, rename, delete, path, and open. Symlinks, reparse points, special files, traversal, and Git metadata are rejected.
 - **Ranges**: Zero-based bytes or one-based inclusive lines. Modes cannot be mixed. Invalid write ranges fail without replacing the target.
 - **Write Modes**: No range replaces the file. `--offset` inserts unless `--delete-count` is supplied. `--start-line` inserts unless `--end-line` is supplied. `--append` writes at EOF.
 - **Input**: Explicit `--text` (UTF-8) or `--stdin` (bytes). Newlines are preserved, never synthesized; lines are LF-delimited.
@@ -196,15 +198,16 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 - **Delete**: Without `--workspace`, discard the exact staged proposal or cancel a pending deletion, remove its manifest entry and file summary, and clear the session summary if no proposals remain. With `--workspace`, require an existing regular workspace file, discard any staged replacement, and record its path in `_deletions` for later apply. Never unlink the workspace file in this command. Reject overlaps with pending renames. Summarize deletion proposals afterward; revise the session summary after discarding a proposal.
 - **Validation**: Reject traversal, symlinks/reparse points, special files, staging inside the workspace, and relevant malformed metadata before mutation. Create/copy publish completed files using hard links without overwriting existing destinations; rename uses link/unlink to avoid clobbering a destination. The staging filesystem must support hard links. Atomicity does not extend across file and metadata updates, and concurrent edits to one session are unsupported.
 - **Output**: JSON contains `operation` and `path`; create/copy/rename include `size` and `sha256`; copy/rename also include `source` and `source_root` (`staged` or `workspace`). Delete includes `mode` (`discard` or `propose`). Commands emit no setup prompts.
+- **Session metadata**: `--meta` on `read`, `write`, `create`, `copy`, `rename`, `delete`, and `path` addresses one basename in the session directory, never a path inside `staging/` and never a dotfile. `write --meta` creates a missing file. `create`, `copy`, and `rename` refuse an existing destination; `copy --meta` requires `--to`. `--meta` cannot be combined with `--workspace` or `--from-workspace`. Writes to `session.json`, `renames.json`, and `summaries.json` are rejected, including case variants; read them with `read --meta` or the summary commands. JSON results include `"meta": true`. Delete mode is `meta`. Copy and rename report `source_root: "meta"`. `path --meta` prints the absolute path even when the file does not exist yet. Apply never copies these files into the workspace.
 
 ---
 
 ### Summary Contract
 
 - **Storage**: Optional `summaries.json` beside `staging/`, with `{"session": "...", "files": {"relative/path": "..."}}`. Missing fields default to an empty string/object. Session and file summaries must be strings; paths follow the same normalized, symlink-free relative-path rules as proposals. Malformed metadata is reported rather than silently replaced. Unrelated keys and file entries survive updates.
-- **Editing**: `staged summarize -m <message>` updates the session; `staged summarize -f <path> -m <message>` updates a file. `--message` aliases `-m`; `--stdin` reads UTF-8 text and rejects invalid bytes without changing metadata; `--clear` or empty text clears the selected summary. `-f` must name an existing proposal exactly, including rename destinations and deletion originals. `--summary <message>` may accompany a file update to replace both summaries in one atomic metadata write. No cross-process locking guarantee.
-- **Reading**: With no update flags, print the session summary and selected file summaries. `--json` returns the entire summaries object, including after an update. Reading missing metadata does not create it.
-- **Display**: `--sessions` and `-R` always show session summaries. `diff -v` / `--verbose` shows session and per-file summaries, including with `-f` or `--all`; cross-session comparisons label both sides. Normal diffs remain unchanged. Missing or blank summaries display `(no summary yet)`. Completion remains machine-readable.
+- **Editing**: `staged summarize -m <message>` updates the session; `staged summarize -f <path> -m <message>` updates a file. `--message` aliases `-m`; `--stdin` reads UTF-8 text and rejects invalid bytes without changing metadata; `--clear` or empty text clears the selected summary. One of `--message`, `--stdin`, or `--clear` is required. `-f` must name an existing proposal exactly, including rename destinations and deletion originals. `--session-message <message>` may accompany a file update to replace both summaries in one atomic metadata write. No cross-process locking guarantee.
+- **Reading**: `staged --summary` prints the session summary and every file summary. `staged --summary -f <path>` prints one file summary; the path is exact when it matches a proposal or stored summary, otherwise it uses the same matching rules as review. File and path selection always uses `-f` / `--file`, with shell completion; session metadata file access always additionally requires `--meta` on the command performing that access. `--json` returns the stored summaries object. With a file, `--json` returns `session`, `path`, and `summary`. Reading does not create `summaries.json`. `--summary` cannot be combined with a command or with `--sessions`, `-R`, or `--list`. A bare `--json` is not a listing.
+- **Display**: `staged --summary` prints the session summary, then file summaries grouped by status in this order: `MISSING`, `NEW FILE`, `MODIFIED`, `RENAMED`, `RELOCATED`, `DELETED`, `APPLIED`. Each summary is an indented, wrapped block in cyan, with a blank line after it, and a further blank line separates status groups. Empty summaries are dim. The overview lists those same groups with a blank line between the header and the files and between status groups. `staged -v` keeps each file's summary with its paths and leaves a blank line after the file, plus a further blank line between status groups. The session id, file paths, and status tokens are colored when color is enabled. `--sessions` and `-R` always show session summaries in the same wrapped style. `diff -v` / `--verbose` includes session and per-file summaries, including with `-f` or `--all`; cross-session comparisons label both sides. Normal diffs remain unchanged. Missing or blank summaries display `(no summary yet)`. Completion remains machine-readable. Color follows the terminal: it is on for a TTY, off when `NO_COLOR` is set, and forced when `FORCE_COLOR` is set.
 - **Lifecycle**: Apply retains summaries. Clean removes selected file summaries and clears the session summary when all changes are removed. Migration copies selected file summaries, removing replaced destination entries if the source has none. A full migration into an empty destination copies the session summary only when the destination has no summary; partial or merged migrations retain the destination summary for the author to revise.
 - **Agent Workflow**: Immediately after every file modification or rename/deletion manifest change, update the affected file summary and the session summary before any further modification. Summaries reflect the current cumulative proposal, generally in one sentence and at most three short sentences each; do not defer them to a batch at the end. Immediately revise session summaries after partial cleanup or migration. Sentence length guidance belongs to the skill; the CLI does not infer summaries or enforce sentence counts.
 
@@ -301,7 +304,7 @@ The bundled `SKILL.md` requires agents to:
 1. Initialize or reuse a staging session and record returned paths.
 2. Write complete proposal files to `staging/`, matching workspace-relative paths.
 3. Record file renames, relocations, and deletions in `renames.json`.
-4. Maintain `staged_changes.md` with session ID, origin branch, file links, and verification output.
+4. Maintain `staged_changes.md` with session ID, origin branch, file links, and verification output, using `write --meta` rather than a host file tool.
 5. Present the proposal and await explicit authorization before applying.
 6. Run tests or formatters against an isolated copy during staging, or in the workspace only after authorization.
 
@@ -309,7 +312,7 @@ The bundled `SKILL.md` requires agents to:
 
 ## 8. Shells, Operating Systems, and Distribution
 
-- **Completions**: Public options follow the CLI parser. Bash, Zsh, and PowerShell support session/tool IDs and case-insensitive substring completion on `-f`. In Zsh, the first Tab on an ambiguous file query lists matches while preserving the input; subsequent Tabs start menu selection and cycle through matches. Unique matches complete immediately.
+- **Completions**: Public options follow the CLI parser. Bash, Zsh, and PowerShell support session/tool IDs and case-insensitive substring completion on `-f`. When `--meta` is present, `-f` and `--to` complete session metadata names instead of proposal paths, and `--workspace` / `--from-workspace` are not offered. In Zsh, the first Tab on an ambiguous file query lists matches while preserving the input; subsequent Tabs start menu selection and cycle through matches. Unique matches complete immediately.
 - **Completion Setup**: Interactive `staged` and `init` offer missing completion setup once per shell. Bash/Zsh update startup files; PowerShell prints a profile loader.
 - **Launcher Setup**: On Windows, explicit `--shell powershell` offers `staged.cmd` once when no launcher is available. Installation requires acceptance or `install-launcher`; PATH is unchanged.
 - **Setup Prompts**: Remember declines. Skip help, machine output, CI, redirected streams, and `STAGED_NO_PROMPT=1`.

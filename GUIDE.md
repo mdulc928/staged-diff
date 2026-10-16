@@ -260,6 +260,13 @@ staged write -f notes.txt --append --text ' — revised'
 - **Conflict Check**: Pass `--expect-sha256 <hash>` from `read --json` to reject stale edits. This checks content; it does not lock other writers.
 - **Output**: Reads emit raw bytes. `--json` adds range information and the full-file SHA-256; non-UTF-8 slices use Base64 with `encoding: "base64"`.
 - **Preservation**: Edits preserve bytes outside the selected range, including CRLF. Line boundaries use LF; byte ranges can split UTF-8 characters.
+- **Session metadata**: Add `--meta` to read or write a top-level session file such as `staged_changes.md`. `write --meta` creates the file when it is absent. `--meta` cannot be combined with `--workspace` or `--from-workspace`, and it cannot modify `session.json`, `renames.json`, or `summaries.json`.
+- **Consistent selection**: Any command that accepts `-f` also accepts `--meta`. On metadata-capable commands it switches completion and file access to session metadata. On proposal-only commands (`--summary`, `summarize`, `diff`, `apply`, `clean`, and `migrate`) it is accepted as a no-op and `-f` continues to complete proposal paths.
+
+```bash
+staged write --meta -f staged_changes.md --text '# Session notes'
+staged read --meta -f staged_changes.md
+```
 
 The bundled skill teaches agents these commands. Approve the staging directory for writes and workspace reads in the host sandbox; command approval alone does not grant filesystem access. Session setup and review metadata also need access to the session directory and staged configuration. Limit agent command approvals to the intended subcommands: approving all of `staged` also permits commands such as `apply`.
 
@@ -278,9 +285,12 @@ staged copy -f src/example.py --to src/second.py      # Staging → staging
 staged rename -f src/example.py --to src/renamed.py
 staged delete -f src/second.py                       # Discard the staged proposal
 staged delete -f src/obsolete.py --workspace          # Propose a workspace deletion
+staged create --meta -f notes.md --text 'Review notes'
+staged rename --meta -f notes.md --to review.md
+staged delete --meta -f review.md
 ```
 
-These examples are alternatives. After each operation, agents update summaries before making another modification. All four commands accept `--json`; create accepts `--text` or `--stdin`, or creates an empty file when neither is provided. JSON results identify `operation` and `path`; create/copy/rename also return `size` and `sha256`, with `source` and `source_root` for copy/rename. Delete returns `mode: "discard"` or `"propose"`.
+These examples are alternatives. `--meta` keeps the same commands on session files beside `staging/`. `copy --meta` requires `--to`. Metadata destinations that already exist must be edited with `write --meta`. After each operation, agents update summaries before making another modification. All four commands accept `--json`; create accepts `--text` or `--stdin`, or creates an empty file when neither is provided. JSON results identify `operation` and `path`; create/copy/rename also return `size` and `sha256`, with `source` and `source_root` for copy/rename. Delete returns `mode: "discard"`, `"propose"`, or `"meta"`.
 
 All destinations are staged. `copy` reads from staging unless `--workspace` is present; `--to` defaults to the source's relative path. There is no staging-to-workspace copy option: use an explicitly authorized `apply` for workspace writes. Copies preserve bytes and permission bits, do not inherit rename mappings or summaries, and leave their source intact. `create` can stage a replacement for a real workspace file if that path is not already staged. To edit an existing proposal, use `write`.
 
@@ -297,15 +307,18 @@ Create, copy, and rename refuse staged destination collisions and pending-operat
 Immediately after each modification, update that file's summary and the session summary before making another edit. Summaries describe the cumulative proposal in one sentence when possible, with at most three short sentences each. Keep detailed review notes and validation in `staged_changes.md`.
 
 ```bash
-staged summarize -f src/example.py -m 'Handle empty input without raising an error.' --summary 'Make input handling tolerate empty values.'
+staged summarize -f src/example.py -m 'Handle empty input without raising an error.' --session-message 'Make input handling tolerate empty values.'
 staged summarize -m 'Make input handling tolerate empty values.'
-staged summarize --json                  # Read the complete summaries object
-staged summarize -f src/example.py      # Read this file and its session summary
 staged summarize -f src/example.py --stdin < summary.txt
 staged summarize -f src/example.py --clear
+staged --summary                         # Read every summary
+staged --summary -f src/example.py       # Read one file summary
+staged --summary --json                  # Read the stored summaries object
 ```
 
-`-m` is short for `--message`. Omit `-f` to update the session summary; use an exact relative path to update a file summary. For a rename, use the destination; for a deletion, use the original path. Pair a file update with `--summary` to update both atomically. `--message`, `--stdin`, and `--clear` are mutually exclusive. `--stdin` expects UTF-8 text on every platform; invalid bytes leave the summaries unchanged. Empty text clears the selected summary; a read without update flags does not create metadata. `--json` always returns the complete object, including after an update.
+`summarize` writes. `staged --summary` reads. `-m` is short for `--message`. Omit `-f` to update the session summary; use an exact relative path to update or read a file summary. For a rename, use the destination; for a deletion, use the original path. Pair a file update with `--session-message` to update both atomically. `--message`, `--stdin`, and `--clear` are mutually exclusive, and one of them is required. `--stdin` expects UTF-8 text on every platform; invalid bytes leave the summaries unchanged. Empty text clears the selected summary. Reading with `--summary` does not create metadata. `--json` after a write returns the complete object. `staged --summary --json` returns that same object; add `-f <path>` to return `session`, `path`, and `summary` for that file. File and path arguments consistently use `-f` / `--file` and support completion. Session metadata file access additionally requires `--meta`.
+
+`staged --summary` prints the session id, then the session summary, then each file with its status. Files are grouped by status (`MISSING`, `NEW FILE`, `MODIFIED`, `RENAMED`, `RELOCATED`, `DELETED`, `APPLIED`), with a blank line between groups. Each summary is indented and wrapped, with a blank line after it, so several summaries do not run together. Status tokens and paths are colored when the terminal supports color. The overview uses the same status groups, with a blank line between them.
 
 The CLI stores agent-authored summaries in `summaries.json` beside `staging/`, preserving unrelated entries:
 
@@ -668,6 +681,8 @@ _(After `path`, `-s` means `--staged`; use `--session <id>` for session selectio
 | `--sessions`        | List sessions for the current repository   |
 | `-R`, `--all-repos` | List sessions across repositories          |
 | `--list`            | Print proposed file paths, one per line    |
+| `--summary`         | Print session and file summaries; use `-f` for one file |
+| `--json`            | With `--summary`, print structured summaries |
 | `--help-all`        | Show the full command and option reference |
 
 ---
@@ -677,18 +692,18 @@ _(After `path`, `-s` means `--staged`; use `--session <id>` for session selectio
 | Command              | Key Options                                                          | Description                                                       |
 | -------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | `staged`             | `[-v]`, `[--sessions]`, `[-R]`                                       | Show overview of active session, workspace sessions, or all roots |
-| `read` | `-f <path>`, `[--workspace]`, `[--offset <n>]`, `[--length <n>]`, `[--start-line <n>]`, `[--end-line <n>]`, `[--json]` | Read exact file contents or ranges |
-| `write` | `-f <path>`, `(--text <text>\|--stdin)`, `[--offset <n>]`, `[--delete-count <n>]`, `[--start-line <n>]`, `[--end-line <n>]`, `[--append]`, `[--from-workspace]`, `[--expect-sha256 <hash>]`, `[--json]` | Write complete files or edit ranges inside staging |
-| `create` | `-f <path>`, `[--text <contents>\|--stdin]`, `[--json]` | Create a new staged file, refusing existing destinations |
-| `copy` | `-f <source>`, `[--workspace]`, `[--to <destination>]`, `[--json]` | Copy workspace or staged contents into staging |
-| `rename` | `-f <source>`, `--to <destination>`, `[--json]` | Move a staged proposal and its rename metadata |
-| `delete` | `-f <path>`, `[--workspace]`, `[--json]` | Discard a staged proposal, or propose deletion of a workspace file |
-| `summarize` | `[-f <path>]`, `[-m <message>\|--stdin\|--clear]`, `[--summary <message>]`, `[--json]` | Read or update session and file summaries |
+| `read` | `-f <path>`, `[--workspace\|--meta]`, `[--offset <n>]`, `[--length <n>]`, `[--start-line <n>]`, `[--end-line <n>]`, `[--json]` | Read exact file contents or ranges |
+| `write` | `-f <path>`, `(--text <text>\|--stdin)`, `[--meta]`, `[--offset <n>]`, `[--delete-count <n>]`, `[--start-line <n>]`, `[--end-line <n>]`, `[--append]`, `[--from-workspace]`, `[--expect-sha256 <hash>]`, `[--json]` | Write complete files or edit ranges inside staging or session metadata |
+| `create` | `-f <path>`, `[--meta]`, `[--text <contents>\|--stdin]`, `[--json]` | Create a new staged or metadata file, refusing existing destinations |
+| `copy` | `-f <source>`, `[--workspace\|--meta]`, `[--to <destination>]`, `[--json]` | Copy workspace, staged, or metadata contents |
+| `rename` | `-f <source>`, `--to <destination>`, `[--meta]`, `[--json]` | Move a staged proposal or a metadata file |
+| `delete` | `-f <path>`, `[--workspace\|--meta]`, `[--json]` | Discard a staged proposal, propose a workspace deletion, or delete metadata |
+| `summarize` | `[-f <path>]`, `(-m <message>\|--stdin\|--clear)`, `[--session-message <message>]`, `[--json]` | Write session and file summaries |
 | `init`               | `[id]`, `[--json]`, `[--root <p>]`                                   | Initialize or reuse a staging session                             |
 | `use`                | `--session <id>`, `--tool <id>`, `--clear`                           | Bind session or tool to current shell                             |
 | `diff`               | `-f <f>`, `--all`, `-a`, `-c`, `-ac`, `--between <a> <b>`            | Review or apply visual diffs in editor                            |
 | `apply`              | `-f <f>`, `--all`, `[--force]`, `[-y]`                               | Apply complete staged files to workspace                          |
-| `path`               | `[-s\|-w]`, `-f <f>`, `[--session <id>]`                             | Print raw absolute path without headers                           |
+| `path`               | `[-s\|-w\|--meta]`, `-f <f>`, `[--session <id>]`                     | Print raw absolute path without headers                           |
 | `open`               | `[--meta]`, `-f <f>`                                                 | Open staged file or session metadata in editor                    |
 | `clean`              | `-f <f>`, `--all`, `--session [<id>]`, `[-y]`                        | Discard staged files or delete session folder                     |
 | `migrate`            | `--from <id>`, `[--to <id>]`, `(-f <q>\|--all)`, `[--force]`         | Copy staged files and metadata between sessions                   |

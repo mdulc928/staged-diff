@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import uuid
 
@@ -32,6 +33,7 @@ GLOBAL_STATE_FILE = CONFIG_DIR / 'state.json'
 DEFAULT_PROTECTED_BRANCHES = []
 STATUS_COLORS = {'APPLIED': '32', 'MODIFIED': '33', 'NEW FILE': '36', 'RENAMED': '35',
                  'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
+STATUS_ORDER = ('MISSING', 'NEW FILE', 'MODIFIED', 'RENAMED', 'RELOCATED', 'DELETED', 'APPLIED')
 COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'init', 'diff', 'apply', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
 
 
@@ -42,6 +44,9 @@ def is_reserved_windows_name(name):
     if hasattr(ntpath, 'isreserved'):
         return ntpath.isreserved(name)
     return PureWindowsPath(name).is_reserved()
+MANAGED_METADATA = ('session.json', 'renames.json', 'summaries.json')
+SUGGESTED_METADATA = ('staged_changes.md', 'diff_viewer.md')
+META_FILE_COMMANDS = ('read', 'write', 'create', 'copy', 'rename', 'delete', 'path', 'open')
 COMPLETION_MARKER_START = '# >>> staged completions >>>'
 COMPLETION_MARKER_END = '# <<< staged completions <<<'
 
@@ -633,7 +638,32 @@ def summary_text(value):
 
 
 def show_session_summary(session, summaries):
-    print('Session summary ({}): {}'.format(session.id, summary_text(summaries['session'])), flush=True)
+    print('{} {}'.format(color('Session', '1'), color(session.id, '1;36')), flush=True)
+    show_summary_text(summaries['session'])
+
+
+def show_summary_text(value, indent='    ', separate=True):
+    print(wrapped_summary(value, indent), flush=True)
+    if separate:
+        print(flush=True)
+
+
+def status_sort_key(status):
+    try:
+        return STATUS_ORDER.index(status)
+    except ValueError:
+        return len(STATUS_ORDER)
+
+
+def grouped_by_status(session, paths, proposed=None):
+    """Order paths by status group, then path, for human-readable listings."""
+    known = None if proposed is None else set(proposed)
+    rows = []
+    for rel in paths:
+        status = session.status(rel) if known is None or rel in known else None
+        rows.append((status_sort_key(status), rel, status))
+    rows.sort(key=lambda item: (item[0], item[1]))
+    return [(status, rel) for _, rel, status in rows]
 
 
 def update_summary(session, args):
@@ -642,8 +672,10 @@ def update_summary(session, args):
         safe_path(session.staging, args.file)
         if args.file not in session.paths(fresh=True):
             raise StagedError('No staged change at exact path: ' + args.file)
-    if args.summary is not None and (args.file is None or not (args.message is not None or args.stdin or args.clear)):
-        raise StagedError('--summary requires a file summary update with --file and --message, --stdin or --clear.')
+    if not (args.message is not None or args.stdin or args.clear):
+        raise StagedError('Nothing to write; pass --message, --stdin or --clear. View summaries with staged --summary.')
+    if args.session_message is not None and args.file is None:
+        raise StagedError('--session-message requires a file summary update with --file.')
     value = args.message
     if args.stdin:
         if sys.stdin.isatty():
@@ -652,27 +684,57 @@ def update_summary(session, args):
             value = sys.stdin.buffer.read().decode('utf-8')
         except UnicodeDecodeError as exc:
             raise StagedError('Summary input must be UTF-8: {}'.format(exc))
-    changed = value is not None or args.clear
-    if changed:
-        value = '' if args.clear else value.strip()
-        if args.file is None:
-            summaries['session'] = value
-        elif value:
-            summaries['files'][args.file] = value
-        else:
-            summaries['files'].pop(args.file, None)
-        if args.summary is not None:
-            summaries['session'] = args.summary.strip()
-        session.save_summaries(summaries)
+    value = '' if args.clear else value.strip()
+    if args.file is None:
+        summaries['session'] = value
+    elif value:
+        summaries['files'][args.file] = value
+    else:
+        summaries['files'].pop(args.file, None)
+    if args.session_message is not None:
+        summaries['session'] = args.session_message.strip()
+    session.save_summaries(summaries)
     if args.json:
         print(json.dumps(summaries))
-    elif changed:
-        print('Updated summary: ' + (args.file or session.id))
     else:
+        print('Updated summary: ' + (args.file or session.id))
+
+
+def wrapped_summary(value, indent='    '):
+    text = summary_text(value)
+    if not value.strip():
+        return color(indent + text, '2')
+    width = max(40, min(100, shutil.get_terminal_size((100, 24)).columns) - len(indent))
+    lines = textwrap.wrap(text, width) or [text]
+    return color('\n'.join(indent + line for line in lines), '36')
+
+
+def show_summaries(session, target, as_json=False):
+    summaries = session.summaries()
+    proposed = session.paths()
+    paths = proposed
+    if target is not None:
+        if target not in proposed and target not in summaries['files']:
+            target = match_file(target, proposed)
+        paths = [target]
+    if as_json:
+        if target is None:
+            print(json.dumps(summaries))
+        else:
+            print(json.dumps({'session': summaries['session'], 'path': target,
+                              'summary': summaries['files'].get(target, '')}))
+        return
+    if target is None:
         show_session_summary(session, summaries)
-        paths = [args.file] if args.file is not None else session.paths()
-        for rel in paths:
-            print('  {}: {}'.format(rel, summary_text(summaries['files'].get(rel, ''))))
+        if not paths:
+            print(color('No staged changes yet.', '2'))
+    previous = None
+    for status, rel in grouped_by_status(session, paths, proposed):
+        if previous is not None and status != previous:
+            print(flush=True)
+        previous = status
+        print('{} {}'.format(status_token(status, width=9) if status else '', color(rel, '1')).strip())
+        show_summary_text(summaries['files'].get(rel, ''))
 
 
 def overview(ctx, session):
@@ -689,16 +751,23 @@ def overview(ctx, session):
     paths = session.paths()
     if not paths:
         print('No staged changes yet.')
-    for rel in paths:
-        status = session.status(rel)
+    previous = None
+    for status, rel in grouped_by_status(session, paths):
+        if previous is None:
+            if summaries is None:
+                print(flush=True)
+        elif status != previous:
+            print(flush=True)
+        previous = status
         print('  {} {}'.format(status_token(status, width=9), rel))
         if ctx.args.verbose:
-            print('    Summary: {}'.format(summary_text(summaries['files'].get(rel, ''))))
+            show_summary_text(summaries['files'].get(rel, ''), separate=False)
             path = safe_path(session.staging, rel)
             print('    Staged:    {}'.format(path if path.exists() else '(deletion)'))
             print('    Workspace: {}'.format(session.original(rel)))
             if path.exists():
                 print('    Size: {} bytes; modified: {}'.format(path.stat().st_size, time.ctime(path.stat().st_mtime)))
+            print(flush=True)
     session.refresh_index()
 
 
@@ -722,8 +791,24 @@ def review(ctx, session, target):
         right = empty if rel in session.deletions else proposed
         print('Review {}: {}'.format(status_token(session.status(rel)), rel), flush=True)
         if summaries is not None:
-            print('  Summary: {}'.format(summary_text(summaries['files'].get(rel, ''))), flush=True)
+            show_summary_text(summaries['files'].get(rel, ''))
         run_editor(tool.get_diff_command(left, right), terminal)
+
+
+META_ALIASES = {
+    'staging': 'staged_changes.md',
+    'staging.md': 'staged_changes.md',
+    'staged': 'staged_changes.md',
+    'staged.md': 'staged_changes.md',
+    'diff': 'diff_viewer.md',
+    'diff.md': 'diff_viewer.md',
+}
+
+
+def resolve_meta_alias(target, paths):
+    if target not in paths and target.lower() in META_ALIASES and META_ALIASES[target.lower()] in paths:
+        return META_ALIASES[target.lower()]
+    return target
 
 
 def open_file(ctx, session, target):
@@ -731,18 +816,7 @@ def open_file(ctx, session, target):
     paths = session.openable_paths(fresh=True, meta=meta)
     if not paths:
         raise StagedError('No {} files to open.'.format('metadata' if meta else 'staged'))
-    aliases = {
-        'staging': 'staged_changes.md',
-        'staging.md': 'staged_changes.md',
-        'staged': 'staged_changes.md',
-        'staged.md': 'staged_changes.md',
-        'diff': 'diff_viewer.md',
-        'diff.md': 'diff_viewer.md',
-    }
-    resolved_query = target
-    if meta and target not in paths and target.lower() in aliases and aliases[target.lower()] in paths:
-        resolved_query = aliases[target.lower()]
-    rel = match_file(resolved_query, paths)
+    rel = match_file(resolve_meta_alias(target, paths) if meta else target, paths)
     path = safe_path(session.directory if meta else session.staging, rel)
     if not path.is_file():
         raise StagedError('File does not exist: ' + str(path))
@@ -897,7 +971,8 @@ def cross_diff(ctx):
         show_session_summary(session, data)
     for rel in paths:
         for session, data in summaries:
-            print('  {} [{}]: {}'.format(rel, session.id, summary_text(data['files'].get(rel, ''))), flush=True)
+            print('  {} {}'.format(color(rel, '1'), color('[' + session.id + ']', '36')), flush=True)
+            show_summary_text(data['files'].get(rel, ''))
         run_editor(tool.get_diff_command(safe_path(left.staging, rel), safe_path(right.staging, rel)),
                    tool.id in ('cli', 'codex', 'claudecode'))
 
@@ -1091,9 +1166,18 @@ def file_version(path):
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def range_path(session, relative, workspace=False):
+def range_path(session, relative, workspace=False, meta=False, writable=False):
     # File APIs deliberately use exact paths rather than interactive fuzzy matching.
-    root = session.workspace if workspace else session.staging
+    root = session.workspace if workspace else session.directory if meta else session.staging
+    if meta:
+        # Basenames only, so a metadata write cannot reach staging/ or dotfiles
+        # such as .workspace. Match managed names case-insensitively so Windows
+        # cannot clobber session.json through a different spelling.
+        lowered = relative.lower()
+        if '/' in relative or relative.startswith('.') or lowered == 'staging':
+            raise StagedError('Metadata files are top-level session files beside staging/: ' + relative)
+        if writable and lowered in {name.lower() for name in MANAGED_METADATA}:
+            raise StagedError('{} is managed by staged; use summarize, rename or delete instead.'.format(relative))
     if not workspace:
         try:
             root.resolve().relative_to(session.workspace.resolve())
@@ -1164,6 +1248,70 @@ def delete_file(session, args):
                           'mode': 'propose' if args.workspace else 'discard'}))
     else:
         print(('Proposed workspace deletion: ' if args.workspace else 'Discarded staged proposal: ') + args.file)
+
+
+def meta_operation(session, args):
+    # Session notes such as staged_changes.md live beside staging/; they never
+    # affect proposals, renames.json or summaries.json.
+    command = args.command
+    if command == 'delete':
+        target = range_path(session, args.file, meta=True, writable=True)
+        if not target.is_file():
+            raise StagedError('Metadata file does not exist: ' + args.file)
+        target.unlink()
+        if args.json:
+            print(json.dumps({'operation': 'delete', 'path': args.file, 'mode': 'meta'}))
+        else:
+            print('Deleted metadata file: ' + args.file)
+        return
+    source = None
+    if command != 'create':
+        source = range_path(session, args.file, meta=True, writable=command == 'rename')
+        if not source.is_file():
+            raise StagedError('Metadata file does not exist: ' + args.file)
+    if command == 'copy' and not args.to:
+        raise StagedError('copy --meta requires --to.')
+    destination = args.file if command == 'create' else args.to or args.file
+    target = range_path(session, destination, meta=True, writable=True)
+    if source is not None and source == target:
+        raise StagedError('Source and destination must differ.')
+    if target.exists():
+        raise StagedError('Metadata file already exists; use write to edit it: ' + destination)
+    if command == 'create' and args.stdin and sys.stdin.isatty():
+        raise StagedError('--stdin requires piped or redirected input; use --text for inline content.')
+    if command == 'rename':
+        os.link(source, target)
+        try:
+            source.unlink()
+        except OSError:
+            target.unlink()
+            raise
+    else:
+        descriptor, temporary = tempfile.mkstemp(prefix='.staged-file-', dir=str(target.parent))
+        try:
+            with os.fdopen(descriptor, 'wb') as output:
+                if source is not None:
+                    with source.open('rb') as stream:
+                        shutil.copyfileobj(stream, output, 1024 * 1024)
+                elif args.stdin:
+                    shutil.copyfileobj(sys.stdin.buffer, output, 1024 * 1024)
+                else:
+                    output.write((args.text or '').encode('utf-8'))
+            if source is not None:
+                os.chmod(temporary, stat.S_IMODE(source.stat().st_mode))
+            os.link(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    if args.json:
+        with target.open('rb') as stream:
+            digest = content_hash(stream)
+        result = {'operation': command, 'path': destination, 'size': target.stat().st_size, 'sha256': digest, 'meta': True}
+        if source is not None:
+            result.update(source=args.file, source_root='meta')
+        print(json.dumps(result))
+    else:
+        print('{} metadata file: {}'.format({'create': 'Created', 'copy': 'Copied', 'rename': 'Renamed'}[command], destination))
 
 
 def file_operation(session, args):
@@ -1303,10 +1451,11 @@ def copy_bytes(source, target, count):
 
 
 def read_file_range(session, args):
-    path = range_path(session, args.file, args.workspace)
+    path = range_path(session, args.file, args.workspace, meta=args.meta)
     before = file_version(path)
     if before is None:
         raise StagedError('File does not exist: ' + args.file)
+    origin = 'workspace' if args.workspace else 'meta' if args.meta else 'staged'
     with path.open('rb') as stream:
         start, end, size = selected_range(stream, args)
         if args.json:
@@ -1319,7 +1468,7 @@ def read_file_range(session, args):
                 content, encoding = base64.b64encode(data).decode('ascii'), 'base64'
             if file_version(path) != before or len(data) != end - start:
                 raise StagedError('File changed while reading; retry the operation.')
-            print(json.dumps({'path': args.file, 'source': 'workspace' if args.workspace else 'staged',
+            print(json.dumps({'path': args.file, 'source': origin,
                               'offset': start, 'length': len(data), 'size': size, 'sha256': digest,
                               'encoding': encoding, 'content': content, 'next_offset': end, 'eof': end == size}))
         else:
@@ -1328,8 +1477,8 @@ def read_file_range(session, args):
 
 
 def write_file_range(session, args):
-    target = range_path(session, args.file)
-    if args.file in session.deletions:
+    target = range_path(session, args.file, meta=args.meta, writable=True)
+    if not args.meta and args.file in session.deletions:
         raise StagedError('File is marked for deletion; remove its deletion entry before writing.')
     before = file_version(target)
     source = target
@@ -1364,7 +1513,7 @@ def write_file_range(session, args):
             if mode is not None:
                 os.chmod(temporary, mode)
             # Catch changes during input collection as well as stale caller hashes.
-            range_path(session, args.file)
+            range_path(session, args.file, meta=args.meta, writable=True)
             if file_version(target) != before or file_version(source) != source_version:
                 raise StagedError('File changed while writing; read again before retrying.')
             # Close the source before replacing it, including on Windows.
@@ -1376,10 +1525,18 @@ def write_file_range(session, args):
     if args.json:
         with target.open('rb') as result:
             digest = content_hash(result)
-        print(json.dumps({'path': args.file, 'size': target.stat().st_size, 'sha256': digest,
-                          'created': before is None, 'from_workspace': args.from_workspace}))
+        result = {'path': args.file, 'size': target.stat().st_size, 'sha256': digest,
+                  'created': before is None, 'from_workspace': args.from_workspace}
+        if args.meta:
+            result['meta'] = True
+        print(json.dumps(result))
     else:
-        print('Wrote staged file: ' + args.file)
+        print('Wrote {} file: {}'.format('metadata' if args.meta else 'staged', args.file))
+
+
+def validate_meta_args(parser, args):
+    if args.meta and (getattr(args, 'workspace', False) or getattr(args, 'from_workspace', False)):
+        parser.error('--meta cannot be combined with --workspace or --from-workspace')
 
 
 def validate_file_range_args(parser, args):
@@ -1410,25 +1567,32 @@ def make_parser():
     parser = argparse.ArgumentParser(
         prog='staged', description=__doc__,
         epilog='Run staged <command> --help for command options, or staged --help-all for the full reference. '
-               'Use --sessions to list sessions; --session <id> selects one.')
-    parser.set_defaults(tool=None, session=None, root=None, verbose=False, clean_session=None, shell=None)
+               'Use --sessions to list sessions, --summary to read summaries, and --session <id> to select one.')
+    parser.set_defaults(tool=None, session=None, root=None, verbose=False, clean_session=None, shell=None, meta=False)
     globals_on(parser)
     parser.add_argument('-R', '--all-repos', action='store_true', help='list sessions across repositories')
     parser.add_argument('--help-all', action='store_true', help='show help for every command')
     parser.add_argument('--sessions', action='store_true', help='list sessions for this repository')
     parser.add_argument('--list', action='store_true', help='print proposed file paths, one per line')
+    parser.add_argument('--summary', action='store_true',
+                        help='show the session summary and file summaries; use -f to select one file')
+    parser.add_argument('-f', '--file', dest='summary_file', metavar='FILE',
+                        help='with --summary, show the summary for one proposed file')
+    parser.add_argument('--meta', action='store_true', default=argparse.SUPPRESS,
+                        help='accepted with -f for consistent syntax; summary selection remains proposal-based')
+    parser.add_argument('--json', dest='summary_json', action='store_true', help='with --summary, print structured summaries')
     for helper in ('--complete', '--complete-sessions', '--complete-tools', '--complete-open', '--complete-meta', '--complete-options'):
         parser.add_argument(helper, action='store_true', help=argparse.SUPPRESS)
     subs = parser.add_subparsers(dest='command')
     command_parsers = {}
     descriptions = {
-        'read': 'Read exact file ranges from staging or the workspace.',
-        'write': 'Write or splice file contents inside staging only.',
-        'create': 'Create a new staged file without replacing an existing proposal.',
-        'copy': 'Copy a staged or workspace file to a new staged destination.',
-        'rename': 'Rename a staged file and maintain its proposal metadata.',
-        'delete': 'Discard a staged proposal, or record a workspace deletion for later apply.',
-        'summarize': 'Read or update concise session and file change summaries.',
+        'read': 'Read exact file ranges from staging, the workspace, or session metadata.',
+        'write': 'Write or splice contents inside staging, or in session metadata with --meta.',
+        'create': 'Create a new staged file, or a session metadata file with --meta.',
+        'copy': 'Copy a staged, workspace, or metadata file to a new destination.',
+        'rename': 'Rename a staged file, or a session metadata file with --meta.',
+        'delete': 'Discard a staged proposal, record a workspace deletion, or delete metadata with --meta.',
+        'summarize': 'Write concise session and file change summaries (view them with staged --summary).',
         'init': 'Create an isolated session and record its workspace and branch.',
         'diff': 'Review proposed files, apply with -a, clean with -c, or apply then clean with -ac.',
         'apply': 'Apply proposed files, renames and deletions to the workspace.',
@@ -1491,12 +1655,12 @@ def make_parser():
     command_parsers['rename'].add_argument('--to', required=True, help='new staged destination path')
     p = command_parsers['summarize']
     p.add_argument('-f', '--file', help='exact proposed path; use rename destination or deleted original path')
-    payload = p.add_mutually_exclusive_group()
+    payload = p.add_mutually_exclusive_group(required=True)
     payload.add_argument('-m', '--message', help='summary text, usually one sentence and at most three')
     payload.add_argument('--stdin', action='store_true', help='read summary text from standard input')
     payload.add_argument('--clear', action='store_true', help='clear the selected session or file summary')
-    p.add_argument('--summary', help='update the session summary alongside a file summary')
-    p.add_argument('--json', action='store_true', help='print the complete structured summaries object')
+    p.add_argument('--session-message', help='also update the session summary alongside a file summary')
+    p.add_argument('--json', action='store_true', help='print the complete structured summaries object after writing')
     p = command_parsers['init']
     p.add_argument('id', nargs='?', help='conversation ID; generates a UUID when omitted')
     p.add_argument('--json', action='store_true', help='print machine-readable session paths')
@@ -1515,8 +1679,16 @@ def make_parser():
     group = p.add_mutually_exclusive_group()
     group.add_argument('-s', '--staged', action='store_true', help='print proposed-file path (default)')
     group.add_argument('-w', '--workspace', action='store_true', help='print the original workspace path')
-    p = command_parsers['open']
-    p.add_argument('--meta', action='store_true', help='open an editable session metadata file instead of a proposed file')
+    group.add_argument('--meta', action='store_true', default=argparse.SUPPRESS,
+                       help='print a session metadata file path (it need not exist yet)')
+    for name in ('read', 'write', 'create', 'copy', 'rename', 'delete', 'open'):
+        command_parsers[name].add_argument(
+            '--meta', action='store_true', default=argparse.SUPPRESS,
+            help='use a top-level session metadata file (e.g. staged_changes.md) instead of a proposal')
+    for name in ('summarize', 'diff', 'apply', 'clean', 'migrate'):
+        command_parsers[name].add_argument(
+            '--meta', action='store_true', default=argparse.SUPPRESS,
+            help='accepted with -f for consistent syntax; this command remains proposal-based')
     p = command_parsers['use']
     p.add_argument('id', nargs='?', help='session ID or unique prefix to bind to this shell')
     p.add_argument('--clear', action='store_true', help='clear current shell session and tool bindings')
@@ -1558,15 +1730,47 @@ def completion_options(words, parser, commands):
             continue
         if word == 'help':
             return list(commands)
-        if word in commands:
+        if word in commands and selected is parser:
             selected = commands[word]
-            break
-        action = parser._option_string_actions.get(word.split('=', 1)[0])
+            continue
+        lookup = selected if selected in commands.values() else parser
+        action = lookup._option_string_actions.get(word.split('=', 1)[0])
+        if action is None and selected is not parser:
+            action = parser._option_string_actions.get(word.split('=', 1)[0])
         if action and action.nargs != 0 and '=' not in word:
             remaining = 1
+    blocked = set()
+    if '--meta' in words:
+        blocked.update(('--workspace', '--from-workspace'))
+    if '--workspace' in words or '--from-workspace' in words:
+        blocked.add('--meta')
     options = [flag for action in selected._actions if action.help != argparse.SUPPRESS
-               for flag in action.option_strings]
+               for flag in action.option_strings if flag not in blocked]
     return (list(commands) if selected is parser else []) + options
+
+
+def completion_files(ctx, words):
+    """Return -f/--to candidates, using metadata names whenever --meta is present."""
+    command = next((word for word in words if word in COMMANDS), None)
+    session = ctx.active(notify=False)
+    if '--meta' not in words or command not in META_FILE_COMMANDS:
+        return session.openable_paths() if command == 'open' else session.paths()
+    existing = set(session.session_files())
+    managed = set(MANAGED_METADATA)
+    suggestions = set(SUGGESTED_METADATA)
+    if words and words[-1] == '--to':
+        return sorted(suggestions - existing - managed)
+    if command == 'create':
+        names = suggestions - existing - managed
+    elif command in ('delete', 'copy', 'rename'):
+        names = existing - managed
+    elif command == 'write':
+        names = (existing - managed) | suggestions
+    else:
+        names = existing | suggestions
+        if command in ('open', 'path'):
+            names.update(alias for alias, target in META_ALIASES.items() if target in existing)
+    return sorted(names)
 
 
 def completion_shell():
@@ -1986,6 +2190,13 @@ def main(argv=None):
     if argv[:1] == ['--complete-options']:
         print('\n'.join(completion_options(argv[1:], parser, commands)))
         return
+    if argv[:1] == ['--complete-files']:
+        try:
+            print('\n'.join(completion_files(Context(parser.parse_args([])), argv[1:])))
+        except StagedError as exc:
+            if not str(exc).startswith('No staging session'):
+                raise
+        return
     if '--help-all' in argv:
         parser.print_help()
         for command in commands.values():
@@ -2000,6 +2211,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command in ('read', 'write'):
         validate_file_range_args(commands[args.command], args)
+    if args.command in ('read', 'write', 'create', 'copy', 'rename', 'delete'):
+        validate_meta_args(commands[args.command], args)
+    if args.summary_json and not args.summary:
+        parser.error('--json requires --summary: staged --summary --json')
+    if args.summary_file is not None and not args.summary:
+        parser.error('--file requires --summary: staged --summary -f <file>')
+    if args.summary and (args.command is not None or args.sessions or args.all_repos or args.list):
+        parser.error('--summary cannot be combined with a command or another listing')
     if args.command == 'diff' and (args.apply or args.clean or args.between or args.compare_session):
         if args.file is None and not args.all:
             commands['diff'].error('choose --file <file> or --all')
@@ -2031,11 +2250,16 @@ def main(argv=None):
             print('{}\t{}\t{}\n\t{}'.format(
                 color(session.id.ljust(id_width), '36'), color(count.ljust(count_width), '33'),
                 color(session.workspace, '1'), color(session.staging, '2')))
-            print('\tSummary: {}'.format(summary_text(session.summaries()['session'])))
+            print('\t{}'.format(color('Summary', '1')))
+            show_summary_text(session.summaries()['session'], indent='\t')
         return
     if args.complete_open or args.complete_meta:
         try:
-            print('\n'.join(ctx.active(notify=False).openable_paths(meta=args.complete_meta)))
+            session = ctx.active(notify=False)
+            paths = session.openable_paths(meta=args.complete_meta)
+            if args.complete_meta:
+                paths = sorted(set(paths) | set(SUGGESTED_METADATA))
+            print('\n'.join(paths))
         except StagedError as exc:
             if not str(exc).startswith('No staging session'):
                 raise
@@ -2047,6 +2271,9 @@ def main(argv=None):
             if not str(exc).startswith('No staging session'):
                 raise
         return
+    if args.command in ('create', 'copy', 'rename', 'delete') and args.meta:
+        meta_operation(ctx.active(notify=False), args)
+        return
     if args.command == 'delete':
         delete_file(ctx.active(notify=False), args)
         return
@@ -2055,6 +2282,9 @@ def main(argv=None):
         return
     if args.command == 'summarize':
         update_summary(ctx.active(notify=False), args)
+        return
+    if args.summary:
+        show_summaries(ctx.active(notify=False), args.summary_file, args.summary_json)
         return
     if args.command in ('read', 'write'):
         session = ctx.active(notify=False)
@@ -2139,7 +2369,11 @@ def main(argv=None):
         session = ctx.find_session(args.clean_session)
     else:
         session = ctx.active()
-    if args.command == 'path':
+    if args.command == 'path' and args.meta:
+        paths = session.openable_paths(meta=True)
+        rel = resolve_meta_alias(args.file, paths)
+        print(range_path(session, rel if rel in paths else args.file, meta=True))
+    elif args.command == 'path':
         rel = match_file(args.file, session.paths())
         if args.workspace:
             print(session.original(rel))
