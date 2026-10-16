@@ -27,7 +27,7 @@ Keep subsequent commands in the same shell. For an agent harness that starts a f
 
 ## Write the proposal
 
-Use the managed `staged read`, `write`, `create`, `copy`, `rename`, and `delete` commands for file access when available, rather than requiring direct filesystem edits. They use exact relative paths; writes are confined to `<staging>/<relative-workspace-path>`. Host filesystem permissions still apply. Read originals with `--workspace`, then explicitly seed the first partial edit with `--from-workspace`:
+Use the managed `staged read`, `write`, `create`, `copy`, `rename`, and `delete` commands for all file access when available; do not edit the filesystem directly (see above). They use exact relative paths; writes are confined to `<staging>/<relative-workspace-path>`. Host filesystem permissions still apply. Read originals with `--workspace`, then explicitly seed the first partial edit with `--from-workspace`:
 
 ```bash
 staged read --workspace -f src/example.py --start-line 10 --end-line 20 --json
@@ -51,7 +51,9 @@ Keep metadata beside `staging/`, never inside it:
     src/example.py
 ```
 
-Use these exact-path operations for proposal files. Immediately summarize each operation before running the next; the examples below are independent alternatives:
+Use these exact-path operations for proposal files. Add `--meta` to read, write, create, copy, rename, or delete a top-level session file such as `staged_changes.md` instead of writing it with a host file tool. `--meta` paths are basenames beside `staging/`; do not combine `--meta` with `--workspace` or `--from-workspace`. `session.json`, `renames.json`, and `summaries.json` stay managed by their own commands and cannot be written through `--meta`.
+
+Immediately summarize each operation before running the next; the examples below are independent alternatives:
 
 ```bash
 staged create -f src/new.py --text 'initial contents'  # Omit content flags for an empty file
@@ -78,14 +80,16 @@ Summaries describe the current cumulative proposal, not just the last edit or a 
 
 ```bash
 # Run immediately after modifying this file; updates both summaries together.
-staged summarize -f src/example.py -m 'Handle empty input without raising an error.' --summary 'Make input handling tolerate empty values.'
+staged summarize -f src/example.py -m 'Handle empty input without raising an error.' --session-message 'Make input handling tolerate empty values.'
 
-# Inspect structured summaries, or set just the session summary.
-staged summarize --json
+# Write the session summary on its own. Read summaries back with --summary.
 staged summarize -m 'Make input handling tolerate empty values.'
+staged --summary
+staged --summary -f src/example.py
+staged --summary --json
 ```
 
-`-f` requires an exact proposed path: the destination for a rename or the original path for a deletion. `--stdin` can replace `-m` / `--message`; `--clear` removes the selected summary. Summary updates preserve unrelated entries. After partial cleanup or migration, immediately revise the session summary to describe the remaining or combined proposal.
+`-f` requires an exact proposed path: the destination for a rename or the original path for a deletion. `--stdin` can replace `-m` / `--message`; `--clear` removes the selected summary. `--session-message` updates the session summary in the same write as a file summary. `summarize` only writes; `staged --summary` prints the session summary and each file summary, grouped by status with a blank line between groups, and `staged --summary -f <path>` prints one file. `-f` always identifies a file and supports completion. Session metadata files always require `--meta` on commands that access them. `--json` with `--summary` returns the stored object, or `session`, `path`, and `summary` when a file is named. Summary updates preserve unrelated entries. After partial cleanup or migration, immediately revise the session summary to describe the remaining or combined proposal.
 
 Summaries live in `<session>/summaries.json`, beside `staging/`:
 
@@ -104,7 +108,7 @@ Run `staged` to inspect the selected session's staged changes. `staged diff -f <
 
 ## Present and refine
 
-Create or update `<session>/staged_changes.md`. Put the session ID prominently at the top, followed by the origin branch, staging path, changes and validation performed. Link the staged files and workspace originals using links supported by the host. Include deletions and renames in the review.
+Create or update `<session>/staged_changes.md` with `staged write --meta -f staged_changes.md` (`--text` or `--stdin`). `write --meta` creates the file when it is missing; use `create --meta` only when the file must not already exist. Put the session ID prominently at the top, followed by the origin branch, staging path, changes and validation performed. Link the staged files and workspace originals using links supported by the host. Include deletions and renames in the review.
 
 Include the session ID prominently in the response and offer the concrete review/apply commands:
 

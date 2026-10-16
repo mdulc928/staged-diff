@@ -4,17 +4,19 @@ Register-ArgumentCompleter -Native -CommandName staged -ScriptBlock {
   $previous = if ($wordToComplete) { $words[-2] } else { $words[-1] }
   $contextWords = @($words | Select-Object -Skip 1)
   if ($wordToComplete) { $contextWords = @($contextWords | Select-Object -SkipLast 1) }
-  $fileHelper = if ($words -contains 'open') {
-    if ($words -contains '--meta') { '--complete-meta' } else { '--complete-open' }
-  } else { '--list' }
   $choices = switch ($previous) {
     { $_ -in '--tool','-t' } { & staged --complete-tools; break }
     { $_ -in '--session','--from','--between','--compare-session','--default-session' } { & staged --complete-sessions; break }
-    '--to' { if ($contextWords -notcontains 'copy' -and $contextWords -notcontains 'rename') { & staged --complete-sessions }; break }
+    '--to' {
+      if ($contextWords -contains 'copy' -or $contextWords -contains 'rename') {
+        if ($contextWords -contains '--meta') { & staged --complete-files @contextWords }
+      } else { & staged --complete-sessions }
+      break
+    }
     'use' { & staged --complete-sessions; & staged --complete-options @contextWords; break }
     '-s' { if ($contextWords -contains 'path') { & staged --complete-options @contextWords } else { & staged --complete-sessions }; break }
     '--branch-protection' { 'true','false'; break }
-    { $_ -in '--file','-f' } { & staged $fileHelper; break }
+    { $_ -in '--file','-f' } { & staged --complete-files @contextWords; break }
     '--shell' { 'bash','zsh','powershell'; break }
     default {
       if ($contextWords.Count -ge 2 -and $contextWords[-2] -eq '--between') {
@@ -26,7 +28,7 @@ Register-ArgumentCompleter -Native -CommandName staged -ScriptBlock {
   }
   $choices | Where-Object {
     $_.StartsWith($wordToComplete, [System.StringComparison]::OrdinalIgnoreCase) -or
-      (($previous -in '--file','-f') -and
+      (($previous -in '--file','-f','--to') -and
         $_.IndexOf($wordToComplete, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
   } | ForEach-Object {
     $quoted = "'" + $_.Replace("'", "''") + "'"
