@@ -362,7 +362,7 @@ staged use --clear                    # Clear session and tool bindings
 
 ```bash
 staged --sessions                       # List sessions with their change summaries
-staged -R                               # List all sessions across all workspaces
+staged -R                               # List all sessions across all workspaces, including removed workspaces
 staged --session other-id diff -f f.py  # One-time session override
 ```
 
@@ -856,6 +856,7 @@ _(After `path`, `-s` means `--staged`; use `--session <id>` for session selectio
 | ----------------------------------- | -------------------------------------------------------------------------------------------- |
 | `staged` command not found          | Add `~/.local/bin` (or `%APPDATA%\staged\bin`) to your shell `PATH`.                         |
 | No staging session found            | Confirm current directory is in the workspace. Check `staged --sessions` or `staged -R`.     |
+| Session workspace does not exist    | The workspace directory was removed. `staged -R` still lists the session and marks the workspace not found. `staged clean --session <id> -y` removes that session only. |
 | Session selection ignored           | Environment variables (`STAGED_SESSION`) or CLI flags take precedence over shell bindings.   |
 | Session lost between agent calls    | Use persistent shells or pass `STAGED_SHELL_ID` across agent subprocess calls.               |
 | File or session is ambiguous        | Provide exact relative path or full session ID.                                              |

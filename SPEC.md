@@ -133,7 +133,7 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 | `staged --sessions`      | Local List               | List sessions associated with current workspace, including session summaries                             |
 | `staged --list`          | File List                | Print proposed file paths, one per line                                     |
 | `staged --help-all`      | Full Help                | Show every command and public option                                        |
-| `staged -R`              | Global List              | List all sessions across all configured workspaces and roots                |
+| `staged -R`              | Global List              | List all sessions across all configured workspaces and roots. A missing workspace is listed as not found and does not abort the command |
 | `read -f <path> [--meta]` | Read File | Read exact byte or line ranges; `--workspace` selects originals; `--meta` selects a session file |
 | `write -f <path> [--meta]` | Write File | Replace, insert, or append contents inside staging, or in a session metadata file with `--meta` |
 | `create -f <path> [--meta]` | Create File | Create an empty or populated staged file, or a new session metadata file with `--meta`, without replacement |
@@ -173,6 +173,7 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 - **Positional Rejection**: Positional filenames and positional `all` are rejected.
 - **Combined Flags**: `-ac`, `-ca`, `-a -c`, and `-c -a` apply first, then clean. Clean runs only if apply succeeds.
 - **Path Flag Scope**: In `staged path`, `-s` denotes `--staged`. Session overrides require `--session <id>`.
+- **Missing workspace**: Discovery does not abort when a recorded workspace directory is gone. `staged -R` lists that session and marks the workspace not found. Commands that use the session fail with the missing-workspace error. `clean --session <id>` can delete it. A live session from another workspace stays out of reach.
 
 ---
 
