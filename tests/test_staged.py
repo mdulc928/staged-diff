@@ -1141,6 +1141,8 @@ class CLI(unittest.TestCase):
                            ('antigravity', '.gemini/config/skills'), ('zed', '.agents/skills')]:
             self.run_cli('install-skill', '--tool', tool)
             self.assertTrue((self.home / path / 'stage/SKILL.md').is_file())
+        state = json.loads((self.config / 'state.json').read_text())
+        self.assertIn(str(self.home / '.gemini/antigravity/brain'), state.get('session_roots', []))
         self.run_cli('install-skill', '--tool', 'vscode', ok=False)
         self.run_cli('install-skill', '--tool', 'vscode', '--target-dir', str(self.home / 'custom/stage'))
         self.assertTrue((self.home / 'custom/stage/SKILL.md').is_file())
@@ -1794,6 +1796,10 @@ source "$1"
 
 
 
+    # ---------------------------------------------------------------------------
+    # New Features CLI Integration Tests
+    # ---------------------------------------------------------------------------
+
     def test_cli_3way_merge_conflict_protection_and_undo(self):
         (self.repo / 'shared.py').write_text('line1\nline2\nline3\nline4\nline5\n')
         self.init('session-a')
@@ -1819,6 +1825,24 @@ source "$1"
             (self.repo / 'shared.py').read_text(),
             'line1_user\nline2\nline3\nline4\nline5\n'
         )
+
+    def test_cli_fmt_check_and_exec(self):
+        self.init('session-a')
+        (self.repo / 'helper_mod.py').write_text('MULT = 3\n')
+        self.file_api('create', '-f', 'calc_mod.py', '--text', 'import helper_mod\n\ndef run(v):\n    return v * helper_mod.MULT\n')
+
+        # `staged check` validates Python AST syntax + imports
+        chk = json.loads(self.run_cli('check', '-f', 'calc_mod.py', '--json').stdout)
+        self.assertTrue(chk['ok'])
+
+        # `staged exec` runs a test inside the ephemeral overlay sandbox
+        exec_res = json.loads(self.run_cli(
+            'exec', '--json', '--',
+            sys.executable, '-c', 'import calc_mod; assert calc_mod.run(7) == 21; print("EXEC_PASS")'
+        ).stdout)
+        self.assertTrue(exec_res['ok'])
+        self.assertIn('EXEC_PASS', exec_res['stdout'])
+        self.assertFalse((self.repo / 'calc_mod.py').exists())
 
 
 class Unit(unittest.TestCase):
@@ -2638,6 +2662,434 @@ class TestSafetyAndUndo(unittest.TestCase):
         self.assertEqual(f_mod.read_text(encoding='utf-8'), 'v1\n')
 
 
+class DummyContext:
+    """Lightweight Context test double compatible with `staged.Context`."""
+
+    def __init__(self, workspace, staging_root, local=None, **arg_overrides):
+        self.workspace = Path(workspace).resolve()
+        self._staging_root = Path(staging_root).resolve()
+        self.local = dict(local or {})
+        self.global_state = {}
+        defaults = {
+            'file': None,
+            'all': False,
+            'check': False,
+            'cmd': None,
+            'json': False,
+            'sandbox': False,
+            'sync': False,
+            'keep_sandbox': False,
+        }
+        defaults.update(arg_overrides)
+        self.args = argparse.Namespace(**defaults)
+
+    def setting(self, key, default=None):
+        return self.local.get(key, self.global_state.get(key, default))
+
+    def staging_root(self):
+        return self._staging_root
+
+
+def create_test_session(workspace, staging_root, session_id='test-session'):
+    """Create an isolated `staged.Session` structure on disk without touching global state."""
+    workspace = Path(workspace).resolve()
+    staging_root = Path(staging_root).resolve()
+    session_dir = staging_root / session_id
+    (session_dir / 'staging').mkdir(parents=True, exist_ok=True)
+    staged.write_text_file(session_dir / '.workspace', str(workspace) + '\n')
+    staged.write_text_file(
+        session_dir / 'session.json',
+        json.dumps({'id': session_id, 'branch': 'main', 'created_at': 1700000000.0}, indent=2) + '\n',
+    )
+    staged.write_text_file(session_dir / 'renames.json', '{}\n')
+    return staged.Session(session_dir)
+
+
+class TestDiffLineStats(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='staged-test-stats-')).resolve()
+        self.workspace = self.tmp / 'workspace'
+        self.staging_root = self.tmp / 'staging_root'
+        self.workspace.mkdir(parents=True)
+        self.staging_root.mkdir(parents=True)
+        self.session = create_test_session(self.workspace, self.staging_root)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_new_file_stats(self):
+        staged.write_text_file(self.session.staging / 'new.py', 'a = 1\nb = 2\nc = 3\n')
+        stats = staged.file_diff_stats(self.session, 'new.py')
+        added, removed = stats
+        self.assertEqual((added, removed), (3, 0))
+        self.assertEqual(stats.added, 3)
+        self.assertEqual(stats.removed, 0)
+        self.assertFalse(stats.binary)
+        self.assertEqual(stats.status, 'NEW FILE')
+        self.assertEqual(stats['added'], 3)
+
+    def test_deleted_file_stats(self):
+        staged.write_text_file(self.workspace / 'old.py', 'line1\nline2\nline3\nline4\n')
+        self.session.deletions = ['old.py']
+        self.session.manifest['_deletions'] = ['old.py']
+        self.session.save_manifest()
+        stats = staged.file_diff_stats(self.session, 'old.py')
+        self.assertEqual(tuple(stats), (0, 4))
+        self.assertEqual(stats.status, 'DELETED')
+        self.assertFalse(stats.binary)
+
+    def test_modified_file_stats(self):
+        staged.write_text_file(self.workspace / 'mod.py', 'a\nb\nc\nd\n')
+        staged.write_text_file(self.session.staging / 'mod.py', 'a\nb_changed\nc\ne\nf\n')
+        stats = staged.file_diff_stats(self.session, 'mod.py')
+        # 'b' -> 'b_changed' (+1 -1), 'd' -> 'e', 'f' (+2 -1) => total +3 -2
+        self.assertEqual(tuple(stats), (3, 2))
+        self.assertEqual(stats.status, 'MODIFIED')
+
+    def test_renamed_file_stats(self):
+        staged.write_text_file(self.workspace / 'src/orig.py', 'x = 1\ny = 2\n')
+        staged.write_text_file(self.session.staging / 'src/renamed.py', 'x = 1\ny = 20\nz = 30\n')
+        self.session.manifest['src/renamed.py'] = 'src/orig.py'
+        self.session.save_manifest()
+        stats = staged.file_diff_stats(self.session, 'src/renamed.py')
+        self.assertEqual(tuple(stats), (2, 1))
+        self.assertEqual(stats.status, 'RENAMED')
+
+    def test_binary_file_stats_and_formatting(self):
+        bin_path = self.session.staging / 'image.bin'
+        bin_path.parent.mkdir(parents=True, exist_ok=True)
+        bin_path.write_bytes(b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR')
+        stats = staged.file_diff_stats(self.session, 'image.bin')
+        self.assertEqual(tuple(stats), (0, 0))
+        self.assertTrue(stats.binary)
+
+        old_env = os.environ.get('NO_COLOR')
+        os.environ['NO_COLOR'] = '1'
+        try:
+            self.assertEqual(staged.format_diff_stats(stats), 'binary')
+            self.assertEqual(staged.format_diff_stats(staged.DiffStats(14, 3)), '+14 -3')
+        finally:
+            if old_env is None:
+                os.environ.pop('NO_COLOR', None)
+            else:
+                os.environ['NO_COLOR'] = old_env
+
+    def test_session_diff_stats_aggregation(self):
+        staged.write_text_file(self.session.staging / 'a.txt', '1\n2\n')
+        staged.write_text_file(self.workspace / 'b.txt', 'old1\nold2\nold3\n')
+        self.session.deletions = ['b.txt']
+        self.session.manifest['_deletions'] = ['b.txt']
+        self.session.save_manifest()
+        total = staged.session_diff_stats(self.session)
+        self.assertEqual(tuple(total), (2, 3))
+
+
+class TestTier1VirtualBufferFormatting(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='staged-test-fmt-')).resolve()
+        self.workspace = self.tmp / 'workspace'
+        self.staging_root = self.tmp / 'staging_root'
+        self.workspace.mkdir(parents=True)
+        self.staging_root.mkdir(parents=True)
+        self.session = create_test_session(self.workspace, self.staging_root)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_auto_detect_formatter_commands(self):
+        bin_dir = self.workspace / 'node_modules' / '.bin'
+        bin_dir.mkdir(parents=True)
+        prettier_mock = bin_dir / 'prettier'
+        prettier_mock.write_text('#!/bin/sh\ncat\n', encoding='utf-8')
+        prettier_mock.chmod(0o755)
+
+        cmd, uses_stdin = staged.detect_formatter_command(self.workspace, 'src/index.ts')
+        self.assertTrue(uses_stdin)
+        self.assertEqual(cmd, [str(prettier_mock), '--stdin-filepath', str(self.workspace / 'src/index.ts')])
+
+        # When biome.json is present in workspace and biome binary exists, prefer biome
+        staged.write_text_file(self.workspace / 'biome.json', '{"formatter": {"enabled": true}}\n')
+        biome_mock = bin_dir / 'biome'
+        biome_mock.write_text('#!/bin/sh\ncat\n', encoding='utf-8')
+        biome_mock.chmod(0o755)
+
+        cmd_biome, uses_stdin = staged.detect_formatter_command(self.workspace, 'src/index.ts')
+        self.assertTrue(uses_stdin)
+        self.assertEqual(
+            cmd_biome,
+            [str(biome_mock), 'format', '--stdin-file-path=' + str(self.workspace / 'src/index.ts')],
+        )
+
+    def test_virtual_stdin_filepath_formatting_and_dry_run_check(self):
+        staged.write_text_file(self.workspace / '.prettierrc', '{"semi": true}\n')
+        bin_dir = self.workspace / 'node_modules' / '.bin'
+        bin_dir.mkdir(parents=True)
+        prettier_script = bin_dir / 'prettier'
+        prettier_script.write_text(
+            '#!{}\n'
+            'import json, os, sys\n'
+            'assert os.getcwd() == {!r}, f"wrong cwd: {{os.getcwd()}}"\n'
+            'assert "--stdin-filepath" in sys.argv\n'
+            'fp = sys.argv[sys.argv.index("--stdin-filepath") + 1]\n'
+            'assert fp == {!r}, f"wrong stdin-filepath: {{fp}}"\n'
+            'cfg = json.loads(open(".prettierrc").read())\n'
+            'data = sys.stdin.read()\n'
+            'if cfg.get("semi"):\n'
+            '    lines = [l.rstrip() + (";" if l.strip() and not l.rstrip().endswith(";") else "") for l in data.splitlines()]\n'
+            '    sys.stdout.write("\\n".join(lines) + "\\n")\n'
+            'else:\n'
+            '    sys.stdout.write(data)\n'.format(
+                sys.executable,
+                str(self.workspace),
+                str(self.workspace / 'src/app.js'),
+            ),
+            encoding='utf-8',
+        )
+        prettier_script.chmod(0o755)
+
+        staged_file = self.session.staging / 'src/app.js'
+        staged.write_text_file(staged_file, 'const x = 1\nconst y = 2\n')
+
+        # 1. Run with --check (dry-run): should report would_format and NOT mutate staged_file
+        ctx_check = DummyContext(self.workspace, self.staging_root, check=True, json=True)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            report_check = staged.format_staged(ctx_check, self.session)
+        self.assertFalse(report_check['ok'])
+        self.assertEqual(report_check['changed'], 1)
+        self.assertEqual(report_check['would_format'], 1)
+        self.assertEqual(staged_file.read_text(encoding='utf-8'), 'const x = 1\nconst y = 2\n')
+
+        # 2. Run actual format: should atomically update staged_file and never touch workspace
+        ctx_fmt = DummyContext(self.workspace, self.staging_root, check=False, json=True)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            report_fmt = staged.format_staged(ctx_fmt, self.session)
+        self.assertTrue(report_fmt['ok'])
+        self.assertEqual(report_fmt['formatted'], 1)
+        self.assertEqual(staged_file.read_text(encoding='utf-8'), 'const x = 1;\nconst y = 2;\n')
+        self.assertFalse((self.workspace / 'src/app.js').exists())
+
+        # 3. Re-running format when already formatted reports unchanged
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            report_again = staged.format_staged(ctx_fmt, self.session)
+        self.assertTrue(report_again['ok'])
+        self.assertEqual(report_again['unchanged'], 1)
+        self.assertEqual(report_again['changed'], 0)
+
+    def test_custom_cmd_template_with_placeholders(self):
+        staged_file = self.session.staging / 'hello.txt'
+        staged.write_text_file(staged_file, 'hello   world\n')
+        cmd_template = (
+            '{} -c "import pathlib, sys; '
+            'p = pathlib.Path(sys.argv[1]); '
+            'ws = sys.argv[2]; '
+            'assert ws.endswith(\'hello.txt\'); '
+            'p.write_text(\' \'.join(p.read_text().split()) + \'\\n\')" '
+            '{{staged_file}} {{workspace_file}}'
+        ).format(shlex.quote(sys.executable))
+
+        # First test --check mode with {staged_file} placeholder (must not modify staged_file!)
+        ctx_check = DummyContext(self.workspace, self.staging_root, check=True, cmd=cmd_template, json=True)
+        with redirect_stdout(io.StringIO()):
+            res_check = staged.format_staged(ctx_check, self.session)
+        self.assertFalse(res_check['ok'])
+        self.assertEqual(staged_file.read_text(encoding='utf-8'), 'hello   world\n')
+
+        # Now format in-place
+        ctx_fmt = DummyContext(self.workspace, self.staging_root, check=False, cmd=cmd_template, json=True)
+        with redirect_stdout(io.StringIO()):
+            res_fmt = staged.format_staged(ctx_fmt, self.session)
+        self.assertTrue(res_fmt['ok'])
+        self.assertEqual(staged_file.read_text(encoding='utf-8'), 'hello world\n')
+
+
+class TestTier1And2CheckStaged(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='staged-test-check-')).resolve()
+        self.workspace = self.tmp / 'workspace'
+        self.staging_root = self.tmp / 'staging_root'
+        self.workspace.mkdir(parents=True)
+        self.staging_root.mkdir(parents=True)
+        self.session = create_test_session(self.workspace, self.staging_root)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_python_ast_syntax_check_and_deleted_import_detection(self):
+        # 1. Invalid Python syntax in staging is caught with 0 external tools
+        staged.write_text_file(self.session.staging / 'broken.py', 'def foo(\n    return 42\n')
+        ctx = DummyContext(self.workspace, self.staging_root, file='broken.py', json=True)
+        with redirect_stdout(io.StringIO()):
+            report = staged.check_staged(ctx, self.session)
+        self.assertFalse(report['ok'])
+        self.assertEqual(report['failed'], 1)
+        self.assertTrue(any('SyntaxError' in d for d in report['diagnostics']))
+
+        # 2. Valid syntax but imports a workspace module that is staged for deletion
+        staged.write_text_file(self.workspace / 'legacy_helper.py', 'VALUE = 10\n')
+        self.session.deletions = ['legacy_helper.py']
+        self.session.manifest['_deletions'] = ['legacy_helper.py']
+        self.session.save_manifest()
+        staged.write_text_file(self.session.staging / 'consumer.py', 'import legacy_helper\nx = legacy_helper.VALUE\n')
+
+        ctx2 = DummyContext(self.workspace, self.staging_root, file='consumer.py', json=True)
+        with redirect_stdout(io.StringIO()):
+            report2 = staged.check_staged(ctx2, self.session)
+        self.assertFalse(report2['ok'])
+        self.assertTrue(any('legacy_helper' in d for d in report2['diagnostics']))
+
+        # 3. Valid syntax with valid workspace import passes
+        staged.write_text_file(self.workspace / 'good_helper.py', 'VALUE = 99\n')
+        staged.write_text_file(self.session.staging / 'valid.py', 'import good_helper\nx = good_helper.VALUE\n')
+        ctx3 = DummyContext(self.workspace, self.staging_root, file='valid.py', json=True)
+        with redirect_stdout(io.StringIO()):
+            report3 = staged.check_staged(ctx3, self.session)
+        self.assertTrue(report3['ok'])
+
+    def test_tsconfig_overlay_generation_and_path_rewriting(self):
+        staged.write_text_file(
+            self.workspace / 'tsconfig.json',
+            json.dumps({'compilerOptions': {'strict': True, 'target': 'ES2020'}}, indent=2) + '\n',
+        )
+        staged.write_text_file(self.workspace / 'src/types.ts', 'export interface User { id: string; }\n')
+        staged.write_text_file(self.workspace / 'src/app.ts', 'export const old = 1;\n')
+        staged.write_text_file(self.session.staging / 'src/app.ts', 'import { User } from "./types";\nexport const u: User = { id: "1" };\n')
+
+        overlay = staged.generate_tsconfig_overlay(self.session)
+        self.assertTrue(overlay.is_file())
+        data = json.loads(overlay.read_text(encoding='utf-8'))
+        self.assertEqual(data['extends'], str(self.workspace / 'tsconfig.json'))
+        self.assertTrue(data['compilerOptions']['noEmit'])
+        self.assertEqual(
+            data['compilerOptions']['rootDirs'],
+            [str(self.session.staging), str(self.workspace)],
+        )
+        # Overridden workspace src/app.ts must be in exclude so tsc only compiles staging/src/app.ts
+        self.assertIn((self.workspace / 'src/app.ts').as_posix(), data['exclude'])
+
+        # Test diagnostic path rewriting
+        raw_diag = '{}/src/app.ts(2,14): error TS2322: Type number is not assignable to string.'.format(
+            self.session.staging
+        )
+        cleaned = staged.rewrite_diagnostic_paths(raw_diag, self.session)
+        self.assertEqual(cleaned, 'src/app.ts(2,14): error TS2322: Type number is not assignable to string.')
+
+    def test_c_include_overlay_command_and_live_clang_check(self):
+        staged.write_text_file(self.workspace / 'include/config.h', '#define OLD_CONST 1\n')
+        staged.write_text_file(self.workspace / 'include/utils.h', '#define UTIL_ADD(a, b) ((a) + (b))\n')
+        staged.write_text_file(self.session.staging / 'include/config.h', '#define NEW_CONST 42\n')
+        staged.write_text_file(
+            self.session.staging / 'src/main.c',
+            '#include "include/config.h"\n#include "include/utils.h"\nint main(void) { return UTIL_ADD(NEW_CONST, 1); }\n',
+        )
+
+        cmd = staged.build_c_check_command(self.session, 'src/main.c', compiler='clang')
+        staging_inc_idx = cmd.index('-I' + str(self.session.staging))
+        ws_inc_idx = cmd.index('-I' + str(self.workspace))
+        self.assertLess(staging_inc_idx, ws_inc_idx)
+
+        if shutil.which('clang') or shutil.which('gcc'):
+            ctx = DummyContext(self.workspace, self.staging_root, file='src/main.c', json=True)
+            with redirect_stdout(io.StringIO()):
+                report = staged.check_staged(ctx, self.session)
+            self.assertTrue(report['ok'], f"C overlay check failed: {report}")
+
+    def test_java_sourcepath_overlay_command_builder(self):
+        staged.write_text_file(self.workspace / 'pkg/Helper.java', 'package pkg;\npublic class Helper { public static int val() { return 7; } }\n')
+        staged.write_text_file(self.session.staging / 'pkg/Main.java', 'package pkg;\npublic class Main { public static int run() { return Helper.val(); } }\n')
+        tmp_out = self.session.directory / '.review/javac-out'
+        cmd = staged.build_java_check_command(self.session, ['pkg/Main.java'], tmp_out, javac_bin='/usr/bin/javac')
+        expected_sp = os.pathsep.join([str(self.session.staging), str(self.workspace)])
+        self.assertIn('-sourcepath', cmd)
+        self.assertEqual(cmd[cmd.index('-sourcepath') + 1], expected_sp)
+
+
+class TestTier3OverlaySandboxExec(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='staged-test-exec-')).resolve()
+        self.workspace = self.tmp / 'workspace'
+        self.staging_root = self.tmp / 'staging_root'
+        self.workspace.mkdir(parents=True)
+        self.staging_root.mkdir(parents=True)
+        self.session = create_test_session(self.workspace, self.staging_root)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_sandbox_hardlinks_symlinks_deletions_renames_and_cleanup(self):
+        nm_pkg = self.workspace / 'node_modules' / 'my-pkg' / 'index.js'
+        staged.write_text_file(nm_pkg, 'module.exports = 123;\n')
+
+        ws_math = self.workspace / 'lib' / 'math_utils.py'
+        staged.write_text_file(ws_math, 'def add(a, b):\n    return a + b\n')
+
+        ws_obsolete = self.workspace / 'lib' / 'obsolete.py'
+        staged.write_text_file(ws_obsolete, 'OBSOLETE = True\n')
+        self.session.deletions = ['lib/obsolete.py']
+        self.session.manifest['_deletions'] = ['lib/obsolete.py']
+
+        ws_old = self.workspace / 'lib' / 'old_name.py'
+        staged.write_text_file(ws_old, 'FACTOR = 2\n')
+        st_new = self.session.staging / 'lib' / 'new_name.py'
+        staged.write_text_file(st_new, 'FACTOR = 10\n')
+        self.session.manifest['lib/new_name.py'] = 'lib/old_name.py'
+        self.session.save_manifest()
+
+        st_test = self.session.staging / 'test_calc.py'
+        staged.write_text_file(
+            st_test,
+            'import os, pathlib\n'
+            'from lib.math_utils import add\n'
+            'from lib.new_name import FACTOR\n'
+            'assert not pathlib.Path("lib/obsolete.py").exists(), "deleted file should not exist in sandbox"\n'
+            'assert not pathlib.Path("lib/old_name.py").exists(), "renamed source should not exist in sandbox"\n'
+            'assert pathlib.Path("node_modules").is_symlink(), "node_modules should be symlinked"\n'
+            'assert add(3, 4) * FACTOR == 70\n'
+            'print("SANDBOX_CHECK_OK:", os.path.abspath("test_calc.py"))\n',
+        )
+
+        sb_dir = staged.materialize_sandbox(self.session)
+        self.assertTrue((sb_dir / 'node_modules').is_symlink())
+        self.assertEqual(
+            os.stat(ws_math).st_ino,
+            os.stat(sb_dir / 'lib/math_utils.py').st_ino,
+            'Unchanged workspace file must be hardlinked into sandbox',
+        )
+        self.assertNotEqual(
+            os.stat(st_new).st_ino,
+            os.stat(sb_dir / 'lib/new_name.py').st_ino,
+            'Staged file must be copied (not hardlinked) to protect staging from unintended mutation',
+        )
+        self.assertFalse((sb_dir / 'lib/obsolete.py').exists())
+        self.assertFalse((sb_dir / 'lib/old_name.py').exists())
+
+        ctx = DummyContext(self.workspace, self.staging_root, json=True)
+        with redirect_stdout(io.StringIO()):
+            res = staged.exec_in_sandbox(ctx, self.session, [sys.executable, 'test_calc.py'], as_json=True)
+        self.assertTrue(res['ok'], f"Sandbox execution failed: {res}")
+        self.assertIn('SANDBOX_CHECK_OK: test_calc.py', res['stdout'])
+        self.assertNotIn(str(sb_dir), res['stdout'])
+        self.assertFalse(sb_dir.exists())
+        self.assertTrue(nm_pkg.is_file())
+
+    def test_sandbox_sync_back_updates_modified_staged_files(self):
+        st_file = self.session.staging / 'codegen.py'
+        staged.write_text_file(st_file, 'VERSION = 1\n')
+
+        ctx = DummyContext(self.workspace, self.staging_root, sync=True, json=True)
+        cmd = [
+            sys.executable,
+            '-c',
+            'import pathlib; p = pathlib.Path("codegen.py"); p.write_text(p.read_text().replace("1", "2"))',
+        ]
+        with redirect_stdout(io.StringIO()):
+            res = staged.exec_in_sandbox(ctx, self.session, cmd, sync_back=True, as_json=True)
+
+        self.assertTrue(res['ok'])
+        self.assertEqual(res['synced'], ['codegen.py'])
+        self.assertEqual(st_file.read_text(encoding='utf-8'), 'VERSION = 2\n')
 
 
 if __name__ == '__main__':

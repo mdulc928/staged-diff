@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Isolated proposal files, explicit review and apply. Python 3.8+; no dependencies."""
 import argparse
+import ast
 import base64
+try:
+    import curses
+except ImportError:
+    curses = None
 import difflib
-import hashlib
 import hashlib
 import io
 import fnmatch
@@ -36,7 +40,7 @@ DEFAULT_PROTECTED_BRANCHES = []
 STATUS_COLORS = {'APPLIED': '32', 'MERGED': '1;32', 'UNDONE': '1;36', 'MODIFIED': '33', 'NEW FILE': '36',
                  'RENAMED': '35', 'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
 STATUS_ORDER = ('MISSING', 'NEW FILE', 'MODIFIED', 'RENAMED', 'RELOCATED', 'DELETED', 'APPLIED')
-COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'init', 'diff', 'apply', 'undo', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
+COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'init', 'diff', 'apply', 'undo', 'fmt', 'check', 'exec', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
 
 
 def is_reserved_windows_name(name):
@@ -485,13 +489,17 @@ class ToolAdapter:
                        'antigravity-ide': ('Antigravity IDE', 'Resources/app/bin/antigravity-ide'),
                        'windsurf': ('Windsurf', 'Resources/app/bin/windsurf'),
                        'code': ('Visual Studio Code', 'Resources/app/bin/code'),
-                       'zed': ('Zed', 'MacOS/zed')}
+                       'zed': ('Zed', 'MacOS/cli')}
             if command in bundles:
                 app, suffix = bundles[command]
                 for parent in (Path('/Applications'), Path(HOME) / 'Applications'):
                     path = parent / (app + '.app') / 'Contents' / suffix
                     if path.is_file():
                         return str(path)
+                    if command == 'zed':
+                        fallback = parent / (app + '.app') / 'Contents/MacOS/zed'
+                        if fallback.is_file():
+                            return str(fallback)
         if os.name == 'nt':
             programs = Path(os.environ.get('LOCALAPPDATA', HOME)) / 'Programs'
             for folder in (command, {'code': 'Microsoft VS Code'}.get(command, command)):
@@ -767,6 +775,7 @@ def overview(ctx, session):
             path = safe_path(session.staging, rel)
             print('    Staged:    {}'.format(path if path.exists() else '(deletion)'))
             print('    Workspace: {}'.format(session.original(rel)))
+            print('    Changes:   {}'.format(format_diff_stats(session, rel)))
             if path.exists():
                 print('    Size: {} bytes; modified: {}'.format(path.stat().st_size, time.ctime(path.stat().st_mtime)))
             print(flush=True)
@@ -871,6 +880,7 @@ def preflight(session, paths):
     for rel in destinations:
         if any(parent.as_posix() in destinations for parent in Path(rel).parents if str(parent) != '.'):
             raise StagedError('Conflicting staged file and directory: ' + rel)
+
 
 
 # ===========================================================================
@@ -1400,6 +1410,1236 @@ def undo_apply(ctx, session):
     else:
         for rel in restored_paths:
             print(status_token('UNDONE') + ' ' + rel)
+
+# ===========================================================================
+# Diff Line Stats, Virtual Buffer Formatter, Overlay Checker & Sandbox Exec
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Diff Line Stats (`+X -Y`)
+# ---------------------------------------------------------------------------
+
+BINARY_SNIFF_BYTES = 8192
+
+
+def is_binary_bytes(data):
+    """Return True if raw byte buffer appears to be binary (contains NUL byte)."""
+    if not data:
+        return False
+    return b'\x00' in data[:BINARY_SNIFF_BYTES]
+
+
+def is_binary_file(path):
+    """Return True if `path` is a file containing binary bytes in its header."""
+    path = Path(path)
+    if not path.is_file():
+        return False
+    with path.open('rb') as stream:
+        return is_binary_bytes(stream.read(BINARY_SNIFF_BYTES))
+
+
+class DiffStats(tuple):
+    """A 2-tuple `(added, removed)` with `.added`, `.removed`, `.binary`, `.status` attributes
+    and dict-style key lookup (`stats['added']`, `stats['binary']`) for universal compatibility.
+    """
+
+    def __new__(cls, added, removed, binary=False, status=None):
+        obj = super().__new__(cls, (int(added), int(removed)))
+        obj.added = int(added)
+        obj.removed = int(removed)
+        obj.binary = bool(binary)
+        obj.status = status
+        return obj
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            if hasattr(self, key):
+                return getattr(self, key)
+            raise KeyError(key)
+        return super().__getitem__(key)
+
+    def to_dict(self):
+        return {
+            'added': self.added,
+            'removed': self.removed,
+            'binary': self.binary,
+            'status': self.status,
+        }
+
+    def format(self, show_zero=True):
+        return format_diff_stats(self, show_zero=show_zero)
+
+
+def _count_line_diff(old_bytes, new_bytes):
+    old_lines = old_bytes.decode('utf-8', errors='replace').splitlines()
+    new_lines = new_bytes.decode('utf-8', errors='replace').splitlines()
+    added = 0
+    removed = 0
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'insert':
+            added += j2 - j1
+        elif tag == 'delete':
+            removed += i2 - i1
+        elif tag == 'replace':
+            removed += i2 - i1
+            added += j2 - j1
+    return added, removed
+
+
+def file_diff_stats(session, rel):
+    """Compute `DiffStats(added, removed, binary=..., status=...)` between workspace original
+    and staged proposal for `rel`.
+    """
+    status = session.status(rel)
+    original = session.original(rel)
+
+    if rel in session.deletions or status == 'DELETED':
+        if not original.is_file():
+            return DiffStats(0, 0, binary=False, status=status)
+        raw_old = original.read_bytes()
+        if is_binary_bytes(raw_old):
+            return DiffStats(0, 0, binary=True, status=status)
+        old_lines = raw_old.decode('utf-8', errors='replace').splitlines()
+        return DiffStats(0, len(old_lines), binary=False, status=status)
+
+    proposed = safe_path(session.staging, rel)
+    if not proposed.is_file():
+        return DiffStats(0, 0, binary=False, status=status)
+
+    raw_new = proposed.read_bytes()
+    if not original.is_file() or status == 'NEW FILE':
+        if is_binary_bytes(raw_new):
+            return DiffStats(0, 0, binary=True, status=status)
+        new_lines = raw_new.decode('utf-8', errors='replace').splitlines()
+        return DiffStats(len(new_lines), 0, binary=False, status=status)
+
+    if status == 'APPLIED' or equal_files(original, proposed):
+        return DiffStats(0, 0, binary=is_binary_bytes(raw_new), status=status)
+
+    raw_old = original.read_bytes()
+    if is_binary_bytes(raw_old) or is_binary_bytes(raw_new):
+        return DiffStats(0, 0, binary=True, status=status)
+
+    added, removed = _count_line_diff(raw_old, raw_new)
+    return DiffStats(added, removed, binary=False, status=status)
+
+
+def session_diff_stats(session):
+    """Aggregate `DiffStats(total_added, total_removed, binary=...)` across all session paths."""
+    total_added = 0
+    total_removed = 0
+    any_binary = False
+    for rel in session.paths():
+        stats = file_diff_stats(session, rel)
+        total_added += stats.added
+        total_removed += stats.removed
+        if stats.binary:
+            any_binary = True
+    return DiffStats(total_added, total_removed, binary=any_binary, status='SESSION')
+
+
+def format_diff_stats(stats_or_session, rel=None, show_zero=True):
+    """Format a compact colored diff stats token such as `+14 -3` or `binary`."""
+    if rel is not None:
+        stats = file_diff_stats(stats_or_session, rel)
+    elif isinstance(stats_or_session, DiffStats):
+        stats = stats_or_session
+    elif isinstance(stats_or_session, tuple) and len(stats_or_session) >= 2:
+        stats = DiffStats(stats_or_session[0], stats_or_session[1])
+    else:
+        stats = session_diff_stats(stats_or_session)
+
+    if stats.binary and stats.added == 0 and stats.removed == 0:
+        return color('binary', '2')
+    if stats.added == 0 and stats.removed == 0 and not show_zero:
+        return ''
+    plus = color('+{}'.format(stats.added), '32' if stats.added > 0 else '2')
+    minus = color('-{}'.format(stats.removed), '31' if stats.removed > 0 else '2')
+    return '{} {}'.format(plus, minus)
+
+
+# ---------------------------------------------------------------------------
+# Binary Resolution & Path Rewriting Helpers
+# ---------------------------------------------------------------------------
+
+WEB_FORMAT_EXTENSIONS = frozenset({
+    '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+    '.svelte', '.vue', '.css', '.scss', '.html',
+    '.json', '.md', '.yaml', '.yml',
+})
+BIOME_FORMAT_EXTENSIONS = frozenset({
+    '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.json', '.css',
+})
+JS_TS_CHECK_EXTENSIONS = frozenset({
+    '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx',
+})
+TS_EXTENSIONS = frozenset({'.ts', '.tsx', '.mts', '.cts'})
+PYTHON_EXTENSIONS = frozenset({'.py', '.pyi'})
+C_CPP_EXTENSIONS = frozenset({'.c', '.cc', '.cpp', '.h', '.hpp', '.m', '.mm'})
+CPP_EXTENSIONS = frozenset({'.cc', '.cpp', '.hpp', '.mm'})
+
+HEAVY_SYMLINK_DIRS = frozenset({
+    'node_modules', '.venv', 'venv', 'target', '.build', 'build', 'dist',
+    'vendor', '.svelte-kit', '.next', '.nuxt', '.gradle', '.m2',
+    '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.tox',
+})
+
+
+def resolve_local_binary(workspace, binary_name):
+    """Resolve `binary_name` preferring workspace-local `node_modules/.bin` and `.venv`/`venv`
+    before falling back to global `PATH`.
+    """
+    workspace = Path(workspace).resolve()
+    bin_dir = 'Scripts' if os.name == 'nt' else 'bin'
+    suffixes = ('.cmd', '.exe', '.bat', '') if os.name == 'nt' else ('',)
+    local_dirs = [
+        workspace / 'node_modules' / '.bin',
+        workspace / '.venv' / bin_dir,
+        workspace / 'venv' / bin_dir,
+    ]
+    for directory in local_dirs:
+        for suffix in suffixes:
+            candidate = directory / (binary_name + suffix)
+            if candidate.is_file() and os.access(str(candidate), os.X_OK):
+                return str(candidate)
+    return shutil.which(binary_name)
+
+
+def rewrite_diagnostic_paths(text, session, sandbox_dir=None):
+    """Rewrite occurrences of `<sandbox_dir>`, `<session.staging>`, and `<session.workspace>`
+    in compiler/linter stdout or stderr back to clean workspace-relative paths.
+    """
+    if not text:
+        return ''
+    result = text
+    roots = []
+    if sandbox_dir is not None:
+        roots.append(Path(sandbox_dir).resolve())
+        roots.append(Path(sandbox_dir))
+    roots.append(session.staging.resolve())
+    roots.append(session.staging)
+    roots.append(session.workspace.resolve())
+    roots.append(session.workspace)
+
+    seen = set()
+    unique_roots = []
+    for r in roots:
+        key = str(r)
+        if key not in seen:
+            seen.add(key)
+            unique_roots.append(r)
+
+    for root in unique_roots:
+        raw_root = str(root)
+        posix_root = root.as_posix()
+        for prefix in (raw_root + os.sep, raw_root + '/', posix_root + '/'):
+            if prefix in result:
+                result = result.replace(prefix, '')
+        if raw_root in result:
+            result = result.replace(raw_root, '.')
+        if posix_root in result:
+            result = result.replace(posix_root, '.')
+    return result
+
+
+def _expand_command_template(template, ws_path, staged_path, session=None, rel=None):
+    tokens = shlex.split(template) if isinstance(template, str) else [str(t) for t in template]
+    raw_joined = ' '.join(tokens)
+    uses_stdin = '{staged_file}' not in raw_joined
+    replacements = {
+        '{workspace_file}': str(ws_path),
+        '{staged_file}': str(staged_path),
+        '{file}': str(rel or ws_path.name),
+        '{rel}': str(rel or ws_path.name),
+    }
+    if session is not None:
+        replacements['{workspace_root}'] = str(session.workspace)
+        replacements['{staging_root}'] = str(session.staging)
+
+    expanded = []
+    for token in tokens:
+        value = token
+        for placeholder, target in replacements.items():
+            value = value.replace(placeholder, target)
+        expanded.append(value)
+    return expanded, uses_stdin
+
+
+# ---------------------------------------------------------------------------
+# 2. Tier 1: Zero-Replication Virtual Buffer Formatting (`staged fmt`)
+# ---------------------------------------------------------------------------
+
+def detect_formatter_command(workspace, rel_path, staged_path=None, custom_cmd=None, session=None):
+    """Auto-detect or build the formatter command for `rel_path`."""
+    workspace = Path(workspace).resolve()
+    ws_path = safe_path(workspace, rel_path)
+    staged_path = Path(staged_path) if staged_path else ws_path
+    ext = Path(rel_path).suffix.lower()
+
+    if custom_cmd:
+        selected_template = None
+        if isinstance(custom_cmd, dict):
+            selected_template = custom_cmd.get(ext) or custom_cmd.get('*')
+        else:
+            selected_template = custom_cmd
+        if selected_template:
+            return _expand_command_template(
+                selected_template, ws_path, staged_path, session=session, rel=rel_path
+            )
+
+    if ext in WEB_FORMAT_EXTENSIONS:
+        has_biome_config = (workspace / 'biome.json').is_file() or (workspace / 'biome.jsonc').is_file()
+        if has_biome_config and ext in BIOME_FORMAT_EXTENSIONS:
+            biome = resolve_local_binary(workspace, 'biome')
+            if biome:
+                return [biome, 'format', '--stdin-file-path=' + str(ws_path)], True
+        prettier = resolve_local_binary(workspace, 'prettier')
+        if prettier:
+            return [prettier, '--stdin-filepath', str(ws_path)], True
+        if ext in BIOME_FORMAT_EXTENSIONS:
+            biome = resolve_local_binary(workspace, 'biome')
+            if biome:
+                return [biome, 'format', '--stdin-file-path=' + str(ws_path)], True
+        return None, False
+
+    if ext in PYTHON_EXTENSIONS:
+        ruff = resolve_local_binary(workspace, 'ruff')
+        if ruff:
+            return [ruff, 'format', '--stdin-filename', str(ws_path), '-'], True
+        black = resolve_local_binary(workspace, 'black')
+        if black:
+            return [black, '--quiet', '--stdin-filename', str(ws_path), '-'], True
+        return None, False
+
+    if ext == '.go':
+        gofmt = resolve_local_binary(workspace, 'gofmt')
+        if gofmt:
+            return [gofmt], True
+        return None, False
+
+    if ext == '.rs':
+        rustfmt = resolve_local_binary(workspace, 'rustfmt')
+        if rustfmt:
+            return [rustfmt, '--emit', 'stdout'], True
+        return None, False
+
+    if ext == '.java':
+        gjf = resolve_local_binary(workspace, 'google-java-format')
+        if gjf:
+            return [gjf, '-'], True
+        clang_fmt = resolve_local_binary(workspace, 'clang-format')
+        if clang_fmt:
+            return [clang_fmt, '--assume-filename=' + str(ws_path)], True
+        return None, False
+
+    if ext in C_CPP_EXTENSIONS:
+        clang_fmt = resolve_local_binary(workspace, 'clang-format')
+        if clang_fmt:
+            return [clang_fmt, '--assume-filename=' + str(ws_path)], True
+        return None, False
+
+    if ext == '.swift':
+        swift_fmt = resolve_local_binary(workspace, 'swift-format')
+        if swift_fmt:
+            return [swift_fmt], True
+        return None, False
+
+    return None, False
+
+
+def format_staged(ctx, session, target=None):
+    """Tier 1 Zero-Replication Virtual Buffer Formatter (`staged fmt`)."""
+    args = getattr(ctx, 'args', None)
+    if target is None and args is not None:
+        target = getattr(args, 'file', None)
+    check_only = bool(getattr(args, 'check', False))
+    custom_cmd = getattr(args, 'cmd', None) or (ctx.setting('format_cmd') if hasattr(ctx, 'setting') else None)
+    as_json = bool(getattr(args, 'json', False))
+
+    paths = [p for p in selected(session, target) if p not in session.deletions]
+    results = []
+    modified_any = False
+
+    for rel in paths:
+        staged_path = safe_path(session.staging, rel)
+        if not staged_path.is_file():
+            raise StagedError('Missing staged contents: ' + rel)
+        raw_bytes = staged_path.read_bytes()
+        if is_binary_bytes(raw_bytes):
+            results.append({
+                'path': rel,
+                'status': 'skipped',
+                'reason': 'binary',
+                'changed': False,
+            })
+            continue
+
+        cmd, uses_stdin = detect_formatter_command(
+            session.workspace, rel, staged_path=staged_path, custom_cmd=custom_cmd, session=session
+        )
+        if not cmd:
+            results.append({
+                'path': rel,
+                'status': 'skipped',
+                'reason': 'no formatter available',
+                'changed': False,
+            })
+            continue
+
+        try:
+            if uses_stdin:
+                proc = subprocess.run(
+                    cmd,
+                    input=raw_bytes,
+                    capture_output=True,
+                    cwd=str(session.workspace),
+                )
+                if proc.returncode != 0:
+                    err = (proc.stderr or proc.stdout).decode('utf-8', errors='replace').strip()
+                    results.append({
+                        'path': rel,
+                        'status': 'error',
+                        'changed': False,
+                        'command': cmd,
+                        'returncode': proc.returncode,
+                        'error': rewrite_diagnostic_paths(err, session),
+                    })
+                    continue
+                formatted_bytes = proc.stdout
+            else:
+                if check_only:
+                    fd, tmp_name = tempfile.mkstemp(
+                        prefix='.staged-fmt-check-', suffix=Path(rel).suffix, dir=str(staged_path.parent)
+                    )
+                    os.close(fd)
+                    tmp_path = Path(tmp_name)
+                    try:
+                        shutil.copy2(staged_path, tmp_path)
+                        ws_path = safe_path(session.workspace, rel)
+                        check_cmd, _ = _expand_command_template(
+                            custom_cmd, ws_path, tmp_path, session=session, rel=rel
+                        )
+                        proc = subprocess.run(
+                            check_cmd,
+                            input=raw_bytes,
+                            capture_output=True,
+                            cwd=str(session.workspace),
+                        )
+                        if proc.returncode != 0:
+                            err = (proc.stderr or proc.stdout).decode('utf-8', errors='replace').strip()
+                            results.append({
+                                'path': rel,
+                                'status': 'error',
+                                'changed': False,
+                                'command': check_cmd,
+                                'returncode': proc.returncode,
+                                'error': rewrite_diagnostic_paths(err, session),
+                            })
+                            continue
+                        disk_bytes = tmp_path.read_bytes()
+                        formatted_bytes = disk_bytes if disk_bytes != raw_bytes else (proc.stdout or raw_bytes)
+                    finally:
+                        if tmp_path.exists():
+                            tmp_path.unlink()
+                else:
+                    proc = subprocess.run(
+                        cmd,
+                        input=raw_bytes,
+                        capture_output=True,
+                        cwd=str(session.workspace),
+                    )
+                    if proc.returncode != 0:
+                        err = (proc.stderr or proc.stdout).decode('utf-8', errors='replace').strip()
+                        results.append({
+                            'path': rel,
+                            'status': 'error',
+                            'changed': False,
+                            'command': cmd,
+                            'returncode': proc.returncode,
+                            'error': rewrite_diagnostic_paths(err, session),
+                        })
+                        continue
+                    disk_bytes = staged_path.read_bytes()
+                    if disk_bytes != raw_bytes:
+                        formatted_bytes = disk_bytes
+                    elif proc.stdout:
+                        formatted_bytes = proc.stdout
+                    else:
+                        formatted_bytes = raw_bytes
+        except OSError as exc:
+            results.append({
+                'path': rel,
+                'status': 'error',
+                'changed': False,
+                'command': cmd,
+                'returncode': 127,
+                'error': str(exc),
+            })
+            continue
+
+        changed = formatted_bytes != raw_bytes
+        if changed and not check_only:
+            if staged_path.read_bytes() != formatted_bytes:
+                write_bytes_atomic(staged_path, formatted_bytes)
+            modified_any = True
+
+        status = (
+            'would_format' if (changed and check_only)
+            else 'formatted' if changed
+            else 'unchanged'
+        )
+        results.append({
+            'path': rel,
+            'status': status,
+            'changed': changed,
+            'command': cmd,
+            'returncode': 0,
+        })
+
+    if modified_any:
+        session.refresh_index()
+
+    changed_count = sum(1 for r in results if r['changed'])
+    error_count = sum(1 for r in results if r['status'] == 'error')
+    ok = error_count == 0 and not (check_only and changed_count > 0)
+    report = {
+        'ok': ok,
+        'check': check_only,
+        'changed': changed_count,
+        'formatted': sum(1 for r in results if r['status'] == 'formatted'),
+        'would_format': sum(1 for r in results if r['status'] == 'would_format'),
+        'unchanged': sum(1 for r in results if r['status'] == 'unchanged'),
+        'skipped': sum(1 for r in results if r['status'] == 'skipped'),
+        'errors': error_count,
+        'files': results,
+    }
+
+    if as_json:
+        print(json.dumps(report))
+    else:
+        for item in results:
+            tag = item['status'].upper()
+            palette = {
+                'FORMATTED': '32',
+                'WOULD_FORMAT': '33',
+                'UNCHANGED': '2',
+                'SKIPPED': '2',
+                'ERROR': '31',
+            }.get(tag, '0')
+            line = '{} {}'.format(color('[{}]'.format(tag), palette), item['path'])
+            if item.get('error'):
+                line += '\n  ' + item['error']
+            print(line)
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# 3. Tier 1 & Tier 2: Zero-Replication Linting, Import Resolution & Typechecking (`staged check`)
+# ---------------------------------------------------------------------------
+
+def build_python_overlay_env(session, base_env=None):
+    env = dict(os.environ if base_env is None else base_env)
+    overlay_entries = [str(session.staging.resolve()), str(session.workspace.resolve())]
+    for var in ('PYTHONPATH', 'MYPYPATH'):
+        existing = env.get(var, '')
+        parts = overlay_entries + ([existing] if existing else [])
+        env[var] = os.pathsep.join(parts)
+    return env
+
+
+def check_python_syntax_and_imports(session, rel):
+    staged_path = safe_path(session.staging, rel)
+    raw = staged_path.read_bytes()
+    try:
+        source = raw.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        return False, ['{}:1:1: SyntaxError: invalid UTF-8 encoding ({})'.format(rel, exc)]
+
+    try:
+        tree = ast.parse(source, filename=rel)
+    except SyntaxError as exc:
+        lineno = exc.lineno or 1
+        col = exc.offset or 1
+        return False, ['{}:{}:{}: SyntaxError: {}'.format(rel, lineno, col, exc.msg)]
+
+    diagnostics = []
+    deleted_set = set(session.deletions)
+    rename_sources = {old for dst, old in session.manifest.items() if dst != '_deletions' and old != dst}
+    unavailable_ws_files = deleted_set | rename_sources
+
+    rel_parent = Path(rel).parent
+
+    def _resolve_module_candidates(mod_name, level=0):
+        parts = mod_name.split('.') if mod_name else []
+        if level > 0:
+            base = rel_parent
+            for _ in range(level - 1):
+                base = base.parent
+            target_rel = base.joinpath(*parts) if parts else base
+        else:
+            target_rel = Path(*parts) if parts else Path('.')
+        posix_base = target_rel.as_posix().lstrip('./')
+        if not posix_base:
+            return []
+        return [
+            posix_base + '.py',
+            posix_base + '/__init__.py',
+        ]
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                candidates = _resolve_module_candidates(alias.name, level=0)
+                if any(c in unavailable_ws_files and not (session.staging / c).is_file() for c in candidates):
+                    diagnostics.append(
+                        '{}:{}:1: ImportError: module {!r} is staged for deletion/rename'.format(
+                            rel, getattr(node, 'lineno', 1), alias.name
+                        )
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            candidates = _resolve_module_candidates(node.module or '', level=node.level or 0)
+            if any(c in unavailable_ws_files and not (session.staging / c).is_file() for c in candidates):
+                diagnostics.append(
+                    '{}:{}:1: ImportError: module {!r} is staged for deletion/rename'.format(
+                        rel, getattr(node, 'lineno', 1), node.module or '.'
+                    )
+                )
+            elif node.level and node.level > 0:
+                resolved_file = None
+                for c in candidates:
+                    st_cand = session.staging / c
+                    ws_cand = session.workspace / c
+                    if st_cand.is_file():
+                        resolved_file = st_cand
+                        break
+                    if c not in unavailable_ws_files and ws_cand.is_file():
+                        resolved_file = ws_cand
+                        break
+                if resolved_file is None and candidates:
+                    pkg_dir = Path(candidates[0]).parent
+                    sub_ok = True
+                    for alias in node.names:
+                        if alias.name == '*':
+                            sub_ok = False
+                            break
+                        sub_py = (pkg_dir / (alias.name + '.py')).as_posix()
+                        if not ((session.staging / sub_py).is_file() or (
+                            sub_py not in unavailable_ws_files and (session.workspace / sub_py).is_file()
+                        )):
+                            sub_ok = False
+                            break
+                    if not sub_ok:
+                        diagnostics.append(
+                            '{}:{}:1: ImportError: cannot resolve relative import {!r}'.format(
+                                rel, getattr(node, 'lineno', 1), node.module or '.'
+                            )
+                        )
+
+    return len(diagnostics) == 0, diagnostics
+
+
+def deleted_set_or_renames(deleted_rels, rename_sources):
+    return set(deleted_rels) | set(rename_sources)
+
+
+def generate_tsconfig_overlay(session, ts_files=None):
+    ws_tsconfig = session.workspace / 'tsconfig.json'
+    overlay_path = safe_path(session.directory, '.review/tsconfig.staged.json')
+
+    staged_files = session.files(fresh=True)
+    deleted_rels = set(session.deletions)
+    rename_sources = {old for dst, old in session.manifest.items() if dst != '_deletions' and old != dst}
+    shadowed_ws_rels = set(staged_files.keys()) | deleted_set_or_renames(deleted_rels, rename_sources)
+
+    include_list = [
+        (session.staging.resolve().as_posix() + '/**/*'),
+        (session.workspace.resolve().as_posix() + '/**/*'),
+    ]
+    exclude_list = [
+        (session.workspace.resolve() / 'node_modules').as_posix(),
+    ]
+    for rel in sorted(shadowed_ws_rels):
+        exclude_list.append(safe_path(session.workspace, rel).as_posix())
+
+    config = {
+        'compilerOptions': {
+            'noEmit': True,
+            'rootDirs': [
+                str(session.staging.resolve()),
+                str(session.workspace.resolve()),
+            ],
+        },
+        'include': include_list,
+        'exclude': exclude_list,
+    }
+    if ws_tsconfig.is_file():
+        config['extends'] = str(ws_tsconfig.resolve())
+
+    write_text_file(overlay_path, json.dumps(config, indent=2) + '\n')
+    return overlay_path
+
+
+def build_c_check_command(session, rel, compiler=None):
+    ext = Path(rel).suffix.lower()
+    is_cpp = ext in CPP_EXTENSIONS
+    if compiler is None:
+        candidates = ('clang++', 'g++', 'clang', 'gcc') if is_cpp else ('clang', 'gcc')
+        for name in candidates:
+            found = resolve_local_binary(session.workspace, name)
+            if found:
+                compiler = found
+                break
+    if not compiler:
+        return None
+
+    staged_file = safe_path(session.staging, rel)
+    ws_file = safe_path(session.workspace, rel)
+    return [
+        compiler,
+        '-fsyntax-only',
+        '-I' + str(staged_file.parent),
+        '-I' + str(ws_file.parent),
+        '-I' + str(session.staging),
+        '-I' + str(session.workspace),
+        str(staged_file),
+    ]
+
+
+def build_java_check_command(session, rel_or_files, tmp_out, javac_bin=None):
+    if javac_bin is None:
+        javac_bin = resolve_local_binary(session.workspace, 'javac')
+    if not javac_bin:
+        return None
+
+    rels = [rel_or_files] if isinstance(rel_or_files, str) else list(rel_or_files)
+    staged_targets = [str(safe_path(session.staging, r)) for r in rels]
+    sourcepath = os.pathsep.join([str(session.staging.resolve()), str(session.workspace.resolve())])
+    return [
+        javac_bin,
+        '-proc:none',
+        '-d', str(tmp_out),
+        '-sourcepath', sourcepath,
+    ] + staged_targets
+
+
+def check_staged(ctx, session, target=None):
+    args = getattr(ctx, 'args', None)
+    if target is None and args is not None:
+        target = getattr(args, 'file', None)
+    use_sandbox = bool(getattr(args, 'sandbox', False))
+    custom_cmd = getattr(args, 'cmd', None) or (ctx.setting('check_cmd') if hasattr(ctx, 'setting') else None)
+    as_json = bool(getattr(args, 'json', False))
+
+    if use_sandbox:
+        if custom_cmd:
+            cmd_tokens = shlex.split(custom_cmd) if isinstance(custom_cmd, str) else list(custom_cmd)
+        else:
+            cmd_tokens = _detect_project_sandbox_check_command(session.workspace)
+        return exec_in_sandbox(ctx, session, cmd_tokens, sync_back=False, as_json=as_json)
+
+    paths = [p for p in selected(session, target) if p not in session.deletions]
+    checks = []
+    py_env = build_python_overlay_env(session)
+
+    if custom_cmd:
+        for rel in paths:
+            staged_path = safe_path(session.staging, rel)
+            ws_path = safe_path(session.workspace, rel)
+            cmd, uses_stdin = _expand_command_template(
+                custom_cmd, ws_path, staged_path, session=session, rel=rel
+            )
+            raw_bytes = staged_path.read_bytes() if uses_stdin else None
+            proc = subprocess.run(
+                cmd,
+                input=raw_bytes,
+                capture_output=True,
+                cwd=str(session.workspace),
+                env=py_env,
+            )
+            diag_raw = (proc.stdout + proc.stderr).decode('utf-8', errors='replace').strip()
+            diag = rewrite_diagnostic_paths(diag_raw, session)
+            checks.append({
+                'path': rel,
+                'tool': cmd[0],
+                'tier': 1,
+                'ok': proc.returncode == 0,
+                'returncode': proc.returncode,
+                'diagnostics': [diag] if diag else [],
+            })
+        return _finalize_check_report(checks, as_json=as_json)
+
+    py_files = []
+    ts_files = []
+    java_files = []
+
+    for rel in paths:
+        staged_path = safe_path(session.staging, rel)
+        if not staged_path.is_file():
+            raise StagedError('Missing staged contents: ' + rel)
+        raw_bytes = staged_path.read_bytes()
+        if is_binary_bytes(raw_bytes):
+            continue
+
+        ws_path = safe_path(session.workspace, rel)
+        ext = Path(rel).suffix.lower()
+
+        if ext in PYTHON_EXTENSIONS:
+            py_files.append(rel)
+            ast_ok, ast_diags = check_python_syntax_and_imports(session, rel)
+            checks.append({
+                'path': rel,
+                'tool': 'python-ast',
+                'tier': 1,
+                'ok': ast_ok,
+                'returncode': 0 if ast_ok else 1,
+                'diagnostics': ast_diags,
+            })
+
+            ruff = resolve_local_binary(session.workspace, 'ruff')
+            if ruff:
+                proc = subprocess.run(
+                    [ruff, 'check', '--stdin-filename', str(ws_path), '-'],
+                    input=raw_bytes,
+                    capture_output=True,
+                    cwd=str(session.workspace),
+                    env=py_env,
+                )
+                out = rewrite_diagnostic_paths(
+                    (proc.stdout + proc.stderr).decode('utf-8', errors='replace').strip(), session
+                )
+                checks.append({
+                    'path': rel,
+                    'tool': 'ruff',
+                    'tier': 1,
+                    'ok': proc.returncode == 0,
+                    'returncode': proc.returncode,
+                    'diagnostics': [out] if (out and proc.returncode != 0) else [],
+                })
+            else:
+                flake8 = resolve_local_binary(session.workspace, 'flake8')
+                if flake8:
+                    proc = subprocess.run(
+                        [flake8, '--stdin-display-name', str(ws_path), '-'],
+                        input=raw_bytes,
+                        capture_output=True,
+                        cwd=str(session.workspace),
+                        env=py_env,
+                    )
+                    out = rewrite_diagnostic_paths(
+                        (proc.stdout + proc.stderr).decode('utf-8', errors='replace').strip(), session
+                    )
+                    checks.append({
+                        'path': rel,
+                        'tool': 'flake8',
+                        'tier': 1,
+                        'ok': proc.returncode == 0,
+                        'returncode': proc.returncode,
+                        'diagnostics': [out] if (out and proc.returncode != 0) else [],
+                    })
+
+        elif ext in JS_TS_CHECK_EXTENSIONS:
+            if ext in TS_EXTENSIONS or (session.workspace / 'tsconfig.json').is_file():
+                ts_files.append(rel)
+            has_biome = (session.workspace / 'biome.json').is_file() or (session.workspace / 'biome.jsonc').is_file()
+            biome = resolve_local_binary(session.workspace, 'biome') if has_biome else None
+            eslint = resolve_local_binary(session.workspace, 'eslint')
+            if biome:
+                proc = subprocess.run(
+                    [biome, 'check', '--stdin-file-path=' + str(ws_path)],
+                    input=raw_bytes,
+                    capture_output=True,
+                    cwd=str(session.workspace),
+                )
+                out = rewrite_diagnostic_paths(
+                    (proc.stdout + proc.stderr).decode('utf-8', errors='replace').strip(), session
+                )
+                checks.append({
+                    'path': rel,
+                    'tool': 'biome',
+                    'tier': 1,
+                    'ok': proc.returncode == 0,
+                    'returncode': proc.returncode,
+                    'diagnostics': [out] if (out and proc.returncode != 0) else [],
+                })
+            elif eslint:
+                proc = subprocess.run(
+                    [eslint, '--stdin', '--stdin-filename', str(ws_path)],
+                    input=raw_bytes,
+                    capture_output=True,
+                    cwd=str(session.workspace),
+                )
+                out = rewrite_diagnostic_paths(
+                    (proc.stdout + proc.stderr).decode('utf-8', errors='replace').strip(), session
+                )
+                checks.append({
+                    'path': rel,
+                    'tool': 'eslint',
+                    'tier': 1,
+                    'ok': proc.returncode == 0,
+                    'returncode': proc.returncode,
+                    'diagnostics': [out] if (out and proc.returncode != 0) else [],
+                })
+
+        elif ext in C_CPP_EXTENSIONS:
+            c_cmd = build_c_check_command(session, rel)
+            if c_cmd:
+                proc = subprocess.run(
+                    c_cmd,
+                    capture_output=True,
+                    cwd=str(session.workspace),
+                )
+                out = rewrite_diagnostic_paths(
+                    (proc.stdout + proc.stderr).decode('utf-8', errors='replace').strip(), session
+                )
+                checks.append({
+                    'path': rel,
+                    'tool': Path(c_cmd[0]).name,
+                    'tier': 1,
+                    'ok': proc.returncode == 0,
+                    'returncode': proc.returncode,
+                    'diagnostics': [out] if (out and proc.returncode != 0) else [],
+                })
+
+        elif ext == '.java':
+            java_files.append(rel)
+
+        elif ext == '.swift':
+            swiftc = resolve_local_binary(session.workspace, 'swiftc')
+            if swiftc and not (session.workspace / 'Package.swift').is_file():
+                proc = subprocess.run(
+                    [swiftc, '-typecheck', str(staged_path)],
+                    capture_output=True,
+                    cwd=str(session.workspace),
+                )
+                out = rewrite_diagnostic_paths(
+                    (proc.stdout + proc.stderr).decode('utf-8', errors='replace').strip(), session
+                )
+                checks.append({
+                    'path': rel,
+                    'tool': 'swiftc',
+                    'tier': 1,
+                    'ok': proc.returncode == 0,
+                    'returncode': proc.returncode,
+                    'diagnostics': [out] if (out and proc.returncode != 0) else [],
+                })
+
+    if java_files:
+        tmp_out = session.directory / '.review' / 'javac-classes'
+        tmp_out.mkdir(parents=True, exist_ok=True)
+        try:
+            java_cmd = build_java_check_command(session, java_files, tmp_out)
+            if java_cmd:
+                proc = subprocess.run(
+                    java_cmd,
+                    capture_output=True,
+                    cwd=str(session.workspace),
+                )
+                out = rewrite_diagnostic_paths(
+                    (proc.stdout + proc.stderr).decode('utf-8', errors='replace').strip(), session
+                )
+                checks.append({
+                    'path': ', '.join(java_files),
+                    'tool': 'javac',
+                    'tier': 2,
+                    'ok': proc.returncode == 0,
+                    'returncode': proc.returncode,
+                    'diagnostics': [out] if (out and proc.returncode != 0) else [],
+                })
+        finally:
+            if tmp_out.exists():
+                shutil.rmtree(tmp_out, ignore_errors=True)
+
+    if ts_files and (session.workspace / 'tsconfig.json').is_file():
+        tsconfig_staged = generate_tsconfig_overlay(session, ts_files=ts_files)
+        tsc = resolve_local_binary(session.workspace, 'tsc')
+        if tsc:
+            proc = subprocess.run(
+                [tsc, '-p', str(tsconfig_staged)],
+                capture_output=True,
+                cwd=str(session.workspace),
+            )
+            out = rewrite_diagnostic_paths(
+                (proc.stdout + proc.stderr).decode('utf-8', errors='replace').strip(), session
+            )
+            checks.append({
+                'path': 'tsconfig.staged.json',
+                'tool': 'tsc',
+                'tier': 2,
+                'ok': proc.returncode == 0,
+                'returncode': proc.returncode,
+                'diagnostics': [out] if (out and proc.returncode != 0) else [],
+            })
+
+    if py_files:
+        has_mypy_cfg = any(
+            (session.workspace / cfg).is_file()
+            for cfg in ('mypy.ini', '.mypy.ini', 'pyproject.toml', 'setup.cfg')
+        )
+        mypy = resolve_local_binary(session.workspace, 'mypy') if has_mypy_cfg else None
+        if mypy:
+            staged_py_targets = [str(safe_path(session.staging, r)) for r in py_files]
+            proc = subprocess.run(
+                [mypy] + staged_py_targets,
+                capture_output=True,
+                cwd=str(session.workspace),
+                env=py_env,
+            )
+            out = rewrite_diagnostic_paths(
+                (proc.stdout + proc.stderr).decode('utf-8', errors='replace').strip(), session
+            )
+            checks.append({
+                'path': ', '.join(py_files),
+                'tool': 'mypy',
+                'tier': 2,
+                'ok': proc.returncode == 0,
+                'returncode': proc.returncode,
+                'diagnostics': [out] if (out and proc.returncode != 0) else [],
+            })
+
+    return _finalize_check_report(checks, as_json=as_json)
+
+
+def _detect_project_sandbox_check_command(workspace):
+    workspace = Path(workspace)
+    if (workspace / 'Makefile').is_file() or (workspace / 'makefile').is_file():
+        return ['make', 'test']
+    if (workspace / 'Package.swift').is_file():
+        return ['swift', 'build']
+    if (workspace / 'Cargo.toml').is_file():
+        return ['cargo', 'check']
+    if (workspace / 'go.mod').is_file():
+        return ['go', 'vet', './...']
+    if (workspace / 'pom.xml').is_file():
+        return ['mvn', 'test-compile']
+    if (workspace / 'package.json').is_file():
+        return ['npm', 'run', 'check']
+    return [sys.executable, '-m', 'unittest']
+
+
+def _finalize_check_report(checks, as_json=False):
+    all_diags = []
+    for item in checks:
+        all_diags.extend(item.get('diagnostics', []))
+    failed = [c for c in checks if not c['ok']]
+    report = {
+        'ok': len(failed) == 0,
+        'total_checks': len(checks),
+        'passed': len(checks) - len(failed),
+        'failed': len(failed),
+        'checks': checks,
+        'diagnostics': all_diags,
+    }
+    if as_json:
+        print(json.dumps(report))
+    else:
+        for item in checks:
+            status_str = 'PASS' if item['ok'] else 'FAIL'
+            code = '32' if item['ok'] else '31'
+            print('{} {} ({})'.format(
+                color('[{}]'.format(status_str), code),
+                item['path'],
+                item['tool'],
+            ))
+            for diag in item.get('diagnostics', []):
+                for line in diag.splitlines():
+                    print('  ' + line)
+    return report
+
+
+# ---------------------------------------------------------------------------
+# 4. Tier 3: Ephemeral CoW / Hardlink Overlay Sandbox (`staged exec`)
+# ---------------------------------------------------------------------------
+
+def remove_sandbox(sandbox_dir):
+    sandbox_dir = Path(sandbox_dir)
+    if not sandbox_dir.exists() and not sandbox_dir.is_symlink():
+        return
+    if sandbox_dir.is_symlink() or sandbox_dir.is_file():
+        sandbox_dir.unlink()
+        return
+
+    for entry in list(sandbox_dir.iterdir()):
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink()
+        elif entry.is_dir():
+            remove_sandbox(entry)
+    try:
+        sandbox_dir.rmdir()
+    except OSError:
+        shutil.rmtree(sandbox_dir, ignore_errors=True)
+
+
+def materialize_sandbox(session, sandbox_dir=None):
+    sandbox_dir = Path(sandbox_dir) if sandbox_dir is not None else (session.directory / '.sandbox')
+    if sandbox_dir.exists() or sandbox_dir.is_symlink():
+        remove_sandbox(sandbox_dir)
+    sandbox_dir.mkdir(parents=True, exist_ok=True)
+
+    staged_files = session.files(fresh=True)
+    deleted_rels = set(session.deletions)
+    rename_sources = {old for dst, old in session.manifest.items() if dst != '_deletions' and old != dst}
+    omitted_ws_files = set(staged_files.keys()) | deleted_rels | rename_sources
+
+    touched_dir_prefixes = set()
+    for rel in (set(staged_files.keys()) | deleted_rels | rename_sources):
+        for parent in Path(rel).parents:
+            if str(parent) != '.':
+                touched_dir_prefixes.add(parent.as_posix())
+
+    workspace = session.workspace.resolve()
+    for root, dirs, files in os.walk(workspace, topdown=True, followlinks=False):
+        root_path = Path(root)
+        rel_root = root_path.relative_to(workspace)
+        rel_root_posix = '' if str(rel_root) == '.' else rel_root.as_posix()
+
+        kept_dirs = []
+        for d in dirs:
+            if d.lower() == '.git':
+                continue
+            dir_rel_posix = (rel_root_posix + '/' + d) if rel_root_posix else d
+            ws_subdir = root_path / d
+            sb_subdir = sandbox_dir / dir_rel_posix
+
+            if ws_subdir.is_symlink():
+                sb_subdir.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(os.readlink(str(ws_subdir)), str(sb_subdir))
+                continue
+
+            if d in HEAVY_SYMLINK_DIRS and dir_rel_posix not in touched_dir_prefixes:
+                sb_subdir.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(str(ws_subdir), str(sb_subdir))
+                continue
+
+            kept_dirs.append(d)
+        dirs[:] = kept_dirs
+
+        for fname in files:
+            file_rel_posix = (rel_root_posix + '/' + fname) if rel_root_posix else fname
+            if file_rel_posix in omitted_ws_files:
+                continue
+            ws_file = root_path / fname
+            sb_file = sandbox_dir / file_rel_posix
+            sb_file.parent.mkdir(parents=True, exist_ok=True)
+            if ws_file.is_symlink():
+                os.symlink(os.readlink(str(ws_file)), str(sb_file))
+            else:
+                try:
+                    os.link(str(ws_file), str(sb_file))
+                except OSError:
+                    shutil.copy2(str(ws_file), str(sb_file))
+
+    for rel, staged_path in staged_files.items():
+        sb_target = sandbox_dir / rel
+        sb_target.parent.mkdir(parents=True, exist_ok=True)
+        if sb_target.exists() or sb_target.is_symlink():
+            sb_target.unlink()
+        shutil.copy2(str(staged_path), str(sb_target))
+
+    return sandbox_dir
+
+
+def exec_in_sandbox(ctx, session, command_args, sync_back=False, as_json=False, keep_sandbox=False):
+    args = getattr(ctx, 'args', None)
+    if args is not None:
+        if not sync_back:
+            sync_back = bool(getattr(args, 'sync', False))
+        if not as_json:
+            as_json = bool(getattr(args, 'json', False))
+        if not keep_sandbox:
+            keep_sandbox = bool(getattr(args, 'keep_sandbox', False))
+
+    if isinstance(command_args, str):
+        cmd = shlex.split(command_args)
+    else:
+        cmd = list(command_args or [])
+    if cmd and cmd[0] == '--':
+        cmd = cmd[1:]
+    if not cmd:
+        raise StagedError('Provide a command to execute in the sandbox (e.g. staged exec -- pytest).')
+
+    staged_before = {rel: path for rel, path in session.files(fresh=True).items()}
+    sandbox_dir = materialize_sandbox(session)
+    synced = []
+
+    try:
+        env = os.environ.copy()
+        py_existing = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = os.pathsep.join([str(sandbox_dir)] + ([py_existing] if py_existing else []))
+
+        node_modules = sandbox_dir / 'node_modules'
+        if node_modules.exists():
+            node_existing = env.get('NODE_PATH', '')
+            env['NODE_PATH'] = os.pathsep.join([str(node_modules)] + ([node_existing] if node_existing else []))
+
+        bin_dir = 'Scripts' if os.name == 'nt' else 'bin'
+        extra_bins = []
+        for candidate in (
+            sandbox_dir / 'node_modules' / '.bin',
+            sandbox_dir / '.venv' / bin_dir,
+            sandbox_dir / 'venv' / bin_dir,
+        ):
+            if candidate.exists():
+                extra_bins.append(str(candidate))
+        if extra_bins:
+            env['PATH'] = os.pathsep.join(extra_bins + [env.get('PATH', '')])
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(sandbox_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+                errors='replace',
+            )
+            returncode = proc.returncode
+            raw_stdout = proc.stdout or ''
+            raw_stderr = proc.stderr or ''
+        except OSError as exc:
+            returncode = 127
+            raw_stdout = ''
+            raw_stderr = str(exc) + '\n'
+
+        clean_stdout = rewrite_diagnostic_paths(raw_stdout, session, sandbox_dir=sandbox_dir)
+        clean_stderr = rewrite_diagnostic_paths(raw_stderr, session, sandbox_dir=sandbox_dir)
+
+        if sync_back:
+            for rel, staged_path in staged_before.items():
+                sb_file = sandbox_dir / rel
+                if sb_file.is_file() and not equal_files(sb_file, staged_path):
+                    copy_atomic(sb_file, staged_path)
+                    synced.append(rel)
+            if synced:
+                session.refresh_index()
+    finally:
+        if not keep_sandbox:
+            remove_sandbox(sandbox_dir)
+
+    result = {
+        'ok': returncode == 0,
+        'returncode': returncode,
+        'command': cmd,
+        'stdout': clean_stdout,
+        'stderr': clean_stderr,
+        'synced': synced,
+        'sandbox': str(sandbox_dir) if keep_sandbox else None,
+    }
+
+    if as_json:
+        print(json.dumps(result))
+    else:
+        if clean_stdout:
+            sys.stdout.write(clean_stdout)
+            if not clean_stdout.endswith('\n'):
+                sys.stdout.write('\n')
+        if clean_stderr:
+            sys.stderr.write(clean_stderr)
+            if not clean_stderr.endswith('\n'):
+                sys.stderr.write('\n')
+
+    return result
 
 def clean_session(ctx, session):
     if getattr(ctx.args, 'clean_session', None) is not None:
@@ -2133,8 +3373,11 @@ def make_parser():
         'summarize': 'Write concise session and file change summaries (view them with staged --summary).',
         'init': 'Create an isolated session and record its workspace and branch.',
         'diff': 'Review proposed files, apply with -a, clean with -c, or apply then clean with -ac.',
-        'apply': 'Apply proposed files, renames and deletions to the workspace.',
-        'undo': 'Restore workspace files to their pre-apply state from a backup.',
+        'apply': 'Apply proposed files, renames and deletions to the workspace with conflict protection.',
+        'undo': 'Atomically roll back the most recent apply operation in this session.',
+        'fmt': 'Format staged files in-place using virtual workspace buffers (zero workspace replication).',
+        'check': 'Lint, typecheck, and verify imports on staged files using virtual workspace overlays.',
+        'exec': 'Run a build or test command inside an ephemeral hardlink/symlink overlay sandbox.',
         'clean': 'Discard staged proposals without changing the workspace.',
         'path': 'Print a raw absolute staged or workspace path.',
         'open': 'Open a staged proposed file or session file in your editor.',
@@ -2210,12 +3453,27 @@ def make_parser():
     comparison.add_argument('--between', nargs=2, metavar=('SESSION1', 'SESSION2'), help='compare proposed files in two sessions')
     comparison.add_argument('--compare-session', help='compare the active session with another session')
     for name in ('diff', 'apply'):
-        command_parsers[name].add_argument('--force', action='store_true', help='allow protected-branch apply')
+        command_parsers[name].add_argument('--force', action='store_true', help='allow protected-branch or conflicting workspace apply')
+        command_parsers[name].add_argument('--no-merge', action='store_true', help='disable automatic 3-way merge when workspace files have drifted')
         command_parsers[name].add_argument('-y', '--yes', action='store_true', help='confirm branch drift or clean')
     p = command_parsers['undo']
     p.add_argument('--force', action='store_true', help='undo even if workspace files were modified after apply')
     p.add_argument('-y', '--yes', action='store_true', help='confirm overwriting post-apply workspace edits')
     p.add_argument('--json', action='store_true', help='print structured JSON undo result')
+    for name in ('fmt', 'check'):
+        p = command_parsers[name]
+        selection = p.add_mutually_exclusive_group()
+        selection.add_argument('-f', '--file', help='select one staged file')
+        selection.add_argument('--all', action='store_true', help='select all staged files (default)')
+        p.add_argument('--cmd', help='custom command template ({workspace_file}, {staged_file})')
+        p.add_argument('--json', action='store_true', help='print structured JSON report')
+    command_parsers['fmt'].add_argument('--check', action='store_true', help='dry-run check without modifying staged files')
+    command_parsers['check'].add_argument('--sandbox', action='store_true', help='force execution in Tier 3 overlay sandbox')
+    p = command_parsers['exec']
+    p.add_argument('--sync', action='store_true', help='sync modified staged files from sandbox back to staging/')
+    p.add_argument('--keep-sandbox', action='store_true', help='keep .sandbox/ directory after execution for debugging')
+    p.add_argument('--json', action='store_true', help='print structured JSON execution result')
+    p.add_argument('exec_cmd', nargs=argparse.REMAINDER, metavar='COMMAND', help='command and arguments to run inside the overlay sandbox')
     p = command_parsers['clean']
     p.add_argument('-y', '--yes', action='store_true', help='confirm discarding proposed changes')
     p = command_parsers['path']
@@ -2228,7 +3486,7 @@ def make_parser():
         command_parsers[name].add_argument(
             '--meta', action='store_true', default=argparse.SUPPRESS,
             help='use a top-level session metadata file (e.g. staged_changes.md) instead of a proposal')
-    for name in ('summarize', 'diff', 'apply', 'clean', 'migrate', 'undo'):
+    for name in ('summarize', 'diff', 'apply', 'clean', 'migrate', 'fmt', 'check'):
         command_parsers[name].add_argument(
             '--meta', action='store_true', default=argparse.SUPPRESS,
             help='accepted with -f for consistent syntax; this command remains proposal-based')
@@ -2895,6 +4153,11 @@ def main(argv=None):
         if args.default:
             ctx.global_state['default_tool'] = tool.id
         ctx.global_state['staging_root'] = str(root)
+        if tool.id == 'antigravity':
+            brain_dir = str(Path(HOME) / '.gemini/antigravity/brain')
+            roots = ctx.global_state.setdefault('session_roots', [])
+            if brain_dir not in roots:
+                roots.append(brain_dir)
         save_json(GLOBAL_STATE_FILE, ctx.global_state)
         print('Installed /stage: {}'.format(path))
         print('Staging root: {}. Skill installation alone does not grant filesystem permissions.'.format(root))
@@ -2928,6 +4191,18 @@ def main(argv=None):
         open_file(ctx, session, args.file)
     elif args.command == 'undo':
         undo_apply(ctx, session)
+    elif args.command == 'fmt':
+        report = format_staged(ctx, session, args.file)
+        if not report['ok']:
+            sys.exit(1)
+    elif args.command == 'check':
+        report = check_staged(ctx, session, args.file)
+        if not report['ok']:
+            sys.exit(1)
+    elif args.command == 'exec':
+        res = exec_in_sandbox(ctx, session, args.exec_cmd)
+        if not res['ok']:
+            sys.exit(res['returncode'] or 1)
     elif args.command == 'apply' or (args.command == 'diff' and args.apply):
         apply_changes(ctx, session, args.file)
         if args.command == 'diff' and args.clean:
