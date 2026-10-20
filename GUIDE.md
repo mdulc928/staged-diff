@@ -366,6 +366,8 @@ staged -R                               # List all sessions across all workspace
 staged --session other-id diff -f f.py  # One-time session override
 ```
 
+Session IDs from `staged -R` are global: pass the full UUID (or at least eight hex characters) to `--session`, `--from`, or `--to` from any directory. Short names like `foreign` still resolve only in the current workspace.
+
 ---
 
 ### Persistent Defaults
@@ -675,7 +677,7 @@ staged migrate --from approach-a --to approach-b -f 'src/*.py'      # Quote glob
 staged migrate --from approach-a --to approach-b --all             # All files
 ```
 
-- If `--to` is omitted, targets the active session.
+- If `--to` is omitted, targets the active session; if the current workspace has none, `staged` creates a new session there (same as `staged init` with a generated id).
 - Source session and workspace files remain unchanged.
 - If destination files exist or workspace files are newer, migration pauses. Pass `--force` to deliberately overwrite. _(Timestamp checks flag potential staleness; they do not perform a 3-way merge)._
 
@@ -860,6 +862,7 @@ _(After `path`, `-s` means `--staged`; use `--session <id>` for session selectio
 | Session selection ignored           | Environment variables (`STAGED_SESSION`) or CLI flags take precedence over shell bindings.   |
 | Session lost between agent calls    | Use persistent shells or pass `STAGED_SHELL_ID` across agent subprocess calls.               |
 | File or session is ambiguous        | Provide exact relative path or full session ID.                                              |
+| Unknown session from `staged -R`    | Use the full session UUID (or ≥8 hex chars), not a local alias, when the session belongs to another workspace. |
 | Editor launcher missing             | Ensure editor CLI is in `PATH`, switch with `staged use --tool`, or use `--tool cli`.        |
 | Agent denied write access           | Add printed staging root path to harness writable directory permissions.                     |
 | Protected or changed branch warning | Use `--force` for protected branches; use `-y` for drifted branches.                         |

@@ -266,12 +266,20 @@ class Context:
                     result.append(session)
         return sorted(result, key=lambda s: s.modified(), reverse=True)
 
+    @staticmethod
+    def global_session_lookup(key):
+        """True when the user named a session by UUID (as in staged -R), not a local alias."""
+        if re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', key, re.I):
+            return True
+        return bool(re.fullmatch(r'[0-9a-f]{8,}', key, re.I))
+
     def find_session(self, key, all_repos=False, require_workspace=True):
+        search_all = all_repos or self.global_session_lookup(key)
         try:
-            session = self.match_session(self.sessions(all_repos), key)
+            session = self.match_session(self.sessions(search_all), key)
         except StagedError as exc:
-            # An explicit id for a removed workspace is not visible in the current repository.
-            if all_repos or not str(exc).startswith('Unknown session'):
+            # Short local aliases stay scoped to the current workspace when it still exists.
+            if search_all or not str(exc).startswith('Unknown session'):
                 raise
             session = self.match_session(self.sessions(True), key)
             if session.workspace.is_dir():
@@ -4337,17 +4345,27 @@ def cross_diff(ctx):
                    tool.id in ('cli', 'codex', 'claudecode'))
 
 
-def migrate(ctx):
-    source = ctx.find_session(ctx.args.source)
+def migrate_destination(ctx, source):
     if ctx.args.to:
         try:
-            dest = ctx.find_session(ctx.args.to)
+            return ctx.find_session(ctx.args.to)
         except StagedError as exc:
             if not str(exc).startswith('Unknown session:'):
                 raise
-            dest = init_session(ctx, ctx.args.to)
-    else:
-        dest = ctx.active()
+            return init_session(ctx, ctx.args.to)
+    try:
+        candidate = ctx.active(notify=False)
+    except StagedError:
+        candidate = None
+    if (candidate is not None and candidate.workspace == ctx.workspace
+            and candidate.directory != source.directory):
+        return candidate
+    return init_session(ctx, str(uuid.uuid4()))
+
+
+def migrate(ctx):
+    source = ctx.find_session(ctx.args.source)
+    dest = migrate_destination(ctx, source)
     if source.directory == dest.directory:
         raise StagedError('Migration needs two different sessions.')
     if ctx.args.file and any(ch in ctx.args.file for ch in '*?['):

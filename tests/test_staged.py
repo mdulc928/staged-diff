@@ -428,6 +428,52 @@ class CLI(unittest.TestCase):
         self.assertTrue((self.root / 'kept').is_dir())
         self.assertNotIn('orphan', self.run_cli('-R').stdout)
 
+    def test_uuid_session_lookup_works_across_workspaces(self):
+        foreign_id = 'd967289f-8157-4bcc-9161-f1d6c6ee21ce'
+        other = self.base / 'other-workspace'
+        other.mkdir()
+        self.run_cli('init', foreign_id, cwd=other)
+        self.run_cli('create', '-f', 'note.txt', '--text', 'from other\n', cwd=other)
+        self.init('kept')
+
+        self.run_cli('migrate', '--all', '--from', foreign_id, '--to', 'kept')
+        self.assertEqual((self.root / 'kept/staging/note.txt').read_text(), 'from other\n')
+        self.assertTrue((self.root / foreign_id).exists())
+
+        other_id = 'cde71c03-78e7-45d0-9c5a-f909a30d0093'
+        self.run_cli('init', other_id, cwd=other)
+        removed = self.run_cli('clean', '--session', other_id, '-y')
+        self.assertIn('Cleaned session ' + other_id + '.', removed.stdout)
+        self.assertFalse((self.root / other_id).exists())
+
+        self.run_cli('clean', '--session', foreign_id, '-y')
+        self.assertFalse((self.root / foreign_id).exists())
+
+    def test_migrate_without_to_inits_destination_session(self):
+        foreign_id = 'aef557c7-1bf3-4245-b1c9-2ea804ffd439'
+        other = self.base / 'other-workspace'
+        other.mkdir()
+        self.run_cli('init', foreign_id, cwd=other)
+        self.run_cli('create', '-f', 'note.txt', '--text', 'migrate me\n', cwd=other)
+
+        result = self.run_cli('migrate', '--all', '--from', foreign_id)
+        self.assertIn('Migrated 1 change(s) from {} to '.format(foreign_id), result.stdout)
+        dest_id = result.stdout.strip().rsplit(' to ', 1)[-1].rstrip('.')
+        self.assertTrue((self.root / dest_id / 'staging/note.txt').exists())
+        self.assertEqual((self.root / dest_id / '.workspace').read_text().strip(), str(self.repo.resolve()))
+
+    def test_migrate_without_to_uses_active_workspace_session(self):
+        foreign_id = '354adec6-dcdd-46ac-84f9-67ee18f14bb8'
+        other = self.base / 'other-workspace'
+        other.mkdir()
+        self.run_cli('init', foreign_id, cwd=other)
+        self.run_cli('create', '-f', 'note.txt', '--text', 'from other\n', cwd=other)
+        self.init('kept')
+
+        result = self.run_cli('migrate', '--all', '--from', foreign_id)
+        self.assertIn(' to kept.', result.stdout)
+        self.assertEqual((self.root / 'kept/staging/note.txt').read_text(), 'from other\n')
+
     def test_verbose_diff_overview_and_selected_review(self):
         self.propose()
         self.propose(rel='other.txt')
