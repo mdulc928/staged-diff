@@ -2,6 +2,8 @@
 """Isolated proposal files, explicit review and apply. Python 3.8+; no dependencies."""
 import argparse
 import base64
+import difflib
+import hashlib
 import hashlib
 import io
 import fnmatch
@@ -31,10 +33,10 @@ if os.name == 'nt':
     DATA_DIR = Path(os.environ.get('LOCALAPPDATA', HOME)) / 'staged'
 GLOBAL_STATE_FILE = CONFIG_DIR / 'state.json'
 DEFAULT_PROTECTED_BRANCHES = []
-STATUS_COLORS = {'APPLIED': '32', 'MODIFIED': '33', 'NEW FILE': '36', 'RENAMED': '35',
-                 'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
+STATUS_COLORS = {'APPLIED': '32', 'MERGED': '1;32', 'UNDONE': '1;36', 'MODIFIED': '33', 'NEW FILE': '36',
+                 'RENAMED': '35', 'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
 STATUS_ORDER = ('MISSING', 'NEW FILE', 'MODIFIED', 'RENAMED', 'RELOCATED', 'DELETED', 'APPLIED')
-COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'init', 'diff', 'apply', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
+COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'init', 'diff', 'apply', 'undo', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
 
 
 def is_reserved_windows_name(name):
@@ -871,24 +873,533 @@ def preflight(session, paths):
             raise StagedError('Conflicting staged file and directory: ' + rel)
 
 
+# ===========================================================================
+# Base-Snapshot Conflict Protection, 3-Way Merge & Workspace Undo
+# ===========================================================================
+
+def file_sha256(path):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def file_mode(path):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def is_utf8_text_file(path):
+    path = Path(path)
+    if not path.is_file():
+        return False
+    try:
+        raw = path.read_bytes()
+        if b'\x00' in raw:
+            return False
+        raw.decode('utf-8')
+        return True
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def base_metadata_path(session):
+    return safe_path(session.directory, '.base.json')
+
+
+def base_files_root(session):
+    root = session.directory / '.base'
+    if root.is_symlink():
+        raise StagedError('Session .base directory cannot be a symlink: {}'.format(root))
+    return root
+
+
+def load_base_metadata(session):
+    path = base_metadata_path(session)
+    data = load_json(path)
+    if not isinstance(data.get('files', {}), dict):
+        raise StagedError('.base.json requires a files object.')
+    data.setdefault('files', {})
+    return data
+
+
+def save_base_metadata(session, data):
+    save_json(base_metadata_path(session), data)
+
+
+def record_base_snapshot(session, workspace_rel, reset=False):
+    """Record the workspace baseline for workspace_rel on first touch in the session."""
+    ws_file = safe_path(session.workspace, workspace_rel)
+    base_root = base_files_root(session)
+    base_root.mkdir(parents=True, exist_ok=True)
+    base_file = safe_path(base_root, workspace_rel)
+    data = load_base_metadata(session)
+    files = data['files']
+
+    if not reset and workspace_rel in files:
+        existing_entry = files[workspace_rel]
+        if existing_entry.get('existed'):
+            if base_file.is_file():
+                return existing_entry
+        else:
+            return existing_entry
+
+    now = time.time()
+    if ws_file.is_file():
+        copy_atomic(ws_file, base_file)
+        st = ws_file.stat()
+        entry = {
+            'sha256': file_sha256(base_file),
+            'size': st.st_size,
+            'mode': stat.S_IMODE(st.st_mode),
+            'recorded_at': now,
+            'existed': True,
+        }
+    else:
+        if base_file.is_file():
+            base_file.unlink()
+        entry = {
+            'existed': False,
+            'recorded_at': now,
+        }
+    files[workspace_rel] = entry
+    save_base_metadata(session, data)
+    return entry
+
+
+def remove_base_snapshot(session, workspace_rel):
+    """Remove a single path's base snapshot entry and stored file."""
+    data = load_base_metadata(session)
+    files = data['files']
+    files.pop(workspace_rel, None)
+    base_root = base_files_root(session)
+    if base_root.exists():
+        base_file = safe_path(base_root, workspace_rel)
+        if base_file.is_file():
+            base_file.unlink()
+            parent = base_file.parent
+            while parent != base_root and parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+                parent = parent.parent
+    if files:
+        save_base_metadata(session, data)
+    else:
+        meta_path = base_metadata_path(session)
+        if meta_path.is_file():
+            meta_path.unlink()
+        if base_root.is_dir() and not any(base_root.iterdir()):
+            shutil.rmtree(base_root)
+
+
+def clear_all_base_snapshots(session):
+    """Remove all base snapshots in the session."""
+    meta_path = base_metadata_path(session)
+    if meta_path.is_file():
+        meta_path.unlink()
+    base_root = base_files_root(session)
+    if base_root.exists():
+        shutil.rmtree(base_root)
+
+
+def three_way_merge_difflib(ours_text, base_text, theirs_text):
+    """Deterministic pure-Python non-overlapping hunk 3-way merge using difflib.
+
+    Returns (merged_text, clean_bool).
+    """
+    base_lines = base_text.splitlines(keepends=True)
+    ours_lines = ours_text.splitlines(keepends=True)
+    theirs_lines = theirs_text.splitlines(keepends=True)
+
+    def extract_edits(src, dst):
+        matcher = difflib.SequenceMatcher(None, src, dst, autojunk=False)
+        edits = []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag != 'equal':
+                edits.append((i1, i2, dst[j1:j2]))
+        return edits
+
+    ours_edits = extract_edits(base_lines, ours_lines)
+    theirs_edits = extract_edits(base_lines, theirs_lines)
+
+    combined = []
+    oi, ti = 0, 0
+    while oi < len(ours_edits) or ti < len(theirs_edits):
+        if oi < len(ours_edits) and (ti >= len(theirs_edits) or ours_edits[oi][0] <= theirs_edits[ti][0]):
+            edit = ('ours', ours_edits[oi][0], ours_edits[oi][1], ours_edits[oi][2])
+            oi += 1
+        else:
+            edit = ('theirs', theirs_edits[ti][0], theirs_edits[ti][1], theirs_edits[ti][2])
+            ti += 1
+        combined.append(edit)
+
+    merged_edits = []
+    for side, start, end, repl in combined:
+        if not merged_edits:
+            merged_edits.append([side, start, end, repl])
+            continue
+        prev_side, prev_start, prev_end, prev_repl = merged_edits[-1]
+        if start < prev_end or (start == prev_end and (prev_start == prev_end or start == end)):
+            if start == prev_start and end == prev_end and repl == prev_repl:
+                continue
+            return None, False
+        merged_edits.append([side, start, end, repl])
+
+    out = []
+    cursor = 0
+    for _, start, end, repl in merged_edits:
+        out.extend(base_lines[cursor:start])
+        out.extend(repl)
+        cursor = end
+    out.extend(base_lines[cursor:])
+    return ''.join(out), True
+
+
+def three_way_merge(ours_path, base_path, theirs_path, prefer_pure_python=False):
+    """Attempt a clean 3-way merge of ours_path, base_path, theirs_path.
+
+    First tries `git merge-file -p` if git is on PATH (unless prefer_pure_python=True),
+    and falls back to `three_way_merge_difflib`.
+    Returns (merged_bytes, True) on clean merge, or (None, False) on conflict / non-UTF8.
+    """
+    for p in (ours_path, base_path, theirs_path):
+        if not is_utf8_text_file(p):
+            return None, False
+
+    if not prefer_pure_python and shutil.which('git'):
+        with tempfile.TemporaryDirectory(prefix='.staged-merge-') as tmpdir:
+            tmp_ours = Path(tmpdir) / 'ours'
+            tmp_base = Path(tmpdir) / 'base'
+            tmp_theirs = Path(tmpdir) / 'theirs'
+            shutil.copy2(ours_path, tmp_ours)
+            shutil.copy2(base_path, tmp_base)
+            shutil.copy2(theirs_path, tmp_theirs)
+            try:
+                res = subprocess.run(
+                    ['git', 'merge-file', '-p', str(tmp_ours), str(tmp_base), str(tmp_theirs)],
+                    capture_output=True
+                )
+                if res.returncode == 0:
+                    return res.stdout, True
+                elif res.returncode > 0:
+                    return None, False
+            except OSError:
+                pass
+
+    ours_text = Path(ours_path).read_text(encoding='utf-8')
+    base_text = Path(base_path).read_text(encoding='utf-8')
+    theirs_text = Path(theirs_path).read_text(encoding='utf-8')
+    merged_text, ok = three_way_merge_difflib(ours_text, base_text, theirs_text)
+    if not ok:
+        return None, False
+    return merged_text.encode('utf-8'), True
+
+
+def write_bytes_atomic(path, data, mode=None):
+    path = Path(path)
+    if mode is None and path.is_file():
+        mode = stat.S_IMODE(path.stat().st_mode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.staged-', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+        if mode is not None:
+            os.chmod(name, mode)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def check_workspace_drifted(ws_file, base_entry):
+    """Return True if ws_file drifted relative to base_entry."""
+    if base_entry is None:
+        return False
+    existed = bool(base_entry.get('existed', False))
+    currently_exists = ws_file.is_file()
+    if existed != currently_exists:
+        return True
+    if not existed:
+        return False
+    current_hash = file_sha256(ws_file)
+    return current_hash != base_entry.get('sha256')
+
+
+def plan_apply_changes(ctx, session, paths):
+    """Inspect all paths before mutating the workspace."""
+    force = bool(getattr(ctx.args, 'force', False))
+    no_merge = bool(getattr(ctx.args, 'no_merge', False))
+    base_data = load_base_metadata(session)
+    base_files = base_data.get('files', {})
+    base_root = base_files_root(session)
+    plan = []
+
+    for rel in paths:
+        orig_rel = session.manifest.get(rel, rel)
+        dest = safe_path(session.workspace, rel)
+        old = safe_path(session.workspace, orig_rel)
+        orig_base = base_files.get(orig_rel)
+        dest_base = base_files.get(rel)
+
+        if rel in session.deletions:
+            if not dest.exists():
+                plan.append({'rel': rel, 'orig_rel': orig_rel, 'action': 'delete', 'dest': dest, 'old': old})
+                continue
+            if orig_base is not None and check_workspace_drifted(dest, orig_base):
+                if not force:
+                    raise StagedError(
+                        "Workspace file '{}' was modified since staging began. Pass --force to delete anyway.".format(rel)
+                    )
+            plan.append({'rel': rel, 'orig_rel': orig_rel, 'action': 'delete', 'dest': dest, 'old': old})
+            continue
+
+        staged_file = safe_path(session.staging, rel)
+        if equal_files(dest, staged_file):
+            if old == dest or not old.exists():
+                plan.append({
+                    'rel': rel, 'orig_rel': orig_rel, 'action': 'noop',
+                    'dest': dest, 'old': old, 'staged': staged_file,
+                    'mode': file_mode(staged_file)
+                })
+                continue
+            elif orig_base is None or not check_workspace_drifted(old, orig_base):
+                # Destination already matches staged, but old rename source exists and hasn't drifted
+                plan.append({
+                    'rel': rel, 'orig_rel': orig_rel, 'action': 'apply',
+                    'dest': dest, 'old': old, 'staged': staged_file,
+                    'mode': file_mode(staged_file)
+                })
+                continue
+
+        drifted_orig = check_workspace_drifted(old, orig_base) if orig_base is not None else False
+        drifted_dest = (
+            rel != orig_rel
+            and dest.exists()
+            and not equal_files(dest, staged_file)
+            and (dest_base is None or check_workspace_drifted(dest, dest_base))
+        )
+        if not drifted_orig and not drifted_dest:
+            plan.append({
+                'rel': rel, 'orig_rel': orig_rel, 'action': 'apply',
+                'dest': dest, 'old': old, 'staged': staged_file,
+                'mode': file_mode(staged_file)
+            })
+            continue
+
+        base_snapshot_file = safe_path(base_root, orig_rel) if base_root.exists() else None
+        can_try_merge = (
+            not no_merge
+            and orig_base is not None
+            and orig_base.get('existed') is True
+            and base_snapshot_file is not None
+            and base_snapshot_file.is_file()
+            and old.is_file()
+            and not drifted_dest
+        )
+
+        if can_try_merge:
+            prefer_py = bool(getattr(ctx.args, 'prefer_pure_python_merge', False))
+            merged_bytes, ok = three_way_merge(old, base_snapshot_file, staged_file, prefer_pure_python=prefer_py)
+            if ok:
+                plan.append({
+                    'rel': rel, 'orig_rel': orig_rel, 'action': 'merge',
+                    'dest': dest, 'old': old, 'staged': staged_file,
+                    'merged_bytes': merged_bytes,
+                    'mode': file_mode(staged_file) or file_mode(old)
+                })
+                continue
+
+        if not force:
+            raise StagedError(
+                "Conflict in '{}': workspace file was modified concurrently and overlaps with staged changes. "
+                "Reconcile in staging or pass --force to overwrite.".format(rel)
+            )
+
+        plan.append({
+            'rel': rel, 'orig_rel': orig_rel, 'action': 'apply',
+            'dest': dest, 'old': old, 'staged': staged_file,
+            'mode': file_mode(staged_file)
+        })
+
+    return plan
+
+
+def backups_root(session):
+    root = session.directory / '.backups'
+    if root.is_symlink():
+        raise StagedError('Session .backups directory cannot be a symlink: {}'.format(root))
+    return root
+
+
+def create_backup_dir(session):
+    root = backups_root(session)
+    root.mkdir(parents=True, exist_ok=True)
+    ts_ms = int(time.time() * 1000)
+    short_id = uuid.uuid4().hex[:8]
+    backup_id = '{}_{}'.format(ts_ms, short_id)
+    bdir = safe_path(root, backup_id)
+    bdir.mkdir(parents=True, exist_ok=False)
+    (bdir / 'files').mkdir(parents=True, exist_ok=True)
+    return backup_id, bdir
+
+
 def apply_changes(ctx, session, target):
     paths = selected(session, target)
     preflight(session, paths)
     guard_apply(ctx, session)
-    for rel in paths:
-        dest = safe_path(session.workspace, rel)
-        old = session.original(rel)
-        if rel in session.deletions:
+    plan = plan_apply_changes(ctx, session, paths)
+
+    backup_id, bdir = create_backup_dir(session)
+    backup_files_root = bdir / 'files'
+    recorded_paths = []
+    seen_paths = set()
+
+    for item in plan:
+        rel = item['rel']
+        orig_rel = item['orig_rel']
+        for p_rel in ([orig_rel, rel] if orig_rel != rel else [rel]):
+            if p_rel in seen_paths:
+                continue
+            seen_paths.add(p_rel)
+            ws_path = safe_path(session.workspace, p_rel)
+            existed = ws_path.is_file()
+            sha_before = file_sha256(ws_path) if existed else None
+            mode_before = file_mode(ws_path) if existed else None
+            if existed:
+                copy_atomic(ws_path, safe_path(backup_files_root, p_rel))
+            recorded_paths.append({
+                'path': p_rel,
+                'existed': existed,
+                'sha256_before': sha_before,
+                'sha256_after': None,
+                'mode': mode_before,
+            })
+
+    for item in plan:
+        rel = item['rel']
+        orig_rel = item['orig_rel']
+        action = item['action']
+        dest = item['dest']
+        old = item['old']
+
+        if action == 'delete':
             if dest.exists():
                 dest.unlink()
+            remove_base_snapshot(session, rel)
             print(status_token('DELETED') + ' ' + rel)
-        else:
-            copy_atomic(safe_path(session.staging, rel), dest)
+        elif action == 'merge':
+            write_bytes_atomic(dest, item['merged_bytes'], mode=item['mode'])
             if old != dest and old.is_file():
                 old.unlink()
+                remove_base_snapshot(session, orig_rel)
+            write_bytes_atomic(item['staged'], item['merged_bytes'], mode=item['mode'])
+            record_base_snapshot(session, rel, reset=True)
+            print(status_token('MERGED') + ' ' + rel)
+        elif action == 'apply':
+            copy_atomic(item['staged'], dest)
+            if old != dest and old.is_file():
+                old.unlink()
+                remove_base_snapshot(session, orig_rel)
+            record_base_snapshot(session, rel, reset=True)
             print(status_token('APPLIED') + ' ' + rel)
+        elif action == 'noop':
+            record_base_snapshot(session, rel, reset=True)
+            print(status_token('APPLIED') + ' ' + rel)
+
+    for entry in recorded_paths:
+        ws_path = safe_path(session.workspace, entry['path'])
+        entry['sha256_after'] = file_sha256(ws_path) if ws_path.is_file() else None
+
+    save_json(bdir / 'backup.json', {
+        'id': backup_id,
+        'created_at': time.time(),
+        'entries': recorded_paths,
+    })
     session.refresh_index()
 
+
+def list_backups(session):
+    root = backups_root(session)
+    if not root.is_dir():
+        return []
+    backups = []
+    for d in sorted(root.iterdir()):
+        if d.is_dir() and not d.is_symlink() and (d / 'backup.json').is_file():
+            backups.append(d)
+    return backups
+
+
+def undo_apply(ctx, session):
+    """Restore workspace files from the latest backup in <session>/.backups/."""
+    backups = list_backups(session)
+    if not backups:
+        raise StagedError('No applied changes to undo in session {}.'.format(session.id))
+    latest_dir = backups[-1]
+    meta = load_json(latest_dir / 'backup.json')
+    entries = meta.get('entries', [])
+    if not isinstance(entries, list):
+        raise StagedError('Invalid backup metadata in {}'.format(latest_dir))
+
+    force = bool(getattr(ctx.args, 'force', False))
+    yes = bool(getattr(ctx.args, 'yes', False))
+    as_json = bool(getattr(ctx.args, 'json', False))
+
+    drifted = []
+    for entry in entries:
+        rel = entry['path']
+        ws_path = safe_path(session.workspace, rel)
+        current_sha = file_sha256(ws_path) if ws_path.is_file() else None
+        if current_sha != entry.get('sha256_after'):
+            drifted.append(rel)
+
+    if drifted and not force:
+        confirm(
+            "Workspace file(s) modified after apply ({}). Overwrite and undo anyway?".format(', '.join(drifted)),
+            yes
+        )
+
+    backup_files_root = latest_dir / 'files'
+    restored_paths = []
+    for entry in entries:
+        rel = entry['path']
+        ws_path = safe_path(session.workspace, rel)
+        if entry.get('existed'):
+            src = safe_path(backup_files_root, rel)
+            if not src.is_file():
+                raise StagedError('Missing backup file for {}: {}'.format(rel, src))
+            copy_atomic(src, ws_path)
+            if entry.get('mode') is not None:
+                os.chmod(ws_path, entry['mode'])
+            record_base_snapshot(session, rel, reset=True)
+        else:
+            if ws_path.is_file():
+                ws_path.unlink()
+            record_base_snapshot(session, rel, reset=True)
+        restored_paths.append(rel)
+
+    shutil.rmtree(latest_dir)
+    root = backups_root(session)
+    if root.is_dir() and not any(root.iterdir()):
+        root.rmdir()
+
+    session.refresh_index()
+
+    if as_json:
+        print(json.dumps({
+            'operation': 'undo',
+            'session': session.id,
+            'backup_id': meta.get('id', latest_dir.name),
+            'restored': restored_paths,
+        }))
+    else:
+        for rel in restored_paths:
+            print(status_token('UNDONE') + ' ' + rel)
 
 def clean_session(ctx, session):
     if getattr(ctx.args, 'clean_session', None) is not None:
@@ -929,6 +1440,7 @@ def clean_session(ctx, session):
 
     target = ctx.args.file
     paths = selected(session, target)
+    origs = {rel: session.manifest.get(rel, rel) for rel in paths}
     summaries = session.summaries()
     if any(session.status(rel) != 'APPLIED' for rel in paths):
         confirm('Discard {} pending staged change(s) from {}?'.format(len(paths), session.id), ctx.args.yes)
@@ -941,8 +1453,14 @@ def clean_session(ctx, session):
     if target is None:
         session.manifest = {}
         session.deletions = []
-    elif '_deletions' in session.manifest:
-        session.manifest['_deletions'] = session.deletions
+        clear_all_base_snapshots(session)
+    else:
+        if '_deletions' in session.manifest:
+            session.manifest['_deletions'] = session.deletions
+        for rel, orig in origs.items():
+            remove_base_snapshot(session, rel)
+            if orig != rel:
+                remove_base_snapshot(session, orig)
     session.save_manifest()
     for rel in paths:
         summaries['files'].pop(rel, None)
@@ -1224,6 +1742,9 @@ def delete_file(session, args):
             raise StagedError('Discard the overlapping rename proposal before proposing deletion: ' + args.file)
     elif args.file not in session.paths(fresh=True):
         raise StagedError('No staged proposal at exact path: ' + args.file)
+    orig_source = session.manifest.get(args.file, args.file)
+    if args.workspace:
+        record_base_snapshot(session, args.file)
     if target.exists():
         target.unlink()
     session.manifest.pop(args.file, None)
@@ -1232,6 +1753,9 @@ def delete_file(session, args):
         deletions.add(args.file)
     else:
         deletions.discard(args.file)
+        remove_base_snapshot(session, args.file)
+        if orig_source != args.file:
+            remove_base_snapshot(session, orig_source)
     session.deletions = sorted(deletions)
     if deletions:
         session.manifest['_deletions'] = session.deletions
@@ -1393,6 +1917,15 @@ def file_operation(session, args):
             if os.path.exists(temporary):
                 os.unlink(temporary)
         summaries['files'].pop(destination, None)
+    if command == 'create':
+        record_base_snapshot(session, args.file)
+    elif command == 'copy':
+        if getattr(args, 'workspace', False):
+            record_base_snapshot(session, args.file)
+        record_base_snapshot(session, destination)
+    elif command == 'rename':
+        record_base_snapshot(session, original)
+        record_base_snapshot(session, destination)
     if (session.directory / 'summaries.json').exists():
         session.save_summaries(summaries)
     if args.json:
@@ -1518,6 +2051,11 @@ def write_file_range(session, args):
                 raise StagedError('File changed while writing; read again before retrying.')
             # Close the source before replacing it, including on Windows.
             original.close()
+            if not args.meta:
+                orig_rel = session.manifest.get(args.file, args.file)
+                record_base_snapshot(session, orig_rel)
+                if orig_rel != args.file:
+                    record_base_snapshot(session, args.file)
             os.replace(temporary, target)
         finally:
             if os.path.exists(temporary):
@@ -1596,6 +2134,7 @@ def make_parser():
         'init': 'Create an isolated session and record its workspace and branch.',
         'diff': 'Review proposed files, apply with -a, clean with -c, or apply then clean with -ac.',
         'apply': 'Apply proposed files, renames and deletions to the workspace.',
+        'undo': 'Restore workspace files to their pre-apply state from a backup.',
         'clean': 'Discard staged proposals without changing the workspace.',
         'path': 'Print a raw absolute staged or workspace path.',
         'open': 'Open a staged proposed file or session file in your editor.',
@@ -1673,6 +2212,10 @@ def make_parser():
     for name in ('diff', 'apply'):
         command_parsers[name].add_argument('--force', action='store_true', help='allow protected-branch apply')
         command_parsers[name].add_argument('-y', '--yes', action='store_true', help='confirm branch drift or clean')
+    p = command_parsers['undo']
+    p.add_argument('--force', action='store_true', help='undo even if workspace files were modified after apply')
+    p.add_argument('-y', '--yes', action='store_true', help='confirm overwriting post-apply workspace edits')
+    p.add_argument('--json', action='store_true', help='print structured JSON undo result')
     p = command_parsers['clean']
     p.add_argument('-y', '--yes', action='store_true', help='confirm discarding proposed changes')
     p = command_parsers['path']
@@ -1685,7 +2228,7 @@ def make_parser():
         command_parsers[name].add_argument(
             '--meta', action='store_true', default=argparse.SUPPRESS,
             help='use a top-level session metadata file (e.g. staged_changes.md) instead of a proposal')
-    for name in ('summarize', 'diff', 'apply', 'clean', 'migrate'):
+    for name in ('summarize', 'diff', 'apply', 'clean', 'migrate', 'undo'):
         command_parsers[name].add_argument(
             '--meta', action='store_true', default=argparse.SUPPRESS,
             help='accepted with -f for consistent syntax; this command remains proposal-based')
@@ -2383,6 +2926,8 @@ def main(argv=None):
             print(safe_path(session.staging, rel))
     elif args.command == 'open':
         open_file(ctx, session, args.file)
+    elif args.command == 'undo':
+        undo_apply(ctx, session)
     elif args.command == 'apply' or (args.command == 'diff' and args.apply):
         apply_changes(ctx, session, args.file)
         if args.command == 'diff' and args.clean:

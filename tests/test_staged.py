@@ -1793,6 +1793,34 @@ source "$1"
         self.assertEqual((workspace / 'file with spaces.txt').read_text(), 'proposal')
 
 
+
+    def test_cli_3way_merge_conflict_protection_and_undo(self):
+        (self.repo / 'shared.py').write_text('line1\nline2\nline3\nline4\nline5\n')
+        self.init('session-a')
+        self.file_api('copy', '--workspace', '-f', 'shared.py')
+        self.file_api('write', '-f', 'shared.py', '--text', 'line1\nline2\nline3\nline4\nline5_agent\n')
+
+        # User edits line 1 in workspace concurrently
+        (self.repo / 'shared.py').write_text('line1_user\nline2\nline3\nline4\nline5\n')
+
+        # Apply performs a clean 3-way merge automatically!
+        out = self.run_cli('apply', '-f', 'shared.py').stdout
+        self.assertIn('[MERGED] shared.py', out)
+        self.assertEqual(
+            (self.repo / 'shared.py').read_text(),
+            'line1_user\nline2\nline3\nline4\nline5_agent\n'
+        )
+
+        # Undo restores the exact pre-apply workspace state (`line1_user...line5`)
+        undo_out = json.loads(self.run_cli('undo', '--json').stdout)
+        self.assertEqual(undo_out['operation'], 'undo')
+        self.assertEqual(undo_out['restored'], ['shared.py'])
+        self.assertEqual(
+            (self.repo / 'shared.py').read_text(),
+            'line1_user\nline2\nline3\nline4\nline5\n'
+        )
+
+
 class Unit(unittest.TestCase):
     def test_cli_test_launcher_uses_an_empty_registry(self):
         support = _Support.ensure()
@@ -2320,6 +2348,296 @@ class UninstallPrompts(unittest.TestCase):
                 staged.uninstall(ctx)
                 run.assert_called_once_with(['npm', 'uninstall'])
             self.assertFalse((config / 'state.json').exists())
+
+
+
+import argparse
+from contextlib import redirect_stdout, redirect_stderr
+import io
+import shlex
+import stat
+
+
+class SafetyDummyContext:
+    def __init__(self, workspace, staging_root, **kwargs):
+        self.workspace = Path(workspace).resolve()
+        self._staging_root = Path(staging_root).resolve()
+        defaults = {
+            'force': False,
+            'yes': True,
+            'no_merge': False,
+            'prefer_pure_python_merge': False,
+            'json': False,
+            'file': None,
+            'all': True,
+            'clean_session': None,
+        }
+        defaults.update(kwargs)
+        self.args = argparse.Namespace(**defaults)
+        self.local = {}
+        self.global_state = {}
+        self.shell_path = self._staging_root / 'shell.json'
+        self.shell = {}
+
+    def staging_root(self):
+        return self._staging_root
+
+    def setting(self, key, default=None):
+        return self.local.get(key, self.global_state.get(key, default))
+
+
+class TestSafetyAndUndo(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix='staged-test-'))
+        self.workspace = self.tmpdir / 'workspace'
+        self.staging_root = self.tmpdir / 'sessions'
+        self.workspace.mkdir(parents=True)
+        self.staging_root.mkdir(parents=True)
+
+        self.session_dir = self.staging_root / 'test-session'
+        (self.session_dir / 'staging').mkdir(parents=True)
+        staged.write_text_file(self.session_dir / '.workspace', str(self.workspace) + '\n')
+        staged.save_json(self.session_dir / 'session.json', {'id': 'test-session', 'branch': None, 'created_at': 1.0})
+        staged.save_json(self.session_dir / 'renames.json', {})
+        self.session = staged.Session(self.session_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_base_snapshot_first_touch_only(self):
+        ws_file = self.workspace / 'app.py'
+        staged.write_text_file(ws_file, 'line1\nline2\n')
+        os.chmod(ws_file, 0o755)
+
+        entry1 = staged.record_base_snapshot(self.session, 'app.py')
+        self.assertTrue(entry1['existed'])
+        self.assertEqual(entry1['mode'], 0o755)
+        orig_hash = entry1['sha256']
+
+        # Modify workspace file later and call record_base_snapshot again without reset
+        staged.write_text_file(ws_file, 'modified_in_workspace\n')
+        entry2 = staged.record_base_snapshot(self.session, 'app.py')
+        self.assertEqual(entry2['sha256'], orig_hash)
+        self.assertEqual((self.session.directory / '.base/app.py').read_text(encoding='utf-8'), 'line1\nline2\n')
+
+        # New file snapshot
+        new_entry = staged.record_base_snapshot(self.session, 'new_file.py')
+        self.assertFalse(new_entry['existed'])
+
+        # Clean single file removes its base snapshot
+        ctx = SafetyDummyContext(self.workspace, self.staging_root, file='app.py', all=False)
+        staged.write_text_file(self.session.staging / 'app.py', 'staged_content\n')
+        with redirect_stdout(io.StringIO()):
+            staged.clean_session(ctx, self.session)
+        base_meta = staged.load_base_metadata(self.session)
+        self.assertNotIn('app.py', base_meta['files'])
+        self.assertFalse((self.session.directory / '.base/app.py').exists())
+        self.assertIn('new_file.py', base_meta['files'])
+
+    def test_three_way_merge_git_and_difflib(self):
+        base_text = 'line 1\nline 2\nline 3\nline 4\nline 5\n'
+        ours_text = 'line 1 modified by user\nline 2\nline 3\nline 4\nline 5\n'
+        theirs_text = 'line 1\nline 2\nline 3\nline 4\nline 5 modified by agent\n'
+        expected = 'line 1 modified by user\nline 2\nline 3\nline 4\nline 5 modified by agent\n'
+
+        # Pure python difflib merge
+        merged_py, ok_py = staged.three_way_merge_difflib(ours_text, base_text, theirs_text)
+        self.assertTrue(ok_py)
+        self.assertEqual(merged_py, expected)
+
+        # Overlapping conflict in pure python
+        conflict_theirs = 'line 1 conflicting agent edit\nline 2\nline 3\nline 4\nline 5\n'
+        _, ok_conflict = staged.three_way_merge_difflib(ours_text, base_text, conflict_theirs)
+        self.assertFalse(ok_conflict)
+
+    def test_clean_3way_merge_on_apply(self):
+        ws_file = self.workspace / 'mod.py'
+        base_content = 'def a():\n    return 1\n\ndef b():\n    return 2\n\ndef c():\n    return 3\n'
+        staged.write_text_file(ws_file, base_content)
+
+        # Agent seeds from workspace and edits def c()
+        args_copy = argparse.Namespace(command='copy', file='mod.py', workspace=True, to=None, meta=False, json=False)
+        with redirect_stdout(io.StringIO()):
+            staged.file_operation(self.session, args_copy)
+
+        staged_content = 'def a():\n    return 1\n\ndef b():\n    return 2\n\ndef c():\n    return 300\n'
+        args_write = argparse.Namespace(
+            command='write', file='mod.py', meta=False, from_workspace=False,
+            expect_sha256=None, start_line=None, end_line=None, append=False,
+            offset=None, delete_count=None, stdin=False, text=staged_content, json=False
+        )
+        with redirect_stdout(io.StringIO()):
+            staged.write_file_range(self.session, args_write)
+
+        # Meanwhile user edits def a() in workspace
+        user_content = 'def a():\n    return 100\n\ndef b():\n    return 2\n\ndef c():\n    return 3\n'
+        staged.write_text_file(ws_file, user_content)
+
+        ctx = SafetyDummyContext(self.workspace, self.staging_root)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            staged.apply_changes(ctx, self.session, None)
+
+        self.assertIn('[MERGED] mod.py', buf.getvalue())
+        expected_merged = 'def a():\n    return 100\n\ndef b():\n    return 2\n\ndef c():\n    return 300\n'
+        self.assertEqual(ws_file.read_text(encoding='utf-8'), expected_merged)
+        self.assertEqual(self.session.status('mod.py'), 'APPLIED')
+
+    def test_overlapping_conflict_blocks_batch_preflight(self):
+        # File 1: clean
+        # File 2: overlapping conflict
+        f1 = self.workspace / 'f1.txt'
+        f2 = self.workspace / 'f2.txt'
+        staged.write_text_file(f1, 'original 1\n')
+        staged.write_text_file(f2, 'original 2\n')
+
+        for name, new_text in [('f1.txt', 'staged 1\n'), ('f2.txt', 'staged 2\n')]:
+            args = argparse.Namespace(
+                command='write', file=name, meta=False, from_workspace=True,
+                expect_sha256=None, start_line=None, end_line=None, append=False,
+                offset=None, delete_count=None, stdin=False, text=new_text, json=False
+            )
+            with redirect_stdout(io.StringIO()):
+                staged.write_file_range(self.session, args)
+
+        # Modify f2.txt in workspace on the same line
+        staged.write_text_file(f2, 'concurrent conflicting workspace edit 2\n')
+
+        ctx = SafetyDummyContext(self.workspace, self.staging_root, force=False)
+        with self.assertRaises(staged.StagedError) as cm:
+            staged.apply_changes(ctx, self.session, None)
+        self.assertIn("Conflict in 'f2.txt'", str(cm.exception))
+
+        # Verify f1.txt was NOT mutated because preflight planned all files first!
+        self.assertEqual(f1.read_text(encoding='utf-8'), 'original 1\n')
+
+    def test_deletion_conflict_and_force(self):
+        ws_file = self.workspace / 'del.txt'
+        staged.write_text_file(ws_file, 'initial\n')
+
+        args_del = argparse.Namespace(command='delete', file='del.txt', workspace=True, meta=False, json=False)
+        with redirect_stdout(io.StringIO()):
+            staged.delete_file(self.session, args_del)
+
+        # Modify del.txt in workspace after deletion was proposed
+        staged.write_text_file(ws_file, 'modified before delete apply\n')
+
+        ctx = SafetyDummyContext(self.workspace, self.staging_root, force=False)
+        with self.assertRaises(staged.StagedError) as cm:
+            staged.apply_changes(ctx, self.session, None)
+        self.assertIn("Workspace file 'del.txt' was modified since staging began", str(cm.exception))
+        self.assertTrue(ws_file.exists())
+
+        # Now apply with --force
+        ctx_force = SafetyDummyContext(self.workspace, self.staging_root, force=True)
+        with redirect_stdout(io.StringIO()):
+            staged.apply_changes(ctx_force, self.session, None)
+        self.assertFalse(ws_file.exists())
+
+    def test_backup_and_undo_modify_create_delete_rename(self):
+        # 1. Existing file to modify
+        f_mod = self.workspace / 'mod.txt'
+        staged.write_text_file(f_mod, 'before mod\n')
+        os.chmod(f_mod, 0o750)
+
+        # 2. Existing file to delete
+        f_del = self.workspace / 'del.txt'
+        staged.write_text_file(f_del, 'before del\n')
+
+        # 3. Existing file to rename
+        f_ren_src = self.workspace / 'old_name.txt'
+        staged.write_text_file(f_ren_src, 'before rename\n')
+
+        # Stage modify
+        with redirect_stdout(io.StringIO()):
+            staged.write_file_range(self.session, argparse.Namespace(
+                command='write', file='mod.txt', meta=False, from_workspace=True,
+                expect_sha256=None, start_line=None, end_line=None, append=False,
+                offset=None, delete_count=None, stdin=False, text='after mod\n', json=False
+            ))
+            # Stage new file
+            staged.file_operation(self.session, argparse.Namespace(
+                command='create', file='created.txt', text='brand new\n', stdin=False, meta=False, json=False
+            ))
+            # Stage delete
+            staged.delete_file(self.session, argparse.Namespace(
+                command='delete', file='del.txt', workspace=True, meta=False, json=False
+            ))
+            # Stage copy + rename
+            staged.file_operation(self.session, argparse.Namespace(
+                command='copy', file='old_name.txt', workspace=True, to=None, meta=False, json=False
+            ))
+            staged.file_operation(self.session, argparse.Namespace(
+                command='rename', file='old_name.txt', to='new_name.txt', meta=False, json=False
+            ))
+
+        ctx = SafetyDummyContext(self.workspace, self.staging_root)
+        with redirect_stdout(io.StringIO()):
+            staged.apply_changes(ctx, self.session, None)
+
+        self.assertEqual(f_mod.read_text(encoding='utf-8'), 'after mod\n')
+        self.assertTrue((self.workspace / 'created.txt').is_file())
+        self.assertFalse(f_del.exists())
+        self.assertFalse(f_ren_src.exists())
+        self.assertEqual((self.workspace / 'new_name.txt').read_text(encoding='utf-8'), 'before rename\n')
+
+        # Now run undo_apply!
+        undo_buf = io.StringIO()
+        with redirect_stdout(undo_buf):
+            staged.undo_apply(ctx, self.session)
+
+        self.assertIn('[UNDONE]', undo_buf.getvalue())
+        self.assertEqual(f_mod.read_text(encoding='utf-8'), 'before mod\n')
+        self.assertEqual(stat.S_IMODE(f_mod.stat().st_mode), 0o750)
+        self.assertFalse((self.workspace / 'created.txt').exists())
+        self.assertTrue(f_del.is_file())
+        self.assertEqual(f_del.read_text(encoding='utf-8'), 'before del\n')
+        self.assertTrue(f_ren_src.is_file())
+        self.assertEqual(f_ren_src.read_text(encoding='utf-8'), 'before rename\n')
+        self.assertFalse((self.workspace / 'new_name.txt').exists())
+
+        # Second undo raises StagedError since no backups remain
+        with self.assertRaises(staged.StagedError):
+            staged.undo_apply(ctx, self.session)
+
+    def test_undo_post_apply_drift_guard(self):
+        f_mod = self.workspace / 'mod.txt'
+        staged.write_text_file(f_mod, 'v1\n')
+        with redirect_stdout(io.StringIO()):
+            staged.write_file_range(self.session, argparse.Namespace(
+                command='write', file='mod.txt', meta=False, from_workspace=True,
+                expect_sha256=None, start_line=None, end_line=None, append=False,
+                offset=None, delete_count=None, stdin=False, text='v2\n', json=False
+            ))
+        ctx = SafetyDummyContext(self.workspace, self.staging_root)
+        with redirect_stdout(io.StringIO()):
+            staged.apply_changes(ctx, self.session, None)
+
+        # User edits mod.txt AFTER apply
+        staged.write_text_file(f_mod, 'v3 post-apply edit\n')
+
+        # Without --yes or --force in non-interactive mode, confirm() raises StagedError
+        ctx_no_yes = SafetyDummyContext(self.workspace, self.staging_root, yes=False, force=False)
+        old_stdin = sys.stdin
+        try:
+            sys.stdin = io.StringIO('n\n')
+            with self.assertRaises(staged.StagedError):
+                staged.undo_apply(ctx_no_yes, self.session)
+        finally:
+            sys.stdin = old_stdin
+        self.assertEqual(f_mod.read_text(encoding='utf-8'), 'v3 post-apply edit\n')
+
+        # With --force, undo succeeds and outputs JSON when requested
+        ctx_force_json = SafetyDummyContext(self.workspace, self.staging_root, yes=False, force=True, json=True)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            staged.undo_apply(ctx_force_json, self.session)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload['operation'], 'undo')
+        self.assertEqual(payload['restored'], ['mod.txt'])
+        self.assertEqual(f_mod.read_text(encoding='utf-8'), 'v1\n')
+
+
 
 
 if __name__ == '__main__':
