@@ -156,7 +156,7 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 | `clean -f <f> \| --all`  | Discard Changes          | Discard staged changes; prompts unless `-y` is passed                       |
 | `clean --session [<id>]` | Delete Session           | Remove session folder from disk and clear shell bindings                    |
 | `use --session <id>`     | Bind Shell               | Bind session to current shell process                                       |
-| `migrate --from <id>`    | Migrate                  | Copy staged files and manifest entries between sessions                     |
+| `migrate --from <id>`    | Migrate                  | Copy staged files and manifest entries between sessions; without `--to`, target the active session in the current workspace or create one |
 | `set [--repo]`           | Save Settings            | Store persistent configuration                                              |
 | `set-tool <id>`          | Register Tool            | Register custom editor CLI adapter                                          |
 | `install-skill`          | Install Skill            | Copy `SKILL.md` to harness skill directory                                  |
