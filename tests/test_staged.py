@@ -1800,6 +1800,34 @@ source "$1"
     # New Features CLI Integration Tests
     # ---------------------------------------------------------------------------
 
+    def test_cli_feedback_add_list_prompt_resolve_and_delete(self):
+        self.propose(rel='src/app.py', text='def calc(x):\n    return x + 42\n')
+        res = json.loads(self.run_cli(
+            'feedback', '--add', '-f', 'src/app.py',
+            '--start-line', '1', '--end-line', '2',
+            '--select', 'x + 42', '-m', 'Avoid magic number 42.', '--json'
+        ).stdout)
+        self.assertEqual(res['id'], 'fb-1')
+        self.assertEqual(res['snippet_focus'], 'x + 42')
+
+        # Listing human output and --prompt output
+        human = self.run_cli('feedback').stdout
+        self.assertIn('fb-1 [OPEN] (staged L1-L2) focus: `x + 42`', human)
+        prompt = self.run_cli('feedback', '--prompt').stdout
+        self.assertIn('# Code Review Feedback for staged session `session-a`', prompt)
+        self.assertIn('Avoid magic number 42.', prompt)
+
+        # Managed metadata protection: write --meta -f feedback.json is rejected
+        self.file_api('write', '--meta', '-f', 'feedback.json', '--text', '{}', ok=False)
+
+        # Resolve and clear
+        self.run_cli('feedback', '--resolve', 'fb-1')
+        data = json.loads(self.run_cli('feedback', '--json').stdout)
+        self.assertEqual(data['comments'][0]['status'], 'resolved')
+        self.run_cli('feedback', '--clear')
+        data_after = json.loads(self.run_cli('feedback', '--json').stdout)
+        self.assertEqual(data_after['comments'], [])
+
     def test_cli_3way_merge_conflict_protection_and_undo(self):
         (self.repo / 'shared.py').write_text('line1\nline2\nline3\nline4\nline5\n')
         self.init('session-a')
@@ -2380,6 +2408,409 @@ from contextlib import redirect_stdout, redirect_stderr
 import io
 import shlex
 import stat
+
+
+class FakeSession:
+    """Minimal Session compatible with `staged` Session layout for isolated unit testing."""
+
+    def __init__(self, root_dir, workspace_dir, session_id='test-sess'):
+        self.directory = Path(root_dir) / session_id
+        self.id = session_id
+        self.staging = self.directory / 'staging'
+        self.staging.mkdir(parents=True, exist_ok=True)
+        self.workspace = Path(workspace_dir).resolve()
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        (self.directory / '.workspace').write_text(str(self.workspace) + '\n', encoding='utf-8')
+        self.metadata = {'id': session_id, 'branch': 'feat/tui', 'created_at': 1700000000.0}
+        self.manifest = {}
+        self.deletions = []
+        self._summaries = {'session': 'Add TUI viewer and feedback engine', 'files': {}}
+
+    def summaries(self):
+        return self._summaries
+
+    def save_summaries(self, data):
+        self._summaries = data
+
+    def files(self, fresh=False):
+        import os
+        res = {}
+        for root, _, filenames in os.walk(self.staging):
+            for name in filenames:
+                rel = (Path(root) / name).relative_to(self.staging).as_posix()
+                res[rel] = Path(root) / name
+        return dict(sorted(res.items()))
+
+    def paths(self, fresh=False):
+        return sorted(set(self.files(fresh=fresh)) | set(self.deletions) | (set(self.manifest) - {'_deletions'}))
+
+    def original(self, rel):
+        return self.workspace / self.manifest.get(rel, rel)
+
+    def status(self, rel):
+        if rel in self.deletions:
+            return 'DELETED' if self.original(rel).exists() else 'APPLIED'
+        staged_p = self.staging / rel
+        if not staged_p.is_file():
+            return 'MISSING'
+        dest_p = self.workspace / rel
+        if dest_p.is_file() and dest_p.read_bytes() == staged_p.read_bytes():
+            return 'APPLIED'
+        return 'MODIFIED' if dest_p.exists() else 'NEW FILE'
+
+    def refresh_index(self):
+        pass
+
+
+class TestTuiAndFeedback(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='staged-tui-test-'))
+        self.workspace = self.tmp / 'workspace'
+        self.staging_root = self.tmp / 'sessions'
+        self.session = FakeSession(self.staging_root, self.workspace, 'sess-1')
+
+        # Seed workspace and staged files
+        ws_py = self.workspace / 'src/example.py'
+        ws_py.parent.mkdir(parents=True, exist_ok=True)
+        ws_py.write_text(
+            'def compute(x):\n'
+            '    value = x + 1\n'
+            '    return value\n'
+            '\n'
+            'def helper():\n'
+            '    return "old"\n',
+            encoding='utf-8',
+        )
+
+        st_py = self.session.staging / 'src/example.py'
+        st_py.parent.mkdir(parents=True, exist_ok=True)
+        st_py.write_text(
+            'def compute(x):\n'
+            '    # Calculate magic offset\n'
+            '    value = x + 42\n'
+            '    return value\n'
+            '\n'
+            'def helper():\n'
+            '    return "new"\n',
+            encoding='utf-8',
+        )
+        self.session._summaries['files']['src/example.py'] = 'Update compute offset and helper string.'
+
+        st_new = self.session.staging / 'src/new_mod.py'
+        st_new.write_text('CONST_VAL = 100\n', encoding='utf-8')
+        self.session._summaries['files']['src/new_mod.py'] = 'Add new constants module.'
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # 1. Managed Feedback Storage Tests
+    # ------------------------------------------------------------------
+    def test_managed_metadata_includes_feedback_json(self):
+        self.assertIn('feedback.json', staged.MANAGED_METADATA)
+
+    def test_feedback_storage_lifecycle(self):
+        initial = staged.load_feedback(self.session)
+        self.assertEqual(initial, {'version': 1, 'comments': []})
+
+        c1 = staged.add_feedback_comment(
+            self.session,
+            file_path='src/example.py',
+            comment='Use a named constant instead of magic number 42.',
+            start_line=2,
+            end_line=3,
+            side='staged',
+            snippet_focus='x + 42',
+            created_at=1700000000.0,
+        )
+        self.assertEqual(c1['id'], 'fb-1')
+        self.assertEqual(c1['status'], 'open')
+        self.assertEqual(c1['snippet_focus'], 'x + 42')
+        self.assertIn('value = x + 42', c1['selected_text'])
+
+        c2 = staged.add_feedback_comment(
+            self.session,
+            file_path='src/example.py',
+            comment='Keep old return value.',
+            start_line=6,
+            end_line=6,
+            side='workspace',
+        )
+        self.assertEqual(c2['id'], 'fb-2')
+        self.assertEqual(c2['side'], 'workspace')
+        self.assertEqual(c2['selected_text'], '    return "old"')
+
+        # Invalid substring focus should raise StagedError
+        with self.assertRaises(staged.StagedError):
+            staged.add_feedback_comment(
+                self.session,
+                file_path='src/example.py',
+                comment='Bad focus',
+                start_line=1,
+                end_line=2,
+                snippet_focus='non_existent_token',
+            )
+
+        # Resolve fb-1
+        resolved = staged.resolve_feedback(self.session, comment_id='fb-1')
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0]['status'], 'resolved')
+
+        # Prompt with only_open=True should only include fb-2
+        prompt_open = staged.format_feedback_prompt(self.session, only_open=True)
+        self.assertNotIn('fb-1', prompt_open)
+        self.assertIn('fb-2', prompt_open)
+
+        # Prompt with only_open=False includes both
+        prompt_all = staged.format_feedback_prompt(self.session, only_open=False)
+        self.assertIn('fb-1', prompt_all)
+        self.assertIn('fb-2', prompt_all)
+
+        # Delete fb-1 and clear all
+        deleted = staged.delete_feedback(self.session, comment_id='fb-1')
+        self.assertEqual(len(deleted), 1)
+        remaining = staged.load_feedback(self.session)['comments']
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]['id'], 'fb-2')
+
+        staged.delete_feedback(self.session, clear_all=True)
+        self.assertEqual(staged.load_feedback(self.session)['comments'], [])
+
+    # ------------------------------------------------------------------
+    # 2. `staged feedback` CLI Handler Tests
+    # ------------------------------------------------------------------
+    def test_cli_handle_feedback_actions_and_outputs(self):
+        parser = staged.configure_feedback_parser(argparse.ArgumentParser())
+
+        # --add
+        args_add = parser.parse_args([
+            '--add', '-f', 'src/example.py', '--start-line', '3', '--end-line', '4',
+            '--select', 'x + 42', '-m', 'Extract 42 into MAGIC_OFFSET',
+        ])
+        buf = io.StringIO()
+        with patch('sys.stdout', buf):
+            staged.handle_feedback(None, self.session, args_add)
+        self.assertIn('Added feedback fb-1 on src/example.py', buf.getvalue())
+
+        # Human output
+        args_list = parser.parse_args([])
+        buf = io.StringIO()
+        with patch('sys.stdout', buf):
+            staged.handle_feedback(None, self.session, args_list)
+        human_out = buf.getvalue()
+        self.assertIn('fb-1 [OPEN] (staged L3-L4) focus: `x + 42`', human_out)
+        self.assertIn('Extract 42 into MAGIC_OFFSET', human_out)
+
+        # --json output
+        args_json = parser.parse_args(['--json'])
+        buf = io.StringIO()
+        with patch('sys.stdout', buf):
+            staged.handle_feedback(None, self.session, args_json)
+        parsed = json.loads(buf.getvalue())
+        self.assertEqual(parsed['session'], 'sess-1')
+        self.assertEqual(len(parsed['comments']), 1)
+        self.assertEqual(parsed['comments'][0]['snippet_focus'], 'x + 42')
+
+        # --prompt and --copy
+        copied = {}
+
+        def fake_runner(cmd, input=None, text=None, capture_output=None):
+            copied['cmd'] = cmd
+            copied['text'] = input
+            res = argparse.Namespace(returncode=0)
+            return res
+
+        args_copy = parser.parse_args(['--prompt', '--copy'])
+        buf = io.StringIO()
+        with patch('sys.stdout', buf):
+            staged.handle_feedback(None, self.session, args_copy, clipboard_runner=fake_runner)
+        self.assertIn('# Code Review Feedback for staged session `sess-1`', copied['text'])
+        self.assertIn('Copied feedback prompt to clipboard', buf.getvalue())
+
+        # --resolve-all
+        args_res = parser.parse_args(['--resolve-all', '--json'])
+        buf = io.StringIO()
+        with patch('sys.stdout', buf):
+            staged.handle_feedback(None, self.session, args_res)
+        res_json = json.loads(buf.getvalue())
+        self.assertEqual(res_json['resolved'], ['fb-1'])
+
+        # --clear
+        args_clear = parser.parse_args(['--clear'])
+        buf = io.StringIO()
+        with patch('sys.stdout', buf):
+            staged.handle_feedback(None, self.session, args_clear)
+        self.assertEqual(staged.load_feedback(self.session)['comments'], [])
+
+    # ------------------------------------------------------------------
+    # 3. Syntax Highlighting, Intraline Diff & Hunk Patching Tests
+    # ------------------------------------------------------------------
+    def test_syntax_tokenizer_and_intraline_spans(self):
+        # highlight_syntax gracefully returns spans if Pygments is installed, or [] if absent
+        spans = staged.highlight_syntax('def compute(x): # comment "ignored"', filename='example.py')
+        self.assertIsInstance(spans, list)
+        try:
+            import pygments
+            self.assertTrue(len(spans) > 0)
+            self.assertEqual(spans[0][2], 'keyword')
+        except ImportError:
+            self.assertEqual(spans, [])
+
+        # Selectable tokens for inline comment targeting (w key)
+        tokens = staged.extract_selectable_tokens('def compute(value): return "hello"')
+        self.assertTrue(len(tokens) >= 3)
+        self.assertIn('def', [t['text'] for t in tokens])
+        self.assertIn('"hello"', [t['text'] for t in tokens])
+
+        l_spans, r_spans = staged.compute_intraline_spans('    value = x + 1', '    value = x + 42')
+        self.assertTrue(l_spans)
+        self.assertTrue(r_spans)
+        self.assertEqual('    value = x + 42'[r_spans[0][0]:r_spans[0][1]], '42')
+
+    def test_selective_hunk_patching(self):
+        # Verify src/example.py has 2 distinct diff hunks
+        orig = staged.read_side_lines(self.session, 'src/example.py', 'workspace')
+        staged_lines = staged.read_side_lines(self.session, 'src/example.py', 'staged')
+        hunks = staged.compute_diff_hunks(orig, staged_lines)
+        self.assertEqual(len(hunks), 2)
+
+        # Apply only the first hunk (index 0: magic offset 42), leaving second hunk ("old" vs "new") unapplied
+        staged.apply_hunk(self.session, 'src/example.py', hunk_index=0)
+        updated_ws = (self.workspace / 'src/example.py').read_text(encoding='utf-8')
+        self.assertIn('value = x + 42', updated_ws)
+        self.assertIn('return "old"', updated_ws)
+
+        # Now only 1 hunk remains
+        orig_after = staged.read_side_lines(self.session, 'src/example.py', 'workspace')
+        remaining_hunks = staged.compute_diff_hunks(orig_after, staged_lines)
+        self.assertEqual(len(remaining_hunks), 1)
+
+    # ------------------------------------------------------------------
+    # 4. 2-Pane TUI State Machine & Inline Code-Selection Workflow Tests
+    # ------------------------------------------------------------------
+    def test_tui_two_pane_navigation_selection_and_inline_comment(self):
+        copied_payload = {}
+
+        def fake_clip(cmd, input=None, text=None, capture_output=None):
+            copied_payload['text'] = input
+            return argparse.Namespace(returncode=0)
+
+        state = staged.TuiState(self.session, target_file='src/example.py', clipboard_runner=fake_clip)
+        self.assertEqual(state.current_file, 'src/example.py')
+        self.assertEqual(state.diff_mode, 'side-by-side')
+
+        # Render initial 2-pane frame
+        frame = state.render_frame(width=120, height=28)
+        self.assertEqual(len(frame), 28)
+        self.assertTrue(all(len(line) == 120 for line in frame))
+        joined = '\n'.join(frame)
+        self.assertIn('staged TUI', joined)
+        self.assertIn('FILES (2)', joined)
+        self.assertIn('Workspace Original', joined)
+        self.assertIn('Staged Proposal', joined)
+
+        # Jump to first hunk with `n`
+        state.handle_key('n')
+        self.assertEqual(state.cursor_row, state.hunks[0]['first_row'])
+
+        # Move down one line into `value = x + 42` and test `w` sub-line token selection
+        state.handle_key('j')
+        state.handle_key('w')
+        self.assertIsNotNone(state.token_index)
+        # Cycle tokens with `]` and `[`
+        state.handle_key(']')
+        state.handle_key('[')
+        selected_tok = state.token_candidates[state.token_index]['text']
+        self.assertTrue(selected_tok)
+
+        # Start visual multi-line selection with `v` and extend 1 line down
+        state.handle_key('v')
+        state.handle_key('j')
+        side, s_line, e_line, sel_text, _ = state.current_selection_range()
+        self.assertEqual(side, 'staged')
+        self.assertEqual(s_line, 3)
+        self.assertEqual(e_line, 4)
+
+        # Select a token on the current line with `w` and open inline comment input with `c`
+        state.handle_key('w')
+        focus_tok = state.token_candidates[state.token_index]['text']
+        state.handle_key('c')
+        self.assertTrue(state.input_mode)
+
+        for ch in 'Please refactor this return block':
+            state.handle_key(ch)
+        state.handle_key('BACKSPACE')
+        state.handle_key('k')
+        state.handle_key('ENTER')
+
+        self.assertFalse(state.input_mode)
+        self.assertEqual(state.comments_added_count, 1)
+        self.assertEqual(state.open_comments_count(), 1)
+
+        # Verify comment renders inline inside the diff viewport
+        frame_with_comment = '\n'.join(state.render_frame(width=120, height=28))
+        self.assertIn('💬 [fb-1 OPEN staged L3-L4]', frame_with_comment)
+        self.assertIn('Please refactor this return bloc', frame_with_comment)
+
+        # Yank prompt with `y`
+        state.handle_key('y')
+        self.assertIn('Please refactor this return block', copied_payload['text'])
+        self.assertIn(focus_tok, copied_payload['text'])
+
+        # Toggle resolve with `r`, then reopen with `r`, then delete with `x`
+        state.handle_key('r')
+        self.assertEqual(state.open_comments_count(), 0)
+        state.handle_key('r')
+        self.assertEqual(state.open_comments_count(), 1)
+        state.handle_key('x')
+        self.assertEqual(state.open_comments_count(), 0)
+
+        # Toggle unified mode (`u`), sidebar (`b`), syntax (`H`), focus (`TAB`), and apply hunk (`a`)
+        state.handle_key('u')
+        self.assertEqual(state.diff_mode, 'unified')
+        frame_unified = '\n'.join(state.render_frame(width=120, height=28))
+        self.assertIn('Unified Diff', frame_unified)
+
+        state.handle_key('b')
+        self.assertFalse(state.show_sidebar)
+        state.handle_key('TAB')
+        self.assertTrue(state.show_sidebar)
+        self.assertEqual(state.focus_pane, 'files')
+        state.handle_key('ENTER')
+        self.assertEqual(state.focus_pane, 'diff')
+
+        # Jump to next hunk (hunk 2) with `n` and selectively apply it with `a`
+        state.handle_key('n')
+        state.handle_key('a')
+        ws_text = (self.workspace / 'src/example.py').read_text(encoding='utf-8')
+        self.assertIn('return "new"', ws_text)
+        self.assertIn('value = x + 1', ws_text)
+
+        # Apply entire file with `A`
+        state.handle_key('A')
+        ws_full = (self.workspace / 'src/example.py').read_text(encoding='utf-8')
+        self.assertIn('value = x + 42', ws_full)
+        self.assertIn('return "new"', ws_full)
+
+        # Test help modal (? and h)
+        state.handle_key('?')
+        self.assertTrue(state.show_help)
+        frame_help = '\n'.join(state.render_frame(width=120, height=28))
+        self.assertIn('staged TUI Command Reference', frame_help)
+        self.assertIn('NAVIGATION:', frame_help)
+        self.assertIn('CODE REVIEW & INLINE FEEDBACK:', frame_help)
+        # Close help with `?` or `q` without quitting TUI
+        state.handle_key('?')
+        self.assertFalse(state.show_help)
+        state.handle_key('h')
+        self.assertTrue(state.show_help)
+        state.handle_key('q')
+        self.assertFalse(state.show_help)
+        self.assertFalse(state.should_quit)
+
+        # Quit with `q`
+        state.handle_key('q')
+        self.assertTrue(state.should_quit)
 
 
 class SafetyDummyContext:

@@ -40,7 +40,7 @@ DEFAULT_PROTECTED_BRANCHES = []
 STATUS_COLORS = {'APPLIED': '32', 'MERGED': '1;32', 'UNDONE': '1;36', 'MODIFIED': '33', 'NEW FILE': '36',
                  'RENAMED': '35', 'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
 STATUS_ORDER = ('MISSING', 'NEW FILE', 'MODIFIED', 'RENAMED', 'RELOCATED', 'DELETED', 'APPLIED')
-COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'init', 'diff', 'apply', 'undo', 'fmt', 'check', 'exec', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
+COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'init', 'diff', 'tui', 'feedback', 'apply', 'undo', 'fmt', 'check', 'exec', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
 
 
 def is_reserved_windows_name(name):
@@ -50,7 +50,7 @@ def is_reserved_windows_name(name):
     if hasattr(ntpath, 'isreserved'):
         return ntpath.isreserved(name)
     return PureWindowsPath(name).is_reserved()
-MANAGED_METADATA = ('session.json', 'renames.json', 'summaries.json')
+MANAGED_METADATA = ('session.json', 'renames.json', 'summaries.json', 'feedback.json')
 SUGGESTED_METADATA = ('staged_changes.md', 'diff_viewer.md')
 META_FILE_COMMANDS = ('read', 'write', 'create', 'copy', 'rename', 'delete', 'path', 'open')
 COMPLETION_MARKER_START = '# >>> staged completions >>>'
@@ -2641,6 +2641,1589 @@ def exec_in_sandbox(ctx, session, command_args, sync_back=False, as_json=False, 
 
     return result
 
+# ===========================================================================
+# 2-Pane Interactive Diff TUI & Inline Code-Selection Feedback Engine
+# ===========================================================================
+
+FEEDBACK_FILENAME = 'feedback.json'
+FEEDBACK_VERSION = 1
+VALID_SIDES = ('staged', 'workspace')
+VALID_STATUSES = ('open', 'resolved')
+
+
+def feedback_path(session):
+    """Return validated path to `<session>/feedback.json`."""
+    return safe_path(session.directory, FEEDBACK_FILENAME)
+
+
+def _validate_comment_item(item):
+    if not isinstance(item, dict):
+        raise StagedError('Each feedback comment must be a JSON object.')
+    for req in ('id', 'file', 'side', 'start_line', 'end_line', 'selected_text', 'comment', 'status'):
+        if req not in item:
+            raise StagedError('Feedback comment missing required field: {}'.format(req))
+    if not isinstance(item['id'], str) or not item['id']:
+        raise StagedError('Feedback comment id must be a non-empty string.')
+    if not isinstance(item['file'], str) or not item['file']:
+        raise StagedError('Feedback comment file must be a non-empty string.')
+    if item['side'] not in VALID_SIDES:
+        raise StagedError('Feedback comment side must be one of {}.'.format(', '.join(VALID_SIDES)))
+    if not isinstance(item['start_line'], int) or item['start_line'] < 1:
+        raise StagedError('Feedback comment start_line must be a positive integer.')
+    if not isinstance(item['end_line'], int) or item['end_line'] < item['start_line']:
+        raise StagedError('Feedback comment end_line must be >= start_line.')
+    if not isinstance(item['selected_text'], str):
+        raise StagedError('Feedback comment selected_text must be a string.')
+    if item.get('snippet_focus') is not None and not isinstance(item['snippet_focus'], str):
+        raise StagedError('Feedback comment snippet_focus must be a string or null.')
+    if not isinstance(item['comment'], str) or not item['comment'].strip():
+        raise StagedError('Feedback comment text must be a non-empty string.')
+    if item['status'] not in VALID_STATUSES:
+        raise StagedError('Feedback comment status must be one of {}.'.format(', '.join(VALID_STATUSES)))
+    return {
+        'id': item['id'],
+        'file': item['file'],
+        'side': item['side'],
+        'start_line': item['start_line'],
+        'end_line': item['end_line'],
+        'selected_text': item['selected_text'],
+        'snippet_focus': item.get('snippet_focus') or '',
+        'comment': item['comment'],
+        'status': item['status'],
+        'created_at': float(item.get('created_at', 0.0)),
+    }
+
+
+def load_feedback(session):
+    """Load and validate `<session>/feedback.json`."""
+    path = feedback_path(session)
+    data = load_json(path)
+    if not data:
+        return {'version': FEEDBACK_VERSION, 'comments': []}
+    version = data.get('version', FEEDBACK_VERSION)
+    if version != FEEDBACK_VERSION:
+        raise StagedError('Unsupported feedback.json version: {!r}'.format(version))
+    comments_raw = data.get('comments', [])
+    if not isinstance(comments_raw, list):
+        raise StagedError('feedback.json "comments" must be a list.')
+    comments = [_validate_comment_item(c) for c in comments_raw]
+    return {'version': FEEDBACK_VERSION, 'comments': comments}
+
+
+def save_feedback(session, data):
+    """Validate and save `<session>/feedback.json` atomically."""
+    if not isinstance(data, dict):
+        raise StagedError('Feedback payload must be a JSON object.')
+    comments = [_validate_comment_item(c) for c in data.get('comments', [])]
+    payload = {'version': FEEDBACK_VERSION, 'comments': comments}
+    save_json(feedback_path(session), payload)
+    return payload
+
+
+def _next_comment_id(comments):
+    max_num = 0
+    for item in comments:
+        m = re.fullmatch(r'fb-(\d+)', str(item.get('id', '')))
+        if m:
+            max_num = max(max_num, int(m.group(1)))
+    return 'fb-{}'.format(max_num + 1)
+
+
+def read_side_lines(session, rel_path, side='staged'):
+    """Read 1-indexed lines for `rel_path` from either `staged` or `workspace`."""
+    if side not in VALID_SIDES:
+        raise StagedError('Invalid side {!r}; expected staged or workspace.'.format(side))
+    if side == 'staged':
+        if rel_path in getattr(session, 'deletions', []):
+            return []
+        target = safe_path(session.staging, rel_path)
+    else:
+        target = session.original(rel_path) if hasattr(session, 'original') else safe_path(session.workspace, rel_path)
+    if not target.is_file():
+        return []
+    try:
+        text = target.read_text(encoding='utf-8', errors='replace')
+    except OSError as exc:
+        raise StagedError('Cannot read {}: {}'.format(target, exc))
+    return text.splitlines()
+
+
+def extract_lines_text(session, rel_path, start_line, end_line=None, side='staged'):
+    """Extract exact lines [start_line..end_line] (1-based inclusive) from staged or workspace file."""
+    end_line = start_line if end_line is None else end_line
+    if start_line < 1 or end_line < start_line:
+        raise StagedError('Invalid line range: {}-{}'.format(start_line, end_line))
+    lines = read_side_lines(session, rel_path, side=side)
+    if not lines:
+        target_label = 'staged' if side == 'staged' else 'workspace'
+        raise StagedError('No {} file content available for {}'.format(target_label, rel_path))
+    if start_line > len(lines) or end_line > len(lines):
+        raise StagedError(
+            'Line range L{}-L{} is out of bounds for {} ({} lines on {} side).'.format(
+                start_line, end_line, rel_path, len(lines), side
+            )
+        )
+    return '\n'.join(lines[start_line - 1:end_line])
+
+
+def add_feedback_comment(
+    session,
+    file_path,
+    comment,
+    start_line=1,
+    end_line=None,
+    side='staged',
+    snippet_focus=None,
+    selected_text=None,
+    created_at=None,
+):
+    """Create and persist a new inline code-selection feedback comment."""
+    safe_path(session.staging, file_path)
+    if side not in VALID_SIDES:
+        raise StagedError('Invalid side {!r}; choose staged or workspace.'.format(side))
+    if not isinstance(comment, str) or not comment.strip():
+        raise StagedError('Feedback comment cannot be empty.')
+    start_line = int(start_line)
+    end_line = int(start_line if end_line is None else end_line)
+    if start_line < 1 or end_line < start_line:
+        raise StagedError('Invalid line range: L{}-L{}.'.format(start_line, end_line))
+
+    if selected_text is None:
+        selected_text = extract_lines_text(session, file_path, start_line, end_line, side=side)
+
+    focus = (snippet_focus or '').strip()
+    if focus and focus not in selected_text:
+        raise StagedError(
+            'Selected substring {!r} was not found in {} L{}-L{}.'.format(
+                focus, file_path, start_line, end_line
+            )
+        )
+
+    data = load_feedback(session)
+    new_item = _validate_comment_item({
+        'id': _next_comment_id(data['comments']),
+        'file': file_path,
+        'side': side,
+        'start_line': start_line,
+        'end_line': end_line,
+        'selected_text': selected_text,
+        'snippet_focus': focus,
+        'comment': comment.strip(),
+        'status': 'open',
+        'created_at': float(time.time() if created_at is None else created_at),
+    })
+    data['comments'].append(new_item)
+    save_feedback(session, data)
+    return new_item
+
+
+def resolve_feedback(session, comment_id=None, resolve_all=False, toggle=False):
+    """Mark one or all feedback comments as resolved (or toggle status when toggle=True)."""
+    data = load_feedback(session)
+    updated = []
+    if resolve_all:
+        for item in data['comments']:
+            if item['status'] != 'resolved':
+                item['status'] = 'resolved'
+                updated.append(item)
+    elif comment_id:
+        for item in data['comments']:
+            if item['id'] == comment_id:
+                if toggle:
+                    item['status'] = 'open' if item['status'] == 'resolved' else 'resolved'
+                else:
+                    item['status'] = 'resolved'
+                updated.append(item)
+                break
+        if not updated:
+            raise StagedError('Unknown feedback comment ID: {}'.format(comment_id))
+    else:
+        raise StagedError('Specify a comment ID or --resolve-all.')
+    save_feedback(session, data)
+    return updated
+
+
+def delete_feedback(session, comment_id=None, clear_all=False):
+    """Delete a single feedback comment by ID or clear all comments in the session."""
+    data = load_feedback(session)
+    if clear_all:
+        removed = list(data['comments'])
+        data['comments'] = []
+        save_feedback(session, data)
+        return removed
+    if not comment_id:
+        raise StagedError('Specify a comment ID to delete or --clear.')
+    kept = []
+    removed = []
+    for item in data['comments']:
+        if item['id'] == comment_id:
+            removed.append(item)
+        else:
+            kept.append(item)
+    if not removed:
+        raise StagedError('Unknown feedback comment ID: {}'.format(comment_id))
+    data['comments'] = kept
+    save_feedback(session, data)
+    return removed
+
+
+def format_line_range(start_line, end_line):
+    return 'L{}'.format(start_line) if start_line == end_line else 'L{}-L{}'.format(start_line, end_line)
+
+
+def format_feedback_human(session, file_filter=None, only_open=False):
+    """Render human- and agent-readable review feedback grouped by file."""
+    data = load_feedback(session)
+    comments = data['comments']
+    if file_filter is not None:
+        comments = [c for c in comments if c['file'] == file_filter]
+    if only_open:
+        comments = [c for c in comments if c['status'] == 'open']
+    if not comments:
+        return 'No review feedback comments{}.'.format(
+            ' for {}'.format(file_filter) if file_filter else ' in session {}'.format(session.id)
+        )
+
+    open_count = sum(1 for c in comments if c['status'] == 'open')
+    resolved_count = sum(1 for c in comments if c['status'] == 'resolved')
+    lines = [
+        'Session {} Feedback ({} open, {} resolved)'.format(session.id, open_count, resolved_count),
+    ]
+    by_file = {}
+    for c in comments:
+        by_file.setdefault(c['file'], []).append(c)
+
+    for rel in sorted(by_file):
+        lines.append('')
+        lines.append('File: {}'.format(rel))
+        for item in sorted(by_file[rel], key=lambda x: (x['start_line'], x['end_line'], x['id'])):
+            badge = '[OPEN]' if item['status'] == 'open' else '[RESOLVED]'
+            rng = format_line_range(item['start_line'], item['end_line'])
+            header = '  {} {} ({} {})'.format(item['id'], badge, item['side'], rng)
+            if item.get('snippet_focus'):
+                header += ' focus: `{}`'.format(item['snippet_focus'])
+            lines.append(header)
+            for code_line in item['selected_text'].splitlines():
+                lines.append('    | {}'.format(code_line))
+            lines.append('    -> {}'.format(item['comment']))
+    return '\n'.join(lines)
+
+
+def format_feedback_prompt(session, only_open=True, file_filter=None):
+    """Generate a copy-pasteable Markdown prompt tailored for AI coding agents."""
+    data = load_feedback(session)
+    comments = data['comments']
+    if file_filter is not None:
+        comments = [c for c in comments if c['file'] == file_filter]
+    if only_open:
+        comments = [c for c in comments if c['status'] == 'open']
+
+    lines = [
+        '# Code Review Feedback for staged session `{}`'.format(session.id),
+        '',
+        'Workspace: `{}`'.format(session.workspace),
+    ]
+    if not comments:
+        lines.append('')
+        lines.append('No open review feedback comments.')
+        return '\n'.join(lines)
+
+    lines.extend([
+        'Open comments: {}'.format(len(comments)),
+        '',
+        'Please address the following inline code review comments in the staged session `{}`:'.format(session.id),
+    ])
+
+    by_file = {}
+    for c in comments:
+        by_file.setdefault(c['file'], []).append(c)
+
+    for rel in sorted(by_file):
+        lines.append('')
+        lines.append('## `{}`'.format(rel))
+        for item in sorted(by_file[rel], key=lambda x: (x['start_line'], x['end_line'], x['id'])):
+            rng = format_line_range(item['start_line'], item['end_line'])
+            lines.append('')
+            lines.append('### `{}` — `{}` ({} side, status: `{}`)'.format(
+                item['id'], rng, item['side'], item['status']
+            ))
+            if item.get('snippet_focus'):
+                lines.append('- **Focused expression**: `{}`'.format(item['snippet_focus']))
+            lines.append('```')
+            lines.append(item['selected_text'])
+            lines.append('```')
+            lines.append('**Reviewer Comment**: {}'.format(item['comment']))
+
+    lines.extend([
+        '',
+        '---',
+        'After updating the staged files (`staged write -s {} -f <file> ...`), '
+        'mark addressed comments resolved with `staged feedback -s {} --resolve <id>`.'.format(
+            session.id, session.id
+        ),
+    ])
+    return '\n'.join(lines)
+
+
+def copy_to_clipboard(text, runner=None):
+    """Copy `text` to the system clipboard using available platform tools."""
+    run_fn = runner or subprocess.run
+    candidates = [
+        (['pbcopy'], 'pbcopy'),
+        (['wl-copy'], 'wl-copy'),
+        (['xclip', '-selection', 'clipboard'], 'xclip'),
+        (['xsel', '--clipboard', '--input'], 'xsel'),
+        (['clip'], 'clip'),
+    ]
+    for cmd, label in candidates:
+        if runner is not None or shutil.which(cmd[0]):
+            try:
+                res = run_fn(cmd, input=text, text=True, capture_output=True)
+                if getattr(res, 'returncode', 1) == 0:
+                    return True, label
+            except OSError:
+                continue
+    return False, None
+
+
+def configure_feedback_parser(parser):
+    """Configure argparse options on the `staged feedback` subparser."""
+    parser.add_argument('-f', '--file', help='filter feedback or target file for --add')
+    parser.add_argument('--json', action='store_true', help='output structured JSON feedback')
+    parser.add_argument('--prompt', action='store_true', help='format open feedback as a Markdown prompt for AI agents')
+    parser.add_argument('--copy', action='store_true', help='copy the formatted agent prompt to system clipboard')
+    parser.add_argument('--all-comments', action='store_true', help='include resolved comments in --prompt output')
+
+    parser.add_argument('--add', action='store_true', help='add a new inline code review comment')
+    parser.add_argument('--start-line', type=int, help='1-based start line for --add')
+    parser.add_argument('--end-line', type=int, help='1-based inclusive end line for --add (default: start-line)')
+    parser.add_argument('--side', choices=list(VALID_SIDES), default='staged',
+                        help='target side for --add (default: staged)')
+    parser.add_argument('--select', dest='snippet_focus', help='specific substring/token within the line range to highlight')
+    parser.add_argument('-m', '--message', help='review comment text for --add')
+    parser.add_argument('--stdin', action='store_true', help='read review comment text from standard input')
+
+    parser.add_argument('--resolve', metavar='ID', help='mark a feedback comment ID as resolved')
+    parser.add_argument('--resolve-all', action='store_true', help='mark all feedback comments in this session as resolved')
+    parser.add_argument('--delete', metavar='ID', help='delete a feedback comment ID')
+    parser.add_argument('--clear', action='store_true', help='remove all feedback comments in this session')
+    return parser
+
+
+def configure_tui_parser(parser):
+    """Configure argparse options on the `staged tui` subparser."""
+    parser.add_argument('-f', '--file', help='initial proposed file to focus in the TUI')
+    return parser
+
+
+def handle_feedback(ctx, session, args, clipboard_runner=None):
+    """Execute the `staged feedback` command."""
+    add_requested = bool(
+        getattr(args, 'add', False)
+        or getattr(args, 'message', None) is not None
+        or getattr(args, 'stdin', False)
+    )
+    resolve_id = getattr(args, 'resolve', None)
+    resolve_all = bool(getattr(args, 'resolve_all', False))
+    delete_id = getattr(args, 'delete', None)
+    clear_all = bool(getattr(args, 'clear', False))
+
+    actions = sum([
+        1 if add_requested else 0,
+        1 if (resolve_id or resolve_all) else 0,
+        1 if (delete_id or clear_all) else 0,
+    ])
+    if actions > 1:
+        raise StagedError('Choose only one feedback action (--add, --resolve/--resolve-all, or --delete/--clear).')
+
+    if add_requested:
+        if not getattr(args, 'file', None):
+            raise StagedError('--add requires -f/--file <file>.')
+        if getattr(args, 'start_line', None) is None:
+            raise StagedError('--add requires --start-line <line>.')
+        comment_text = getattr(args, 'message', None)
+        if getattr(args, 'stdin', False):
+            if sys.stdin.isatty():
+                raise StagedError('--stdin requires piped or redirected input; use -m/--message for inline text.')
+            comment_text = sys.stdin.read()
+        if not comment_text or not comment_text.strip():
+            raise StagedError('Provide a non-empty comment with -m/--message or --stdin.')
+        target_file = args.file
+        available = session.paths(fresh=True)
+        if target_file not in available and available:
+            target_file = match_file(target_file, available)
+        item = add_feedback_comment(
+            session,
+            file_path=target_file,
+            comment=comment_text,
+            start_line=args.start_line,
+            end_line=getattr(args, 'end_line', None),
+            side=getattr(args, 'side', 'staged') or 'staged',
+            snippet_focus=getattr(args, 'snippet_focus', None),
+        )
+        if getattr(args, 'json', False):
+            print(json.dumps(item))
+        else:
+            rng = format_line_range(item['start_line'], item['end_line'])
+            print('Added feedback {} on {} ({} {}): {}'.format(
+                item['id'], item['file'], item['side'], rng, item['comment']
+            ))
+        return item
+
+    if resolve_id or resolve_all:
+        updated = resolve_feedback(session, comment_id=resolve_id, resolve_all=resolve_all)
+        if getattr(args, 'json', False):
+            print(json.dumps({'operation': 'resolve', 'resolved': [c['id'] for c in updated], 'count': len(updated)}))
+        else:
+            print('Resolved {} feedback comment(s).'.format(len(updated)))
+        return updated
+
+    if delete_id or clear_all:
+        removed = delete_feedback(session, comment_id=delete_id, clear_all=clear_all)
+        if getattr(args, 'json', False):
+            print(json.dumps({'operation': 'delete', 'deleted': [c['id'] for c in removed], 'count': len(removed)}))
+        else:
+            print('Deleted {} feedback comment(s).'.format(len(removed)))
+        return removed
+
+    file_filter = getattr(args, 'file', None)
+    if file_filter is not None:
+        data_all = load_feedback(session)
+        known_paths = sorted(set(session.paths(fresh=True)) | {c['file'] for c in data_all['comments']})
+        if file_filter not in known_paths and known_paths:
+            file_filter = match_file(file_filter, known_paths)
+
+    if getattr(args, 'json', False):
+        data = load_feedback(session)
+        comments = data['comments']
+        if file_filter is not None:
+            comments = [c for c in comments if c['file'] == file_filter]
+        payload = {
+            'session': session.id,
+            'workspace': str(session.workspace),
+            'version': data['version'],
+            'comments': comments,
+        }
+        print(json.dumps(payload))
+        return payload
+
+    only_open = not getattr(args, 'all_comments', False)
+    if getattr(args, 'copy', False):
+        prompt_text = format_feedback_prompt(session, only_open=only_open, file_filter=file_filter)
+        ok, tool_name = copy_to_clipboard(prompt_text, runner=clipboard_runner)
+        if getattr(args, 'prompt', False):
+            print(prompt_text)
+        if ok:
+            print('Copied feedback prompt to clipboard via {}.'.format(tool_name))
+        else:
+            raise StagedError('No clipboard utility found (tried pbcopy, wl-copy, xclip, xsel, clip).')
+        return prompt_text
+
+    if getattr(args, 'prompt', False):
+        prompt_text = format_feedback_prompt(session, only_open=only_open, file_filter=file_filter)
+        print(prompt_text)
+        return prompt_text
+
+    output = format_feedback_human(session, file_filter=file_filter, only_open=False)
+    print(output)
+    return output
+
+
+def highlight_syntax(code_line, filename=None):
+    """Optional syntax highlighting via Pygments.
+    Returns a list of (start, end, token_kind) spans if Pygments is installed.
+    Falls back gracefully to an empty list (clean standard diff highlighting) with zero dependencies.
+    """
+    if not code_line:
+        return []
+    try:
+        import pygments
+        from pygments.lexers import get_lexer_for_filename, TextLexer
+        from pygments.token import Token
+    except ImportError:
+        return []
+
+    try:
+        lexer = get_lexer_for_filename(filename, ensure_nl=False) if filename else TextLexer()
+    except Exception:
+        lexer = TextLexer()
+
+    spans = []
+    offset = 0
+    for token_type, value in pygments.lex(code_line, lexer):
+        length = len(value)
+        if token_type in Token.Keyword:
+            spans.append((offset, offset + length, 'keyword'))
+        elif token_type in Token.String:
+            spans.append((offset, offset + length, 'string'))
+        elif token_type in Token.Comment:
+            spans.append((offset, offset + length, 'comment'))
+        elif token_type in Token.Number:
+            spans.append((offset, offset + length, 'number'))
+        elif token_type in Token.Name:
+            spans.append((offset, offset + length, 'name'))
+        offset += length
+    return spans
+
+
+tokenize_syntax = highlight_syntax
+
+
+def extract_selectable_tokens(line):
+    if not line or not line.strip():
+        return []
+    tokens = []
+    pattern = re.compile(
+        r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
+        r'|\b[A-Za-z_][A-Za-z0-9_.]*\([^()]*\)'
+        r'|\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+'
+        r'|\b[A-Za-z_][A-Za-z0-9_]*\b'
+        r'|\b\d+(?:\.\d+)?\b'
+    )
+    seen = set()
+    for match in pattern.finditer(line):
+        text = match.group(0)
+        start, end = match.span()
+        if (start, end, text) not in seen:
+            seen.add((start, end, text))
+            tokens.append({'start': start, 'end': end, 'text': text})
+    return tokens
+
+
+def compute_intraline_spans(left_line, right_line):
+    if not left_line or not right_line:
+        return ([(0, len(left_line))] if left_line else []), ([(0, len(right_line))] if right_line else [])
+    matcher = difflib.SequenceMatcher(None, left_line, right_line)
+    left_spans = []
+    right_spans = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != 'equal':
+            if i2 > i1:
+                left_spans.append((i1, i2))
+            if j2 > j1:
+                right_spans.append((j1, j2))
+    return left_spans, right_spans
+
+
+def compute_diff_hunks(orig_lines, staged_lines):
+    matcher = difflib.SequenceMatcher(None, orig_lines, staged_lines)
+    hunks = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != 'equal':
+            hunks.append({
+                'index': len(hunks),
+                'tag': tag,
+                'orig_start': i1,
+                'orig_end': i2,
+                'staged_start': j1,
+                'staged_end': j2,
+            })
+    return hunks
+
+
+def build_side_by_side_rows(orig_lines, staged_lines):
+    matcher = difflib.SequenceMatcher(None, orig_lines, staged_lines)
+    rows = []
+    hunks = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            for offset in range(i2 - i1):
+                li = i1 + offset
+                ri = j1 + offset
+                rows.append({
+                    'kind': 'equal',
+                    'hunk_index': None,
+                    'left_lineno': li + 1,
+                    'left_text': orig_lines[li],
+                    'right_lineno': ri + 1,
+                    'right_text': staged_lines[ri],
+                    'left_spans': [],
+                    'right_spans': [],
+                })
+        else:
+            hunk_idx = len(hunks)
+            hunks.append({
+                'index': hunk_idx,
+                'tag': tag,
+                'orig_start': i1,
+                'orig_end': i2,
+                'staged_start': j1,
+                'staged_end': j2,
+                'first_row': len(rows),
+            })
+            left_chunk = orig_lines[i1:i2]
+            right_chunk = staged_lines[j1:j2]
+            count = max(len(left_chunk), len(right_chunk))
+            for k in range(count):
+                has_l = k < len(left_chunk)
+                has_r = k < len(right_chunk)
+                l_text = left_chunk[k] if has_l else ''
+                r_text = right_chunk[k] if has_r else ''
+                l_spans, r_spans = ([], [])
+                if has_l and has_r:
+                    l_spans, r_spans = compute_intraline_spans(l_text, r_text)
+                rows.append({
+                    'kind': tag,
+                    'hunk_index': hunk_idx,
+                    'left_lineno': (i1 + k + 1) if has_l else None,
+                    'left_text': l_text if has_l else None,
+                    'right_lineno': (j1 + k + 1) if has_r else None,
+                    'right_text': r_text if has_r else None,
+                    'left_spans': l_spans,
+                    'right_spans': r_spans,
+                })
+    return rows, hunks
+
+
+def build_unified_rows(orig_lines, staged_lines):
+    matcher = difflib.SequenceMatcher(None, orig_lines, staged_lines)
+    rows = []
+    hunks = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            for offset in range(i2 - i1):
+                li = i1 + offset
+                ri = j1 + offset
+                rows.append({
+                    'kind': 'equal',
+                    'prefix': ' ',
+                    'hunk_index': None,
+                    'left_lineno': li + 1,
+                    'right_lineno': ri + 1,
+                    'text': orig_lines[li],
+                    'left_text': orig_lines[li],
+                    'right_text': staged_lines[ri],
+                })
+        else:
+            hunk_idx = len(hunks)
+            hunks.append({
+                'index': hunk_idx,
+                'tag': tag,
+                'orig_start': i1,
+                'orig_end': i2,
+                'staged_start': j1,
+                'staged_end': j2,
+                'first_row': len(rows),
+            })
+            for li in range(i1, i2):
+                rows.append({
+                    'kind': 'delete',
+                    'prefix': '-',
+                    'hunk_index': hunk_idx,
+                    'left_lineno': li + 1,
+                    'right_lineno': None,
+                    'text': orig_lines[li],
+                    'left_text': orig_lines[li],
+                    'right_text': None,
+                })
+            for ri in range(j1, j2):
+                rows.append({
+                    'kind': 'insert',
+                    'prefix': '+',
+                    'hunk_index': hunk_idx,
+                    'left_lineno': None,
+                    'right_lineno': ri + 1,
+                    'text': staged_lines[ri],
+                    'left_text': None,
+                    'right_text': staged_lines[ri],
+                })
+    return rows, hunks
+
+
+def file_line_delta(session, rel_path):
+    orig = read_side_lines(session, rel_path, side='workspace')
+    staged = read_side_lines(session, rel_path, side='staged')
+    matcher = difflib.SequenceMatcher(None, orig, staged)
+    added = 0
+    removed = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in ('replace', 'delete'):
+            removed += (i2 - i1)
+        if tag in ('replace', 'insert'):
+            added += (j2 - j1)
+    return added, removed
+
+
+def apply_hunk(session, rel_path, hunk_index=0):
+    safe_path(session.staging, rel_path)
+    if rel_path in getattr(session, 'deletions', []):
+        raise StagedError('Cannot apply a single hunk of a full-file deletion; apply the file instead.')
+    staged_file = safe_path(session.staging, rel_path)
+    if not staged_file.is_file():
+        raise StagedError('Missing staged file: {}'.format(rel_path))
+
+    dest_file = safe_path(session.workspace, rel_path)
+    orig_raw = dest_file.read_text(encoding='utf-8', errors='replace') if dest_file.is_file() else ''
+    staged_raw = staged_file.read_text(encoding='utf-8', errors='replace')
+
+    orig_lines = orig_raw.splitlines()
+    staged_lines = staged_raw.splitlines()
+    hunks = compute_diff_hunks(orig_lines, staged_lines)
+    if not hunks:
+        return False
+    if hunk_index < 0 or hunk_index >= len(hunks):
+        raise StagedError('Hunk index {} out of range (0..{}).'.format(hunk_index, len(hunks) - 1))
+
+    target_hunk = hunks[hunk_index]
+    new_lines = (
+        orig_lines[:target_hunk['orig_start']]
+        + staged_lines[target_hunk['staged_start']:target_hunk['staged_end']]
+        + orig_lines[target_hunk['orig_end']:]
+    )
+    trailing_newline = staged_raw.endswith('\n') or orig_raw.endswith('\n') or bool(new_lines)
+    new_content = '\n'.join(new_lines) + ('\n' if trailing_newline and new_lines else '')
+    write_text_file(dest_file, new_content)
+    if hasattr(session, 'refresh_index'):
+        session.refresh_index()
+    return True
+
+
+def apply_file_from_tui(session, rel_path):
+    dest = safe_path(session.workspace, rel_path)
+    old = session.original(rel_path) if hasattr(session, 'original') else dest
+    if rel_path in getattr(session, 'deletions', []):
+        if dest.exists():
+            dest.unlink()
+    else:
+        source = safe_path(session.staging, rel_path)
+        if not source.is_file():
+            raise StagedError('Missing staged file: {}'.format(rel_path))
+        copy_atomic(source, dest)
+        if old != dest and old.is_file():
+            old.unlink()
+    if hasattr(session, 'refresh_index'):
+        session.refresh_index()
+    return session.status(rel_path)
+
+
+class TuiState:
+    """Pure state machine and frame renderer for the 2-Pane Interactive Diff TUI."""
+
+    def __init__(self, session, target_file=None, ctx=None, clipboard_runner=None):
+        self.session = session
+        self.ctx = ctx
+        self.clipboard_runner = clipboard_runner
+        self.branch = get_git_branch(session.workspace) or '(detached)'
+
+        try:
+            import pygments
+            has_pygments = True
+        except ImportError:
+            has_pygments = False
+
+        self.show_sidebar = True
+        self.focus_pane = 'diff'
+        self.diff_mode = 'side-by-side'
+        self.syntax_highlight = has_pygments
+        self.show_help = False
+        self.active_side = 'staged'
+        if not has_pygments:
+            self.status_message = "Tip: Install 'pygments' (pip install pygments) for syntax highlighting. Press [?] for help."
+        else:
+            self.status_message = "Ready. Press [?] for help."
+
+        self.file_index = 0
+        self.cursor_row = 0
+        self.scroll_offset = 0
+
+        self.visual_anchor_row = None
+
+        self.token_candidates = []
+        self.token_index = None
+
+        self.input_mode = False
+        self.input_buffer = ''
+        self.pending_comment_meta = None
+
+        self.status_message = 'Press ? or see header for keys. v:select w:token c:comment a:apply hunk q:quit'
+        self.comments_added_count = 0
+        self.should_quit = False
+
+        self.file_entries = []
+        self.rows = []
+        self.hunks = []
+        self.feedback_data = {'version': FEEDBACK_VERSION, 'comments': []}
+        self.summaries_data = {'session': '', 'files': {}}
+
+        self.refresh_inventory(select_file=target_file)
+
+    def refresh_inventory(self, select_file=None):
+        current_path = select_file or self.current_file
+        self.feedback_data = load_feedback(self.session)
+        try:
+            self.summaries_data = self.session.summaries()
+        except Exception:
+            self.summaries_data = {'session': '', 'files': {}}
+
+        paths = self.session.paths(fresh=True)
+        grouped = grouped_by_status(self.session, paths, paths)
+
+        comment_counts = {}
+        for c in self.feedback_data['comments']:
+            if c['status'] == 'open':
+                comment_counts[c['file']] = comment_counts.get(c['file'], 0) + 1
+
+        entries = []
+        for status, rel in grouped:
+            added, removed = file_line_delta(self.session, rel)
+            entries.append({
+                'path': rel,
+                'status': status,
+                'added': added,
+                'removed': removed,
+                'open_comments': comment_counts.get(rel, 0),
+                'summary': self.summaries_data.get('files', {}).get(rel, ''),
+            })
+        self.file_entries = entries
+
+        if current_path and entries:
+            for idx, entry in enumerate(entries):
+                if entry['path'] == current_path:
+                    self.file_index = idx
+                    break
+            else:
+                try:
+                    matched = match_file(current_path, [e['path'] for e in entries])
+                    for idx, entry in enumerate(entries):
+                        if entry['path'] == matched:
+                            self.file_index = idx
+                            break
+                except StagedError:
+                    self.file_index = min(self.file_index, len(entries) - 1)
+        elif entries:
+            self.file_index = min(self.file_index, len(entries) - 1)
+        else:
+            self.file_index = 0
+
+        self.rebuild_diff_rows()
+
+    @property
+    def current_file_entry(self):
+        if 0 <= self.file_index < len(self.file_entries):
+            return self.file_entries[self.file_index]
+        return None
+
+    @property
+    def current_file(self):
+        entry = self.current_file_entry
+        return entry['path'] if entry else None
+
+    def open_comments_count(self):
+        return sum(1 for c in self.feedback_data['comments'] if c['status'] == 'open')
+
+    def file_comments(self, rel_path=None):
+        rel = rel_path or self.current_file
+        if not rel:
+            return []
+        return [c for c in self.feedback_data['comments'] if c['file'] == rel]
+
+    def rebuild_diff_rows(self):
+        rel = self.current_file
+        if not rel:
+            self.rows = []
+            self.hunks = []
+            self.cursor_row = 0
+            return
+        orig_lines = read_side_lines(self.session, rel, side='workspace')
+        staged_lines = read_side_lines(self.session, rel, side='staged')
+        if self.diff_mode == 'side-by-side':
+            self.rows, self.hunks = build_side_by_side_rows(orig_lines, staged_lines)
+        else:
+            self.rows, self.hunks = build_unified_rows(orig_lines, staged_lines)
+        if not self.rows:
+            self.cursor_row = 0
+        else:
+            self.cursor_row = max(0, min(self.cursor_row, len(self.rows) - 1))
+        self._clear_token_selection()
+
+    def _clear_token_selection(self):
+        self.token_candidates = []
+        self.token_index = None
+
+    def _row_line_for_side(self, row, side=None):
+        side = side or self.active_side
+        if side == 'staged':
+            if row.get('right_lineno') is not None:
+                return 'staged', row['right_lineno'], row.get('right_text') or ''
+            if row.get('left_lineno') is not None:
+                return 'workspace', row['left_lineno'], row.get('left_text') or ''
+        else:
+            if row.get('left_lineno') is not None:
+                return 'workspace', row['left_lineno'], row.get('left_text') or ''
+            if row.get('right_lineno') is not None:
+                return 'staged', row['right_lineno'], row.get('right_text') or ''
+        return side, 1, ''
+
+    def current_selection_range(self):
+        if not self.rows or not self.current_file:
+            return (self.active_side, 1, 1, '', '')
+
+        lo_row = self.cursor_row
+        hi_row = self.cursor_row
+        if self.visual_anchor_row is not None:
+            lo_row = min(self.visual_anchor_row, self.cursor_row)
+            hi_row = max(self.visual_anchor_row, self.cursor_row)
+
+        side, first_line, _ = self._row_line_for_side(self.rows[lo_row], self.active_side)
+        line_numbers = []
+        for r_idx in range(lo_row, hi_row + 1):
+            row = self.rows[r_idx]
+            lineno = row.get('right_lineno') if side == 'staged' else row.get('left_lineno')
+            if lineno is not None:
+                line_numbers.append(lineno)
+        if not line_numbers:
+            _, fallback_line, fallback_text = self._row_line_for_side(self.rows[self.cursor_row], self.active_side)
+            line_numbers = [fallback_line]
+
+        start_line = min(line_numbers)
+        end_line = max(line_numbers)
+        try:
+            selected_text = extract_lines_text(self.session, self.current_file, start_line, end_line, side=side)
+        except StagedError:
+            _, _, selected_text = self._row_line_for_side(self.rows[self.cursor_row], side)
+
+        snippet_focus = ''
+        if self.token_index is not None and 0 <= self.token_index < len(self.token_candidates):
+            candidate = self.token_candidates[self.token_index]['text']
+            if candidate in selected_text:
+                snippet_focus = candidate
+
+        return (side, start_line, end_line, selected_text, snippet_focus)
+
+    def comments_at_row(self, row_idx):
+        if not (0 <= row_idx < len(self.rows)) or not self.current_file:
+            return []
+        row = self.rows[row_idx]
+        matched = []
+        for c in self.file_comments():
+            if c['side'] == 'staged' and row.get('right_lineno') == c['end_line']:
+                matched.append(c)
+            elif c['side'] == 'workspace' and row.get('left_lineno') == c['end_line']:
+                matched.append(c)
+        return matched
+
+    def comments_covering_row(self, row_idx):
+        if not (0 <= row_idx < len(self.rows)) or not self.current_file:
+            return []
+        row = self.rows[row_idx]
+        matched = []
+        for c in self.file_comments():
+            lineno = row.get('right_lineno') if c['side'] == 'staged' else row.get('left_lineno')
+            if lineno is not None and c['start_line'] <= lineno <= c['end_line']:
+                matched.append(c)
+        return matched
+
+    def current_hunk_index(self):
+        if not self.rows or not self.hunks:
+            return None
+        row = self.rows[self.cursor_row]
+        if row.get('hunk_index') is not None:
+            return row['hunk_index']
+        for hunk in self.hunks:
+            if hunk['first_row'] >= self.cursor_row:
+                return hunk['index']
+        return self.hunks[-1]['index']
+
+    def handle_key(self, key):
+        if isinstance(key, int):
+            if curses is not None:
+                if key == getattr(curses, 'KEY_DOWN', -1):
+                    key = 'DOWN'
+                elif key == getattr(curses, 'KEY_UP', -1):
+                    key = 'UP'
+                elif key == getattr(curses, 'KEY_LEFT', -1):
+                    key = 'LEFT'
+                elif key == getattr(curses, 'KEY_RIGHT', -1):
+                    key = 'RIGHT'
+                elif key in (getattr(curses, 'KEY_BACKSPACE', -1), 127, 8):
+                    key = 'BACKSPACE'
+                elif key in (getattr(curses, 'KEY_ENTER', -1), 10, 13):
+                    key = 'ENTER'
+                elif key == 27:
+                    key = 'ESC'
+                elif key == 9:
+                    key = 'TAB'
+                elif 0 <= key < 256:
+                    key = chr(key)
+
+        if key == '\t':
+            key = 'TAB'
+        elif key in ('\n', '\r'):
+            key = 'ENTER'
+        elif key == '\x1b':
+            key = 'ESC'
+        elif key in ('\x7f', '\x08'):
+            key = 'BACKSPACE'
+
+        if self.input_mode:
+            return self._handle_input_key(key)
+
+        if self.show_help:
+            if key in ('?', 'h', 'q', 'ESC', 'Escape'):
+                self.show_help = False
+                self.status_message = 'Closed help.'
+                return 'close_help'
+            return 'help_open'
+
+        if key in ('?', 'h'):
+            self.show_help = True
+            self.status_message = 'Showing command reference. Press [?] or [q] to close.'
+            return 'open_help'
+
+        if key == 'q':
+            self.should_quit = True
+            return 'quit'
+
+        if key == 'b':
+            self.show_sidebar = not self.show_sidebar
+            if not self.show_sidebar and self.focus_pane == 'files':
+                self.focus_pane = 'diff'
+            self.status_message = 'File sidebar {}.'.format('shown' if self.show_sidebar else 'hidden')
+            return 'toggle_sidebar'
+
+        if key == 'TAB':
+            if not self.show_sidebar:
+                self.show_sidebar = True
+                self.focus_pane = 'files'
+            else:
+                self.focus_pane = 'files' if self.focus_pane == 'diff' else 'diff'
+            self.status_message = 'Focused {} pane.'.format(self.focus_pane)
+            return 'switch_focus'
+
+        if key == 'u':
+            self.diff_mode = 'unified' if self.diff_mode == 'side-by-side' else 'side-by-side'
+            self.rebuild_diff_rows()
+            self.status_message = 'Switched to {} diff mode.'.format(self.diff_mode)
+            return 'toggle_diff_mode'
+
+        if key == 'H':
+            try:
+                import pygments
+                has_pygments = True
+            except ImportError:
+                has_pygments = False
+            if not has_pygments:
+                self.syntax_highlight = False
+                self.status_message = "Syntax highlighting requires 'pygments' (pip install pygments). Showing clean diff."
+                return 'syntax_unavailable'
+            self.syntax_highlight = not self.syntax_highlight
+            self.status_message = 'Syntax highlighting (Pygments) {}.'.format('enabled' if self.syntax_highlight else 'disabled')
+            return 'toggle_syntax'
+
+        if key in ('j', 'DOWN'):
+            if self.focus_pane == 'files':
+                if self.file_entries:
+                    self.file_index = min(len(self.file_entries) - 1, self.file_index + 1)
+                    self.cursor_row = 0
+                    self.visual_anchor_row = None
+                    self.rebuild_diff_rows()
+            else:
+                if self.rows:
+                    self.cursor_row = min(len(self.rows) - 1, self.cursor_row + 1)
+                    self._clear_token_selection()
+            return 'down'
+
+        if key in ('k', 'UP'):
+            if self.focus_pane == 'files':
+                if self.file_entries:
+                    self.file_index = max(0, self.file_index - 1)
+                    self.cursor_row = 0
+                    self.visual_anchor_row = None
+                    self.rebuild_diff_rows()
+            else:
+                if self.rows:
+                    self.cursor_row = max(0, self.cursor_row - 1)
+                    self._clear_token_selection()
+            return 'up'
+
+        if key == 'n':
+            if self.hunks:
+                for hunk in self.hunks:
+                    if hunk['first_row'] > self.cursor_row:
+                        self.cursor_row = hunk['first_row']
+                        self._clear_token_selection()
+                        self.status_message = 'Jumped to hunk {}/{}.'.format(hunk['index'] + 1, len(self.hunks))
+                        return 'next_hunk'
+                self.cursor_row = self.hunks[0]['first_row']
+                self._clear_token_selection()
+                self.status_message = 'Wrapped to hunk 1/{}.'.format(len(self.hunks))
+            return 'next_hunk'
+
+        if key == 'p':
+            if self.hunks:
+                for hunk in reversed(self.hunks):
+                    if hunk['first_row'] < self.cursor_row:
+                        self.cursor_row = hunk['first_row']
+                        self._clear_token_selection()
+                        self.status_message = 'Jumped to hunk {}/{}.'.format(hunk['index'] + 1, len(self.hunks))
+                        return 'prev_hunk'
+                self.cursor_row = self.hunks[-1]['first_row']
+                self._clear_token_selection()
+                self.status_message = 'Wrapped to hunk {}/{}.'.format(len(self.hunks), len(self.hunks))
+            return 'prev_hunk'
+
+        if key in ('[', 'LEFT'):
+            if self.token_candidates and self.token_index is not None:
+                self.token_index = (self.token_index - 1) % len(self.token_candidates)
+                tok = self.token_candidates[self.token_index]['text']
+                self.status_message = 'Selected token [{}/{}]: `{}`'.format(
+                    self.token_index + 1, len(self.token_candidates), tok
+                )
+                return 'prev_token'
+            self.active_side = 'workspace'
+            self._clear_token_selection()
+            self.status_message = 'Active side: workspace (original)'
+            return 'side_workspace'
+
+        if key in (']', 'RIGHT'):
+            if self.token_candidates and self.token_index is not None:
+                self.token_index = (self.token_index + 1) % len(self.token_candidates)
+                tok = self.token_candidates[self.token_index]['text']
+                self.status_message = 'Selected token [{}/{}]: `{}`'.format(
+                    self.token_index + 1, len(self.token_candidates), tok
+                )
+                return 'next_token'
+            self.active_side = 'staged'
+            self._clear_token_selection()
+            self.status_message = 'Active side: staged (proposal)'
+            return 'side_staged'
+
+        if key in ('v', ' '):
+            if self.visual_anchor_row is None:
+                self.visual_anchor_row = self.cursor_row
+                side, s_line, e_line, _, _ = self.current_selection_range()
+                self.status_message = 'Visual selection started at {} {}. Move j/k, press c or Enter to comment.'.format(
+                    side, format_line_range(s_line, e_line)
+                )
+            else:
+                self.visual_anchor_row = None
+                self.status_message = 'Visual selection cleared.'
+            return 'toggle_visual'
+
+        if key == 'ESC':
+            self.visual_anchor_row = None
+            self._clear_token_selection()
+            self.status_message = 'Selection cleared.'
+            return 'escape'
+
+        if key == 'w':
+            if not self.rows:
+                return 'noop'
+            row = self.rows[self.cursor_row]
+            _, _, line_text = self._row_line_for_side(row, self.active_side)
+            if not self.token_candidates:
+                self.token_candidates = extract_selectable_tokens(line_text)
+                if not self.token_candidates:
+                    self.status_message = 'No selectable tokens on current line.'
+                    return 'no_tokens'
+                self.token_index = 0
+            else:
+                self.token_index = (self.token_index + 1) % len(self.token_candidates)
+            tok = self.token_candidates[self.token_index]['text']
+            self.status_message = 'Selected token [{}/{}]: `{}` (press c to comment on this expression)'.format(
+                self.token_index + 1, len(self.token_candidates), tok
+            )
+            return 'cycle_token'
+
+        if key == 'c' or (key == 'ENTER' and (self.visual_anchor_row is not None or self.token_index is not None)):
+            if not self.current_file or not self.rows:
+                return 'noop'
+            side, s_line, e_line, sel_text, focus = self.current_selection_range()
+            self.input_mode = True
+            self.input_buffer = ''
+            self.pending_comment_meta = {
+                'file': self.current_file,
+                'side': side,
+                'start_line': s_line,
+                'end_line': e_line,
+                'selected_text': sel_text,
+                'snippet_focus': focus,
+            }
+            rng = format_line_range(s_line, e_line)
+            focus_hint = ' [focus: `{}`]'.format(focus) if focus else ''
+            self.status_message = 'Comment on {} {} {}{}: '.format(self.current_file, side, rng, focus_hint)
+            return 'start_comment'
+
+        if key == 'ENTER' and self.focus_pane == 'files':
+            self.focus_pane = 'diff'
+            self.status_message = 'Focused diff pane for {}.'.format(self.current_file or '')
+            return 'enter_diff'
+
+        if key == 'r':
+            comments = self.comments_covering_row(self.cursor_row) or self.comments_at_row(self.cursor_row)
+            if not comments:
+                self.status_message = 'No feedback comment on current line.'
+                return 'noop'
+            target = comments[-1]
+            updated = resolve_feedback(self.session, comment_id=target['id'], toggle=True)
+            new_status = updated[0]['status'] if updated else target['status']
+            self.refresh_inventory()
+            self.status_message = 'Marked {} as {}.'.format(target['id'], new_status)
+            return 'toggle_resolve'
+
+        if key == 'x':
+            comments = self.comments_covering_row(self.cursor_row) or self.comments_at_row(self.cursor_row)
+            if not comments:
+                self.status_message = 'No feedback comment on current line to delete.'
+                return 'noop'
+            target = comments[-1]
+            delete_feedback(self.session, comment_id=target['id'])
+            self.refresh_inventory()
+            self.status_message = 'Deleted feedback comment {}.'.format(target['id'])
+            return 'delete_comment'
+
+        if key == 'a':
+            if not self.current_file:
+                return 'noop'
+            if self.focus_pane == 'files':
+                status = apply_file_from_tui(self.session, self.current_file)
+                self.refresh_inventory()
+                self.status_message = 'Applied file {} ({}).'.format(self.current_file, status)
+                return 'apply_file'
+            hunk_idx = self.current_hunk_index()
+            if hunk_idx is None:
+                self.status_message = 'No diff hunk to apply in {}.'.format(self.current_file)
+                return 'noop'
+            apply_hunk(self.session, self.current_file, hunk_idx)
+            self.refresh_inventory()
+            self.status_message = 'Applied hunk {} of {} to workspace.'.format(hunk_idx + 1, self.current_file)
+            return 'apply_hunk'
+
+        if key == 'A':
+            if not self.current_file:
+                return 'noop'
+            status = apply_file_from_tui(self.session, self.current_file)
+            self.refresh_inventory()
+            self.status_message = 'Applied entire file {} ({}).'.format(self.current_file, status)
+            return 'apply_file'
+
+        if key == 'y':
+            prompt_text = format_feedback_prompt(self.session, only_open=True)
+            ok, tool_name = copy_to_clipboard(prompt_text, runner=self.clipboard_runner)
+            if ok:
+                self.status_message = 'Copied open feedback prompt to clipboard ({}).'.format(tool_name)
+            else:
+                self.status_message = 'Clipboard tool unavailable; run `staged feedback --prompt`.'
+            return 'yank_prompt'
+
+        return 'noop'
+
+    def _handle_input_key(self, key):
+        if key == 'ESC':
+            self.input_mode = False
+            self.input_buffer = ''
+            self.pending_comment_meta = None
+            self.status_message = 'Comment cancelled.'
+            return 'cancel_comment'
+
+        if key == 'BACKSPACE':
+            self.input_buffer = self.input_buffer[:-1]
+            return 'input_backspace'
+
+        if key == 'ENTER':
+            text = self.input_buffer.strip()
+            meta = self.pending_comment_meta
+            self.input_mode = False
+            self.input_buffer = ''
+            self.pending_comment_meta = None
+            if not text or not meta:
+                self.status_message = 'Empty comment discarded.'
+                return 'discard_comment'
+            created = add_feedback_comment(
+                self.session,
+                file_path=meta['file'],
+                comment=text,
+                start_line=meta['start_line'],
+                end_line=meta['end_line'],
+                side=meta['side'],
+                snippet_focus=meta['snippet_focus'],
+                selected_text=meta['selected_text'],
+            )
+            self.visual_anchor_row = None
+            self._clear_token_selection()
+            self.comments_added_count += 1
+            self.refresh_inventory()
+            self.status_message = 'Saved {} on {} ({}).'.format(
+                created['id'],
+                created['file'],
+                format_line_range(created['start_line'], created['end_line']),
+            )
+            return 'save_comment'
+
+        if isinstance(key, str) and len(key) == 1 and key.isprintable():
+            self.input_buffer += key
+            return 'input_char'
+        return 'noop'
+
+    def _selected_row_bounds(self):
+        if self.visual_anchor_row is None:
+            return (self.cursor_row, self.cursor_row)
+        return (min(self.visual_anchor_row, self.cursor_row), max(self.visual_anchor_row, self.cursor_row))
+
+    def render_frame(self, width=120, height=32):
+        width = max(60, int(width))
+        height = max(12, int(height))
+
+        def fit(text, w):
+            text = str(text)
+            return text[:w].ljust(w)
+
+        mode_label = '2-Pane Side-by-Side' if self.diff_mode == 'side-by-side' else 'Unified'
+        open_cnt = self.open_comments_count()
+        header = (
+            ' staged TUI | Session: {} | Branch: {} | Mode: {} | Side: {} | Open Comments: {} '
+            '| [?]Help [Tab]Pane [b]Files [u]Mode [v]Select [w]Token [c]Comment [a]Apply [q]Quit'
+        ).format(self.session.id, self.branch, mode_label, self.active_side, open_cnt)
+
+        frame = [fit(header, width)]
+        body_height = height - 2
+
+        sidebar_w = min(38, max(24, width // 4)) if self.show_sidebar else 0
+        diff_w = width - sidebar_w - (1 if sidebar_w else 0)
+
+        left_lines = []
+        if sidebar_w:
+            pane_marker = '*' if self.focus_pane == 'files' else ' '
+            left_lines.append(fit(' {}FILES ({})'.format(pane_marker, len(self.file_entries)), sidebar_w))
+            left_lines.append(fit(' ' + '-' * (sidebar_w - 2), sidebar_w))
+            last_status = None
+            for idx, entry in enumerate(self.file_entries):
+                if entry['status'] != last_status:
+                    left_lines.append(fit(' [{}]'.format(entry['status']), sidebar_w))
+                    last_status = entry['status']
+                cursor_prefix = '>' if idx == self.file_index else ' '
+                badge = ' 💬{}'.format(entry['open_comments']) if entry['open_comments'] else ''
+                delta = '+{}-{}'.format(entry['added'], entry['removed'])
+                item_str = ' {} {} ({}){}'.format(cursor_prefix, entry['path'], delta, badge)
+                left_lines.append(fit(item_str, sidebar_w))
+            while len(left_lines) < body_height:
+                left_lines.append(' ' * sidebar_w)
+
+        right_lines = []
+        if self.show_help:
+            right_lines.append(fit(' staged TUI Command Reference & Shortcuts', diff_w))
+            right_lines.append(fit(' ' + '─' * max(10, diff_w - 4), diff_w))
+            help_sections = [
+                ('NAVIGATION', [
+                    ('j / k (or Down/Up)', 'Move cursor line by line'),
+                    ('n / p', 'Jump to next / previous diff hunk'),
+                    ('Tab', 'Switch focus between File Rail and Diff Viewport'),
+                    ('[ / ]', 'Switch active side (workspace vs staged) or cycle tokens'),
+                    ('b', 'Toggle file rail sidebar on / off'),
+                    ('u', 'Toggle 2-Pane Side-by-Side vs Unified diff mode'),
+                ]),
+                ('CODE REVIEW & INLINE FEEDBACK', [
+                    ('v (or Space)', 'Toggle visual multi-line selection mode'),
+                    ('w', 'Select sub-line token / expression on current line'),
+                    ('c (or Enter)', 'Add inline comment anchored to selection (saves to feedback.json)'),
+                    ('r', 'Toggle [OPEN] / [RESOLVED] status on comment at cursor'),
+                    ('x', 'Delete comment at cursor'),
+                    ('y', 'Copy all open review comments to clipboard as AI prompt'),
+                ]),
+                ('STAGING & APPLY', [
+                    ('a', 'Selectively apply current diff hunk directly to workspace'),
+                    ('A', 'Apply entire current file to workspace'),
+                ]),
+                ('DISPLAY & SYNTAX HIGHLIGHTING', [
+                    ('H', 'Toggle Pygments syntax highlighting on / off'),
+                    ('? or h', 'Toggle this help reference screen'),
+                    ('q', 'Quit TUI / Close help'),
+                ]),
+            ]
+            for section_title, items in help_sections:
+                if len(right_lines) >= body_height - 3:
+                    break
+                right_lines.append(fit(' ' + section_title + ':', diff_w))
+                for key_combo, desc in items:
+                    if len(right_lines) >= body_height - 3:
+                        break
+                    row_txt = '   {:<24} {}'.format(key_combo, desc)
+                    right_lines.append(fit(row_txt, diff_w))
+                right_lines.append(fit('', diff_w))
+            right_lines.append(fit(' ' + '─' * max(10, diff_w - 4), diff_w))
+            right_lines.append(fit(' Press [?] or [q] or [Esc] to return to diff view', diff_w))
+        else:
+            entry = self.current_file_entry
+            if not entry:
+                right_lines.append(fit(' No staged files in session {}.'.format(self.session.id), diff_w))
+            else:
+                focus_marker = '*' if self.focus_pane == 'diff' else ' '
+                summary_str = entry['summary'] or '(no file summary)'
+                sub_hdr = ' {}[{}] {} (+{} -{}) — {}'.format(
+                    focus_marker, entry['status'], entry['path'], entry['added'], entry['removed'], summary_str
+                )
+                right_lines.append(fit(sub_hdr, diff_w))
+
+                if self.diff_mode == 'side-by-side':
+                    half_w = max(10, (diff_w - 3) // 2)
+                    w_marker = '<ACTIVE>' if self.active_side == 'workspace' else ''
+                    s_marker = '<ACTIVE>' if self.active_side == 'staged' else ''
+                    col_hdr = '{} | {}'.format(
+                        fit(' Workspace Original {}'.format(w_marker), half_w),
+                        fit(' Staged Proposal {}'.format(s_marker), diff_w - half_w - 3),
+                    )
+                    right_lines.append(fit(col_hdr, diff_w))
+                else:
+                    right_lines.append(fit(' Unified Diff (Active Side: {})'.format(self.active_side), diff_w))
+
+                viewport_items = []
+                lo_sel, hi_sel = self._selected_row_bounds()
+                cursor_viewport_idx = 0
+
+                for r_idx, row in enumerate(self.rows):
+                    if r_idx == self.cursor_row:
+                        cursor_viewport_idx = len(viewport_items)
+                    is_cursor = (r_idx == self.cursor_row)
+                    is_selected = (self.visual_anchor_row is not None and lo_sel <= r_idx <= hi_sel)
+                    sel_flag = '>' if is_cursor else ('*' if is_selected else ' ')
+
+                    if self.diff_mode == 'side-by-side':
+                        half_w = max(10, (diff_w - 3) // 2)
+                        right_half_w = diff_w - half_w - 3
+                        l_no = '{:4d}'.format(row['left_lineno']) if row['left_lineno'] is not None else '    '
+                        r_no = '{:4d}'.format(row['right_lineno']) if row['right_lineno'] is not None else '    '
+                        l_sign = '-' if row['kind'] in ('delete', 'replace') and row['left_lineno'] is not None else ' '
+                        r_sign = '+' if row['kind'] in ('insert', 'replace') and row['right_lineno'] is not None else ' '
+                        l_txt = row['left_text'] if row['left_text'] is not None else ''
+                        r_txt = row['right_text'] if row['right_text'] is not None else ''
+                        left_cell = fit('{}{} {} {}'.format(sel_flag, l_no, l_sign, l_txt), half_w)
+                        right_cell = fit('{}{} {} {}'.format(sel_flag, r_no, r_sign, r_txt), right_half_w)
+                        line_str = '{} | {}'.format(left_cell, right_cell)
+                    else:
+                        l_no = '{:4d}'.format(row['left_lineno']) if row['left_lineno'] is not None else '    '
+                        r_no = '{:4d}'.format(row['right_lineno']) if row['right_lineno'] is not None else '    '
+                        line_str = '{} {} {} {} {}'.format(sel_flag, l_no, r_no, row['prefix'], row['text'])
+
+                    if is_cursor and self.token_index is not None and 0 <= self.token_index < len(self.token_candidates):
+                        tok_text = self.token_candidates[self.token_index]['text']
+                        line_str = fit(line_str, max(1, diff_w - len(tok_text) - 10)) + ' [tok:{}]'.format(tok_text)
+
+                    viewport_items.append((fit(line_str, diff_w), row['kind'], is_cursor, is_selected, r_idx))
+
+                    for c in self.comments_at_row(r_idx):
+                        badge = 'OPEN' if c['status'] == 'open' else 'RESOLVED'
+                        rng = format_line_range(c['start_line'], c['end_line'])
+                        focus_part = ' (focus: `{}`)'.format(c['snippet_focus']) if c.get('snippet_focus') else ''
+                        comment_line = '   💬 [{} {} {} {}]{}: {}'.format(
+                            c['id'], badge, c['side'], rng, focus_part, c['comment']
+                        )
+                        viewport_items.append((fit(comment_line, diff_w), 'comment', is_cursor, False, r_idx))
+
+                avail_rows = max(1, body_height - len(right_lines))
+                if cursor_viewport_idx < self.scroll_offset:
+                    self.scroll_offset = cursor_viewport_idx
+                elif cursor_viewport_idx >= self.scroll_offset + avail_rows:
+                    self.scroll_offset = cursor_viewport_idx - avail_rows + 1
+                self.scroll_offset = max(0, min(self.scroll_offset, max(0, len(viewport_items) - avail_rows)))
+
+                visible = viewport_items[self.scroll_offset:self.scroll_offset + avail_rows]
+                for text_line, _, _, _, _ in visible:
+                    right_lines.append(fit(text_line, diff_w))
+
+        while len(right_lines) < body_height:
+            right_lines.append(' ' * diff_w)
+
+        for row_i in range(body_height):
+            if sidebar_w:
+                combined = left_lines[row_i] + '│' + right_lines[row_i]
+            else:
+                combined = right_lines[row_i]
+            frame.append(fit(combined, width))
+
+        if self.input_mode:
+            meta = self.pending_comment_meta or {}
+            rng = format_line_range(meta.get('start_line', 1), meta.get('end_line', 1))
+            focus_tag = ' [{}]'.format(meta['snippet_focus']) if meta.get('snippet_focus') else ''
+            prompt_bar = ' Comment ({} {}{}): {}█  [Enter:Save  Esc:Cancel]'.format(
+                meta.get('side', 'staged'), rng, focus_tag, self.input_buffer
+            )
+            frame.append(fit(prompt_bar, width))
+        elif self.show_help:
+            frame.append(fit(' [?] Command Reference: Press [?] or [q] or [Esc] to return to diff view.', width))
+        else:
+            frame.append(fit(' ' + self.status_message, width))
+
+        return frame
+
+
+class TuiApp:
+    """Interactive curses wrapper around `TuiState`."""
+
+    def __init__(self, state):
+        self.state = state
+
+    def run(self):
+        if curses is None:
+            raise StagedError('Python curses module is unavailable on this platform.')
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise StagedError('staged TUI requires an interactive terminal (TTY).')
+        curses.wrapper(self._curses_main)
+        return self.state
+
+    def _init_colors(self):
+        if not curses.has_colors():
+            return
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            pass
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_RED, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_CYAN, -1)
+        curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+
+    def _curses_main(self, stdscr):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.keypad(True)
+        self._init_colors()
+
+        while not self.state.should_quit:
+            height, width = stdscr.getmaxyx()
+            frame = self.state.render_frame(width=width, height=height)
+            stdscr.erase()
+            for idx, line in enumerate(frame):
+                if idx >= height:
+                    break
+                attr = curses.A_NORMAL
+                if idx == 0 or idx == height - 1:
+                    attr = curses.A_REVERSE
+                elif '💬 [' in line:
+                    attr = curses.color_pair(3) | curses.A_BOLD
+                elif line.lstrip().startswith('>'):
+                    attr = curses.A_BOLD | curses.color_pair(4)
+                elif ' + ' in line:
+                    attr = curses.color_pair(1)
+                elif ' - ' in line:
+                    attr = curses.color_pair(2)
+                try:
+                    stdscr.addnstr(idx, 0, line, max(0, width - 1), attr)
+                except curses.error:
+                    pass
+            stdscr.refresh()
+            ch = stdscr.getch()
+            self.state.handle_key(ch)
+
+
+def run_tui(ctx, session, target=None):
+    """Entry point for `staged tui` and `staged diff --tui`."""
+    state = TuiState(session, target_file=target, ctx=ctx)
+    app = TuiApp(state)
+    app.run()
+    if state.comments_added_count > 0:
+        print(
+            'Saved {} feedback comment(s). Tell your agent: "Check staged feedback"'.format(
+                state.comments_added_count
+            )
+        )
+    return state
+
+
+
 def clean_session(ctx, session):
     if getattr(ctx.args, 'clean_session', None) is not None:
         target_session = session
@@ -3373,6 +4956,8 @@ def make_parser():
         'summarize': 'Write concise session and file change summaries (view them with staged --summary).',
         'init': 'Create an isolated session and record its workspace and branch.',
         'diff': 'Review proposed files, apply with -a, clean with -c, or apply then clean with -ac.',
+        'tui': 'Launch the built-in 2-pane interactive terminal diff viewer and inline comment reviewer.',
+        'feedback': 'View, add, resolve, or export inline code-selection review comments for agents.',
         'apply': 'Apply proposed files, renames and deletions to the workspace with conflict protection.',
         'undo': 'Atomically roll back the most recent apply operation in this session.',
         'fmt': 'Format staged files in-place using virtual workspace buffers (zero workspace replication).',
@@ -3449,6 +5034,7 @@ def make_parser():
     p = command_parsers['diff']
     p.add_argument('-a', '--apply', action='store_true', help='apply proposed changes before any requested clean')
     p.add_argument('-c', '--clean', action='store_true', help='clean proposed changes; with --apply, clean only after apply succeeds')
+    p.add_argument('--tui', action='store_true', help='open the built-in 2-pane interactive terminal diff viewer')
     comparison = p.add_mutually_exclusive_group()
     comparison.add_argument('--between', nargs=2, metavar=('SESSION1', 'SESSION2'), help='compare proposed files in two sessions')
     comparison.add_argument('--compare-session', help='compare the active session with another session')
@@ -3456,6 +5042,8 @@ def make_parser():
         command_parsers[name].add_argument('--force', action='store_true', help='allow protected-branch or conflicting workspace apply')
         command_parsers[name].add_argument('--no-merge', action='store_true', help='disable automatic 3-way merge when workspace files have drifted')
         command_parsers[name].add_argument('-y', '--yes', action='store_true', help='confirm branch drift or clean')
+    configure_tui_parser(command_parsers['tui'])
+    configure_feedback_parser(command_parsers['feedback'])
     p = command_parsers['undo']
     p.add_argument('--force', action='store_true', help='undo even if workspace files were modified after apply')
     p.add_argument('-y', '--yes', action='store_true', help='confirm overwriting post-apply workspace edits')
@@ -3486,7 +5074,7 @@ def make_parser():
         command_parsers[name].add_argument(
             '--meta', action='store_true', default=argparse.SUPPRESS,
             help='use a top-level session metadata file (e.g. staged_changes.md) instead of a proposal')
-    for name in ('summarize', 'diff', 'apply', 'clean', 'migrate', 'fmt', 'check'):
+    for name in ('summarize', 'diff', 'apply', 'clean', 'migrate', 'tui', 'feedback', 'fmt', 'check'):
         command_parsers[name].add_argument(
             '--meta', action='store_true', default=argparse.SUPPRESS,
             help='accepted with -f for consistent syntax; this command remains proposal-based')
@@ -4189,6 +5777,10 @@ def main(argv=None):
             print(safe_path(session.staging, rel))
     elif args.command == 'open':
         open_file(ctx, session, args.file)
+    elif args.command == 'tui' or (args.command == 'diff' and getattr(args, 'tui', False)):
+        run_tui(ctx, session, getattr(args, 'file', None))
+    elif args.command == 'feedback':
+        handle_feedback(ctx, session, args)
     elif args.command == 'undo':
         undo_apply(ctx, session)
     elif args.command == 'fmt':
