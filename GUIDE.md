@@ -18,7 +18,10 @@ For a high-level summary, see [README.md](README.md). This guide covers the comp
 - [Preparing Proposals](#preparing-proposals)
 - [Managing Sessions](#managing-sessions)
 - [Reviewing Changes](#reviewing-changes)
-- [Applying Changes & Branch Guards](#applying-changes--branch-guards)
+- [Interactive Terminal Diff TUI](#interactive-terminal-diff-tui)
+- [Managing Feedback & AI Agent Handoff](#managing-feedback--ai-agent-handoff)
+- [Zero-Replication Formatting, Linting & Ephemeral Sandbox](#zero-replication-formatting-linting--ephemeral-sandbox)
+- [Applying Changes, 3-Way Merge & Rollback (Undo)](#applying-changes-3-way-merge--rollback-undo)
 - [Renames, Moves, and Deletions](#renames-moves-and-deletions)
 - [Cross-Session Comparison & Migration](#cross-session-comparison--migration)
 - [Cleaning Up](#cleaning-up)
@@ -444,7 +447,126 @@ _(Deletions have only a workspace path. Inside `path`, `-s` means `--staged`; us
 
 ---
 
-## Applying Changes & Branch Guards
+## Interactive Terminal Diff TUI
+
+Launch the built-in, zero-dependency interactive terminal diff viewer:
+
+```bash
+staged tui                    # Open TUI for all files in active session
+staged tui -f src/example.py  # Open TUI focused on a specific file
+staged diff --tui             # Alias via diff command
+```
+
+### 2-Pane Architecture
+
+- **Left Rail (Files)**: Toggle with `b`. Lists proposed files with status badges, line delta stats (`+X -Y`), and open feedback counts (`💬2`). Press `Tab` to switch focus between the file rail and the diff viewport. Press `j`/`k` to navigate files and `Enter` to open the diff for that file.
+- **Right Viewport (Diff)**:
+  - Defaults to a **Side-by-Side 2-Pane Diff** (`Workspace Original` on the left, `Staged Proposal` on the right) with aligned hunk opcodes and intraline character/word-level highlight spans.
+  - Press `u` to toggle between **Side-by-Side** and **Unified Diff**.
+  - Press `H` to toggle optional syntax highlighting via Pygments (clean standard diff highlighting is used by default).
+
+### Navigation & Inline Commenting Shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `j` / `k` (or Down/Up) | Move cursor down/up line by line |
+| `n` / `p` | Jump to next / previous diff hunk |
+| `[` / `]` | Switch active side (`workspace` vs `staged`) or cycle sub-line tokens |
+| `v` (or Space) | Toggle **Visual Multi-line Selection** mode |
+| `w` | Select individual sub-line token / expression (`snippet_focus`) on the line |
+| `c` (or Enter) | Open inline comment input box anchored to selection; saves to `feedback.json` |
+| `r` | Toggle `[OPEN]` / `[RESOLVED]` status on the comment at the cursor |
+| `x` | Delete the comment at the cursor |
+| `a` | **Selectively apply the current hunk** directly to the workspace |
+| `A` | Apply the entire current file to the workspace |
+| `y` | Format and copy all open feedback to clipboard as an agent prompt |
+| `H` | Toggle optional syntax highlighting (uses Pygments if installed) |
+| `?` or `h` | **Open built-in command reference & help screen** |
+| `q` | Quit TUI (or close help screen) |
+
+---
+
+## Managing Feedback & AI Agent Handoff
+
+Review comments created via `staged tui` or the CLI are persisted in `<session>/feedback.json` (a managed session metadata file).
+
+### Inspecting & Exporting Feedback
+
+```bash
+staged feedback                           # List comments grouped by file with line ranges & quotes
+staged feedback -f src/example.py         # Filter comments for one file
+staged feedback --json                    # Machine-readable JSON
+staged feedback --prompt                  # Format as copy-pasteable Markdown prompt for AI agents
+staged feedback --copy                    # Copy prompt directly to system clipboard
+```
+
+### Adding & Managing Comments from CLI
+
+```bash
+# Add a comment anchored to lines 10-14 and specific expression
+staged feedback --add -f src/app.py --start-line 10 --end-line 14 --select 'return 42' -m 'Avoid magic number 42'
+
+# Resolve comments
+staged feedback --resolve fb-1            # Mark comment fb-1 resolved
+staged feedback --resolve-all             # Mark all comments resolved
+
+# Delete comments
+staged feedback --delete fb-1             # Remove comment fb-1
+staged feedback --clear                   # Delete all comments
+```
+
+---
+
+## Zero-Replication Formatting, Linting & Ephemeral Sandbox
+
+Verify code quality, syntax, and builds in staging without copying or mutating the working tree.
+
+### 1. In-Place Formatting (`staged fmt`)
+
+Formats staged files using the project's exact workspace configuration (`.prettierrc`, `biome.json`, `pyproject.toml`, `.clang-format`, `rustfmt.toml`) via the virtual stdin trick (`--stdin-filepath <workspace_file>`):
+
+```bash
+staged fmt -f src/index.ts                # Format a single staged file in-place
+staged fmt --all                          # Format all staged files in-place
+staged fmt --all --check                  # Dry-run check: exit 0 if formatted, exit 1 if changes needed
+staged fmt --cmd 'ruff format --stdin-filename {workspace_file} -' # Custom formatter template
+```
+
+### 2. Linting & Typechecking (`staged check`)
+
+Runs syntax, type, and import checks using virtual workspace overlays:
+
+```bash
+staged check -f src/app.py                # Python AST syntax check + workspace import validation
+staged check --all                        # Check all staged files
+staged check --sandbox                    # Force check to run in Tier 3 overlay sandbox
+```
+
+- **Python**: Zero-dependency `ast.parse` validates syntax immediately; imports are checked against workspace files and staged deletions; when `ruff`/`flake8`/`mypy` are available, `PYTHONPATH` and `MYPYPATH` overlays allow staged modules to override workspace modules.
+- **TypeScript**: Generates `.review/tsconfig.staged.json` extending workspace `tsconfig.json` with `compilerOptions.rootDirs: [staging, workspace]`, resolving cross-file imports without copying. Diagnostics paths are rewritten to clean relative paths.
+- **C/C++**: Virtual include flags (`-I<staging> -I<workspace>`) ensure staged headers shadow workspace headers cleanly.
+- **Java**: `-sourcepath <staging>:<workspace>` allows staged and workspace classes to compile together seamlessly.
+
+### 3. Ephemeral CoW / Hardlink Sandbox (`staged exec`)
+
+Runs arbitrary build commands, compilers, or test suites inside `<session>/.sandbox/`:
+
+```bash
+staged exec -- npm test                   # Run full test suite against proposed code
+staged exec -- cargo check                # Check Rust project
+staged exec -- make test                  # Run Makefile test targets
+staged exec -- pytest tests/              # Run Python test suite
+staged exec --sync -- npm run lint:fix    # Sync modified files back into staging/
+staged exec --keep-sandbox -- make build  # Retain .sandbox/ directory for debugging
+```
+
+- **Millisecond Materialization**: Heavy directories (`node_modules`, `.venv`, `target`, `.build`, `.gradle`) are directory-symlinked; unchanged workspace files are hardlinked; staged files are copied; deletions are omitted.
+- **Transparent Output**: Sandbox directory paths in stdout/stderr are rewritten back to clean relative paths so build diagnostics match your workspace.
+- **Automatic Teardown**: The sandbox is completely cleaned up after command execution unless `--keep-sandbox` is passed.
+
+---
+
+## Applying Changes, 3-Way Merge & Rollback (Undo)
 
 ### Applying Proposals
 
@@ -461,16 +583,28 @@ staged diff --all -a              # Apply all changes
 staged diff -f src/example.py -ac  # Apply file, then clean its staged copy
 ```
 
-Combining `-ac` applies first; if apply fails, staged files are preserved.
+---
+
+### Conflict Safety & Automatic 3-Way Merge
+
+- **Base Snapshots**: The first time an existing workspace file is touched by a staging command (`write`, `create`, `copy`, `rename`, `delete --workspace`), `staged` records a base snapshot in `<session>/.base/` and `<session>/.base.json`.
+- **Automatic 3-Way Merge**: If you edit a workspace file concurrently after staging begins, `staged apply` detects the drift. If the changes do not overlap with the staged proposal, it automatically performs a clean 3-way merge (`[MERGED]`) using `git merge-file -p` (or pure-Python `difflib.SequenceMatcher` fallback).
+- **Conflict Preflight Guard**: If changes overlap and conflict, `staged apply` halts during preflight before mutating any workspace files, warning you of the conflict. Pass `--force` to overwrite or `--no-merge` to disable automatic merging.
 
 ---
 
-### Operational Guarantees & Trade-offs
+### Instant Rollback (`staged undo`)
 
-- **Atomic File Replacement**: Files are replaced atomically, preserving file permissions.
-- **No 3-Way Merge**: Applying overwrites workspace files with staged contents. It does not merge concurrent workspace edits.
-- **No Git Commits**: Changes remain uncommitted in your working tree for your final review.
-- **Partial Batches**: Batch apply is not an ACID transaction. If an error occurs on file 8 of 10, files 1–7 remain applied. Always inspect `staged` after a failure.
+Before any file in the workspace is modified, `staged apply` records an atomic snapshot in `<session>/.backups/`:
+
+```bash
+staged undo                               # Atomically roll back the most recent apply
+staged undo --force                       # Roll back even if workspace files were edited after apply
+staged undo --json                        # Output machine-readable JSON result
+```
+
+- Restores modified, merged, and deleted files to their exact pre-apply state and unlinks files that were newly created by the apply.
+- If files were modified in the workspace *after* the apply, `staged undo` guards against accidental data loss and prompts for confirmation unless `--force` or `-y` is passed.
 
 ---
 
