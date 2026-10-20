@@ -389,6 +389,45 @@ class CLI(unittest.TestCase):
         self.assertEqual(set(self.run_cli('--complete-sessions').stdout.splitlines()), {'legacy', 'empty'})
         self.assertFalse((self.root / 'empty/summaries.json').exists())
 
+    def test_missing_workspace_stays_listed_and_cleanable(self):
+        gone = self.base / 'gone-workspace'
+        gone.mkdir()
+        self.run_cli('init', 'orphan', cwd=gone)
+        self.run_cli('create', '-f', 'note.txt', '--text', 'keep me\n', cwd=gone)
+        bound = dict(self.env, STAGED_SHELL_ID='orphan-shell')
+        self.run_cli('use', '--session', 'orphan', cwd=gone, env=bound)
+        other = self.base / 'other-workspace'
+        other.mkdir()
+        self.run_cli('init', 'foreign', cwd=other)
+        self.init('kept')
+        shutil.rmtree(gone)
+
+        listed = self.run_cli('-R')
+        self.assertIn('kept', listed.stdout)
+        self.assertIn('orphan', listed.stdout)
+        self.assertIn('foreign', listed.stdout)
+        self.assertIn(str(gone.resolve()) + ' (workspace not found)', listed.stdout)
+        self.assertNotIn('workspace not found', listed.stdout.replace(str(gone.resolve()) + ' (workspace not found)', ''))
+        current = self.run_cli('--sessions')
+        self.assertIn('kept', current.stdout)
+        self.assertNotIn('orphan', current.stdout)
+        self.assertNotIn('foreign', current.stdout)
+        self.assertEqual(self.run_cli().returncode, 0)
+        self.assertNotIn('orphan', self.run_cli('--complete-sessions').stdout)
+
+        blocked = self.run_cli(env=bound, ok=False)
+        self.assertIn('Session workspace does not exist: ' + str(gone.resolve()), blocked.stderr)
+        self.assertIn('orphan', self.run_cli('-R', env=bound).stdout)
+        refused = self.run_cli('clean', '--session', 'foreign', '-y', ok=False)
+        self.assertIn('Unknown session', refused.stderr)
+        self.assertTrue((self.root / 'foreign').is_dir())
+
+        removed = self.run_cli('clean', '--session', 'orphan', '-y')
+        self.assertIn('Cleaned session orphan.', removed.stdout)
+        self.assertFalse((self.root / 'orphan').exists())
+        self.assertTrue((self.root / 'kept').is_dir())
+        self.assertNotIn('orphan', self.run_cli('-R').stdout)
+
     def test_verbose_diff_overview_and_selected_review(self):
         self.propose()
         self.propose(rel='other.txt')

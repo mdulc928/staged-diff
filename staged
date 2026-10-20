@@ -260,15 +260,30 @@ class Context:
             for directory in sorted(root.iterdir()):
                 if directory.is_symlink() or not directory.is_dir() or not (directory / '.workspace').is_file():
                     continue
-                session = Session(directory)
+                # A deleted workspace must not hide every other session.
+                session = Session(directory, require_workspace=False)
                 if all_repos or session.workspace == self.workspace:
                     result.append(session)
         return sorted(result, key=lambda s: s.modified(), reverse=True)
 
-    def find_session(self, key, all_repos=False):
-        sessions = self.sessions(all_repos)
-        exact = [s for s in sessions if s.id == key]
-        matches = exact or [s for s in sessions if s.id.startswith(key)]
+    def find_session(self, key, all_repos=False, require_workspace=True):
+        try:
+            session = self.match_session(self.sessions(all_repos), key)
+        except StagedError as exc:
+            # An explicit id for a removed workspace is not visible in the current repository.
+            if all_repos or not str(exc).startswith('Unknown session'):
+                raise
+            session = self.match_session(self.sessions(True), key)
+            if session.workspace.is_dir():
+                raise exc
+        if require_workspace:
+            session.ensure_workspace()
+        return session
+
+    @staticmethod
+    def match_session(sessions, key):
+        exact = [session for session in sessions if session.id == key]
+        matches = exact or [session for session in sessions if session.id.startswith(key)]
         if len(matches) != 1:
             raise StagedError(('Ambiguous' if matches else 'Unknown') + ' session: ' + key)
         return matches[0]
@@ -301,7 +316,7 @@ class Context:
 
 
 class Session:
-    def __init__(self, directory):
+    def __init__(self, directory, require_workspace=True):
         self.directory = Path(directory).resolve()
         self.id = self.directory.name
         self.staging = self.directory / 'staging'
@@ -311,8 +326,8 @@ class Session:
         if not marker or not Path(marker).expanduser().is_absolute():
             raise StagedError('.workspace must contain an absolute workspace path: ' + str(self.directory))
         self.workspace = Path(marker).expanduser().resolve()
-        if not self.workspace.is_dir():
-            raise StagedError('Session workspace does not exist: {}'.format(self.workspace))
+        if require_workspace:
+            self.ensure_workspace()
         self.metadata = load_json(self.directory / 'session.json')
         if self.metadata.get('branch') is not None and not isinstance(self.metadata['branch'], str):
             raise StagedError('Session branch must be a string or null.')
@@ -332,6 +347,10 @@ class Session:
                 safe_path(self.workspace, source)
         for rel in self.deletions:
             safe_path(self.workspace, rel)
+
+    def ensure_workspace(self):
+        if not self.workspace.is_dir():
+            raise StagedError('Session workspace does not exist: {}'.format(self.workspace))
 
     def summaries(self):
         data = load_json(safe_path(self.directory, 'summaries.json'))
@@ -5636,9 +5655,12 @@ def main(argv=None):
         id_width = max((len(session.id) for session, _ in rows), default=0)
         count_width = max((len(count) for _, count in rows), default=0)
         for session, count in rows:
+            workspace = str(session.workspace)
+            if not session.workspace.is_dir():
+                workspace += ' (workspace not found)'
             print('{}\t{}\t{}\n\t{}'.format(
                 color(session.id.ljust(id_width), '36'), color(count.ljust(count_width), '33'),
-                color(session.workspace, '1'), color(session.staging, '2')))
+                color(workspace, '1'), color(session.staging, '2')))
             print('\t{}'.format(color('Summary', '1')))
             show_summary_text(session.summaries()['session'], indent='\t')
         return
@@ -5760,7 +5782,7 @@ def main(argv=None):
         cross_diff(ctx)
         return
     if args.command == 'clean' and isinstance(args.clean_session, str):
-        session = ctx.find_session(args.clean_session)
+        session = ctx.find_session(args.clean_session, require_workspace=False)
     else:
         session = ctx.active()
     if args.command == 'path' and args.meta:
