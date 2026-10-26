@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -1957,6 +1958,78 @@ source "$1"
         self.assertIn('EXEC_PASS', exec_res['stdout'])
         self.assertFalse((self.repo / 'calc_mod.py').exists())
 
+    def test_cli_sandbox_auto_link_write_and_remove(self):
+        self.init('session-a')
+        (self.repo / 'node_modules/react').mkdir(parents=True)
+        (self.repo / 'apps/web/node_modules/vite').mkdir(parents=True)
+        (self.repo / 'apps/web/tsconfig.json').write_text('{}\n')
+        self.file_api('create', '-f', 'apps/web/src/App.tsx', '--text', 'export {};\n')
+        staging = self.root / 'session-a/staging'
+
+        auto = json.loads(self.run_cli('sandbox', '--auto', '--json').stdout)
+        self.assertEqual(sorted(auto['changed']), ['apps/web/node_modules', 'apps/web/tsconfig.json', 'node_modules'])
+        self.assertTrue((staging / 'apps/web/node_modules/vite').is_dir())
+
+        self.run_cli('create', '--sandbox', '-f', 'apps/web/vite.config.ts', '--text', 'export default {};\n')
+        self.run_cli('create', '--sandbox', '-f', 'apps/web/vite.config.ts', ok=False)
+        read = json.loads(self.run_cli('read', '--sandbox', '-f', 'apps/web/vite.config.ts', '--json').stdout)
+        self.assertEqual(read['source'], 'sandbox')
+        self.run_cli('write', '--sandbox', '-f', 'apps/web/vite.config.ts', '--start-line', '1', '--end-line', '1',
+                     '--text', 'export default { alias: true };\n', '--expect-sha256', read['sha256'])
+        self.assertIn('alias', (staging / 'apps/web/vite.config.ts').read_text())
+        self.run_cli('write', '--sandbox', '-f', 'apps/web/tsconfig.json', '--from-workspace', '--text', '', ok=False)
+        (self.repo / 'apps/web/vitest.config.ts').write_text('export default {};\n')
+        self.run_cli('write', '--sandbox', '-f', 'apps/web/vitest.config.ts', '--from-workspace', '--append', '--text', '// test\n')
+        self.assertEqual((staging / 'apps/web/vitest.config.ts').read_text(), 'export default {};\n// test\n')
+        self.assertEqual((self.repo / 'apps/web/vitest.config.ts').read_text(), 'export default {};\n')
+        self.run_cli('link', '--sandbox', '-f', 'shared', '--target', str(self.repo / 'node_modules'))
+        self.run_cli('link', '-f', 'other', ok=False)
+        self.assertEqual(self.run_cli('path', '--sandbox', '-f', 'shared').stdout.strip(), str(staging / 'shared'))
+
+        self.assertEqual(self.run_cli('--list').stdout.split(), ['apps/web/src/App.tsx'])
+        self.run_cli('write', '-f', 'apps/web/tsconfig.json', '--text', 'x', ok=False)
+        self.run_cli('create', '-f', 'node_modules/react/index.js', ok=False)
+        self.run_cli('write', '--sandbox', '-f', 'apps/web/src/App.tsx', '--text', 'x', ok=False)
+        self.run_cli('write', '--sandbox', '-f', 'node_modules/react/index.js', '--text', 'x', ok=False)
+        self.run_cli('link', '--sandbox', '-f', 'apps/web/src/App.tsx', ok=False)
+        self.run_cli('read', '--sandbox', '--meta', '-f', 'shared', ok=False)
+
+        self.run_cli('delete', '--sandbox', '-f', 'shared')
+        self.assertFalse(os.path.lexists(str(staging / 'shared')))
+        listed = json.loads(self.run_cli('sandbox', '--json').stdout)
+        self.assertEqual(len(listed['entries']), 5)
+        removed = json.loads(self.run_cli('sandbox', '--clear', '--json').stdout)
+        self.assertEqual(len(removed['removed']), 5)
+        self.assertEqual(sorted(p.relative_to(staging).as_posix() for p in staging.rglob('*') if p.is_file()),
+                         ['apps/web/src/App.tsx'])
+        self.assertTrue((self.repo / 'apps/web/node_modules/vite').is_dir())
+        self.assertTrue((self.repo / 'node_modules/react').is_dir())
+
+    def test_cli_exec_staging_with_cloned_entries(self):
+        self.init('session-a')
+        (self.repo / 'node_modules/pkg').mkdir(parents=True)
+        (self.repo / 'node_modules/pkg/index.js').write_text('ORIG\n')
+        (self.repo / '.lintrc').write_text('{}\n')
+        self.file_api('create', '-f', 'apps/web/a.ts', '--text', 'export {};\n')
+        staging = self.root / 'session-a/staging'
+
+        self.run_cli('sandbox', '--clone', ok=False)
+        self.assertEqual(json.loads(self.run_cli('sandbox', '--auto', '--clone', '--json').stdout)['changed'], ['node_modules'])
+        copied = json.loads(self.run_cli('copy', '--sandbox', '-f', '.lintrc', '--to', 'apps/web/.lintrc', '--json').stdout)
+        self.assertEqual((copied['path'], copied['kind']), ('apps/web/.lintrc', 'copy'))
+        self.run_cli('copy', '--sandbox', '--workspace', '-f', '.lintrc', ok=False)
+        self.run_cli('exec', '--staging', '--keep-sandbox', '--', sys.executable, '-c', 'pass', ok=False)
+
+        script = ("import os; assert os.path.isfile('.lintrc'); open('../../node_modules/pkg/index.js', 'a').write('X'); "
+                  "open('out.js', 'w').write('1'); open('a.ts', 'w').write('edited')")
+        result = json.loads(self.run_cli('exec', '--staging', '--cwd', 'apps/web', '--json', '--',
+                                         sys.executable, '-c', script).stdout)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual((result['reverted'], result['discarded']), (['apps/web/a.ts'], ['apps/web/out.js']))
+        self.assertEqual((self.repo / 'node_modules/pkg/index.js').read_text(), 'ORIG\n')
+        self.assertEqual((staging / 'apps/web/a.ts').read_text(), 'export {};\n')
+        self.assertEqual(self.run_cli('--list').stdout.split(), ['apps/web/a.ts'])
+
 
 class Unit(unittest.TestCase):
     def test_cli_test_launcher_uses_an_empty_registry(self):
@@ -3534,7 +3607,7 @@ class TestTier3OverlaySandboxExec(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_sandbox_hardlinks_symlinks_deletions_renames_and_cleanup(self):
+    def test_sandbox_copies_symlinks_deletions_renames_and_cleanup(self):
         nm_pkg = self.workspace / 'node_modules' / 'my-pkg' / 'index.js'
         staged.write_text_file(nm_pkg, 'module.exports = 123;\n')
 
@@ -3561,18 +3634,21 @@ class TestTier3OverlaySandboxExec(unittest.TestCase):
             'from lib.new_name import FACTOR\n'
             'assert not pathlib.Path("lib/obsolete.py").exists(), "deleted file should not exist in sandbox"\n'
             'assert not pathlib.Path("lib/old_name.py").exists(), "renamed source should not exist in sandbox"\n'
-            'assert pathlib.Path("node_modules").is_symlink(), "node_modules should be symlinked"\n'
+            'assert not pathlib.Path("node_modules").is_symlink(), "node_modules should be cloned"\n'
             'assert add(3, 4) * FACTOR == 70\n'
             'print("SANDBOX_CHECK_OK:", os.path.abspath("test_calc.py"))\n',
         )
 
         sb_dir = staged.materialize_sandbox(self.session)
-        self.assertTrue((sb_dir / 'node_modules').is_symlink())
-        self.assertEqual(
+        self.assertFalse((sb_dir / 'node_modules').is_symlink())
+        self.assertNotEqual(os.stat(nm_pkg).st_ino, os.stat(sb_dir / 'node_modules/my-pkg/index.js').st_ino)
+        self.assertNotEqual(
             os.stat(ws_math).st_ino,
             os.stat(sb_dir / 'lib/math_utils.py').st_ino,
-            'Unchanged workspace file must be hardlinked into sandbox',
+            'Unchanged workspace file must not share an inode with the sandbox',
         )
+        self.assertEqual((sb_dir / 'lib/math_utils.py').read_bytes(), ws_math.read_bytes())
+        self.assertEqual(os.stat(ws_math).st_mtime_ns, os.stat(sb_dir / 'lib/math_utils.py').st_mtime_ns)
         self.assertNotEqual(
             os.stat(st_new).st_ino,
             os.stat(sb_dir / 'lib/new_name.py').st_ino,
@@ -3589,6 +3665,82 @@ class TestTier3OverlaySandboxExec(unittest.TestCase):
         self.assertNotIn(str(sb_dir), res['stdout'])
         self.assertFalse(sb_dir.exists())
         self.assertTrue(nm_pkg.is_file())
+
+    def test_in_place_sandbox_writes_never_reach_the_workspace(self):
+        ws_file = self.workspace / 'lib/util.txt'
+        staged.write_text_file(ws_file, 'ORIGINAL\n')
+        os.symlink(str(ws_file), str(self.workspace / 'abs_link.txt'))
+        cmd = [
+            sys.executable, '-c',
+            'for p in ("lib/util.txt", "abs_link.txt"):\n'
+            '    with open(p, "a") as f: f.write("SANDBOX\\n")\n',
+        ]
+        ctx = DummyContext(self.workspace, self.staging_root, json=True)
+        with redirect_stdout(io.StringIO()):
+            res = staged.exec_in_sandbox(ctx, self.session, cmd, as_json=True)
+        self.assertTrue(res['ok'], res)
+        self.assertEqual(ws_file.read_text(encoding='utf-8'), 'ORIGINAL\n')
+
+    def test_writes_into_dependency_and_build_dirs_stay_in_the_sandbox(self):
+        package = self.workspace / 'node_modules/pkg/index.js'
+        staged.write_text_file(package, 'ORIGINAL\n')
+        staged.write_text_file(self.workspace / 'dist/out.js', 'ORIGINAL\n')
+        (self.workspace / 'apps/web/node_modules').mkdir(parents=True)
+        os.symlink('../../../node_modules/pkg', str(self.workspace / 'apps/web/node_modules/pkg'))
+        cmd = [
+            sys.executable, '-c',
+            'for p in ("node_modules/pkg/index.js", "dist/out.js", "apps/web/node_modules/pkg/index.js"):\n'
+            '    with open(p, "a") as f: f.write("SANDBOX\\n")\n'
+            'print(open("node_modules/pkg/index.js").read().count("SANDBOX"))\n',
+        ]
+        ctx = DummyContext(self.workspace, self.staging_root, json=True)
+        with redirect_stdout(io.StringIO()):
+            res = staged.exec_in_sandbox(ctx, self.session, cmd, as_json=True)
+        self.assertTrue(res['ok'], res)
+        self.assertEqual(res['stdout'].strip(), '2', 'relative links must resolve inside the sandbox clone')
+        self.assertEqual(package.read_text(encoding='utf-8'), 'ORIGINAL\n')
+        self.assertEqual((self.workspace / 'dist/out.js').read_text(encoding='utf-8'), 'ORIGINAL\n')
+        self.assertFalse((self.session.directory / '.sandbox').exists())
+
+    def test_clone_tree_falls_back_to_per_file_copies(self):
+        staged.write_text_file(self.workspace / 'tree/a/b.txt', 'data\n')
+        os.symlink('a/b.txt', str(self.workspace / 'tree/link'))
+        target = self.tmp / 'clone'
+        with patch.object(staged.sys, 'platform', 'unsupported'):
+            staged.clone_tree(self.workspace / 'tree', target)
+        self.assertEqual((target / 'a/b.txt').read_text(encoding='utf-8'), 'data\n')
+        self.assertEqual(os.readlink(str(target / 'link')), 'a/b.txt')
+        self.assertNotEqual(os.stat(self.workspace / 'tree/a/b.txt').st_ino, os.stat(target / 'a/b.txt').st_ino)
+
+    def test_discard_moves_the_sandbox_aside_immediately(self):
+        sandbox = self.session.directory / '.sandbox'
+        staged.write_text_file(sandbox / 'big/file.txt', 'x\n')
+        with patch.object(staged, 'delete_detached') as delete:
+            staged.discard_sandbox(sandbox)
+        self.assertFalse(sandbox.exists())
+        trash = delete.call_args[0][0]
+        self.assertTrue(trash.name.startswith('.sandbox-trash-'))
+
+        # Trash with a live deleter is left alone; trash whose deleter died is retried once.
+        with patch.object(staged, 'delete_detached') as delete:
+            staged.discard_sandbox(sandbox)
+            delete.assert_not_called()
+            old = time.time() - staged.SANDBOX_TRASH_STALE_SECONDS - 60
+            os.utime(str(trash), (old, old))
+            staged.discard_sandbox(sandbox)
+            staged.discard_sandbox(sandbox)
+        self.assertEqual([call[0][0] for call in delete.call_args_list], [trash])
+        staged.rmtree_ignoring_races(trash)
+        self.assertFalse(trash.exists())
+
+    def test_clone_file_falls_back_to_a_plain_copy(self):
+        source = self.workspace / 'a.txt'
+        staged.write_text_file(source, 'data\n')
+        target = self.tmp / 'b.txt'
+        with patch.object(staged.sys, 'platform', 'unsupported'):
+            staged.clone_file(source, target)
+        self.assertEqual(target.read_text(encoding='utf-8'), 'data\n')
+        self.assertNotEqual(os.stat(source).st_ino, os.stat(target).st_ino)
 
     def test_sandbox_sync_back_updates_modified_staged_files(self):
         st_file = self.session.staging / 'codegen.py'
@@ -3607,6 +3759,145 @@ class TestTier3OverlaySandboxExec(unittest.TestCase):
         self.assertEqual(res['synced'], ['codegen.py'])
         self.assertEqual(st_file.read_text(encoding='utf-8'), 'VERSION = 2\n')
 
+
+class TestSandboxEntries(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='staged-test-sandbox-entries-')).resolve()
+        self.workspace = self.tmp / 'workspace'
+        self.staging_root = self.tmp / 'staging_root'
+        self.workspace.mkdir(parents=True)
+        self.staging_root.mkdir(parents=True)
+        self.session = create_test_session(self.workspace, self.staging_root)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_auto_mirrors_node_modules_and_nearest_config_outside_the_diff(self):
+        types = self.workspace / 'node_modules/@types/react/index.d.ts'
+        staged.write_text_file(types, 'export {};\n')
+        staged.write_text_file(self.workspace / 'apps/web/node_modules/vite/index.js', '\n')
+        staged.write_text_file(self.workspace / 'apps/web/tsconfig.json', '{"compilerOptions": {"jsx": "react-jsx"}}\n')
+        staged.write_text_file(self.workspace / 'tsconfig.json', '{}\n')
+        staged.write_text_file(self.session.staging / 'apps/web/src/App.tsx', 'export const App = () => <div />;\n')
+
+        self.assertEqual(sorted(staged.auto_sandbox(self.session)),
+                         ['apps/web/node_modules', 'apps/web/tsconfig.json', 'node_modules'])
+        self.assertTrue((self.session.staging / 'node_modules/@types/react/index.d.ts').is_file())
+        config = json.loads((self.session.staging / 'apps/web/tsconfig.json').read_text(encoding='utf-8'))
+        self.assertEqual(config['extends'], str(self.workspace / 'apps/web/tsconfig.json'))
+        self.assertEqual(config['compilerOptions']['rootDirs'], ['../..', str(self.workspace)])
+        self.assertFalse((self.session.staging / 'tsconfig.json').exists(), 'only the nearest config is wrapped')
+
+        self.assertEqual(self.session.paths(fresh=True), ['apps/web/src/App.tsx'])
+        self.session.refresh_index()
+        self.assertEqual(list(self.session.files()), ['apps/web/src/App.tsx'])
+        overlay = json.loads(staged.generate_tsconfig_overlay(self.session).read_text(encoding='utf-8'))
+        self.assertIn((self.session.staging / 'apps/web/tsconfig.json').as_posix(), overlay['exclude'])
+        self.assertEqual(staged.auto_sandbox(self.session), [])
+
+    def test_staged_config_is_used_as_is(self):
+        staged.write_text_file(self.workspace / 'tsconfig.json', '{}\n')
+        staged.write_text_file(self.session.staging / 'tsconfig.json', '{"proposal": true}\n')
+        staged.write_text_file(self.session.staging / 'src/a.ts', 'export {};\n')
+        self.assertEqual(staged.auto_sandbox(self.session), [])
+        self.assertEqual(self.session.paths(fresh=True), ['src/a.ts', 'tsconfig.json'])
+
+    def test_entries_and_proposals_never_overwrite_each_other(self):
+        staged.write_text_file(self.workspace / 'lib/node_modules/pkg/index.js', '\n')
+        staged.write_text_file(self.session.staging / 'lib/a.ts', 'export {};\n')
+        with self.assertRaises(staged.StagedError):
+            staged.add_sandbox_link(self.session, 'lib/a.ts', 'lib/node_modules')
+        with self.assertRaises(staged.StagedError):
+            staged.write_sandbox_file(self.session, 'lib/a.ts', b'x')
+        with self.assertRaises(staged.StagedError):
+            staged.add_sandbox_link(self.session, 'missing', 'does/not/exist')
+
+        staged.add_sandbox_link(self.session, 'lib/node_modules')
+        staged.write_sandbox_file(self.session, 'lib/deep/vite.config.ts', b'export default {};\n')
+        staged.write_sandbox_file(self.session, 'lib/deep/vite.config.ts', b'export default { v: 2 };\n')
+        for rel in ('lib/node_modules/pkg/index.js', 'lib/deep/vite.config.ts'):
+            with self.assertRaises(staged.StagedError):
+                staged.range_path(self.session, rel, writable=True)
+        with self.assertRaises(staged.StagedError):
+            staged.write_sandbox_file(self.session, 'lib/node_modules', b'x')
+        with self.assertRaises(staged.StagedError):
+            staged.remove_sandbox_entries(self.session, ['lib/a.ts'])
+
+        self.assertEqual(staged.remove_sandbox_entries(self.session),
+                         ['lib/deep/vite.config.ts', 'lib/node_modules'])
+        self.assertFalse((self.session.staging / 'lib/deep').exists())
+        self.assertTrue((self.session.staging / 'lib/a.ts').is_file())
+        self.assertTrue((self.workspace / 'lib/node_modules/pkg/index.js').is_file())
+        self.assertFalse((self.session.directory / staged.SANDBOX_RECORD).exists())
+
+    def test_rejects_record_entries_that_escape_staging(self):
+        staged.save_json(self.session.directory / staged.SANDBOX_RECORD, {'entries': {'../x': {'kind': 'file'}}})
+        with self.assertRaises(staged.StagedError):
+            self.session.files(fresh=True)
+
+    def test_run_in_staging_discards_new_files_and_reverts_unless_synced(self):
+        staged.write_text_file(self.workspace / 'node_modules/pkg/index.js', 'ORIG\n')
+        staged.write_text_file(self.session.staging / 'apps/web/a.ts', 'export const a = 2;\n')
+        staged.add_sandbox_copy(self.session, 'node_modules')
+        staged.write_sandbox_file(self.session, 'apps/web/vite.config.ts', b'export default {};\n')
+        script = ("import os; open('../../node_modules/pkg/index.js', 'a').write('X'); open('out.js', 'w').write('1'); "
+                  "os.makedirs('dist/x'); open('dist/x/y.js', 'w').write('1'); open('a.ts', 'w').write('edited'); "
+                  "open('vite.config.ts', 'a').write('// tool')")
+
+        rc, _, err, changes = staged.run_in_staging(self.session, [sys.executable, '-c', script], 'apps/web')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(changes, {'synced': [], 'reverted': ['apps/web/a.ts'],
+                                   'discarded': ['apps/web/dist/x/y.js', 'apps/web/out.js']})
+        self.assertEqual((self.session.staging / 'apps/web/a.ts').read_text(), 'export const a = 2;\n')
+        self.assertFalse((self.session.staging / 'apps/web/dist').exists())
+        self.assertEqual((self.workspace / 'node_modules/pkg/index.js').read_text(), 'ORIG\n')
+        self.assertEqual((self.session.staging / 'node_modules/pkg/index.js').read_text(), 'ORIG\nX')
+        self.assertTrue((self.session.staging / 'apps/web/vite.config.ts').read_text().endswith('// tool'))
+
+        rc, _, err, changes = staged.run_in_staging(
+            self.session, [sys.executable, '-c', "open('apps/web/a.ts', 'w').write('kept')"], sync_back=True)
+        self.assertEqual((rc, changes['synced']), (0, ['apps/web/a.ts']), err)
+        self.assertEqual((self.session.staging / 'apps/web/a.ts').read_text(), 'kept')
+        self.assertEqual(sorted(self.session.files(fresh=True)), ['apps/web/a.ts'])
+
+    def test_copy_entries_are_isolated_clones_with_anchored_workspace_links(self):
+        if not hasattr(os, 'symlink'):
+            self.skipTest('symlinks unavailable')
+        staged.write_text_file(self.workspace / 'packages/shared/index.ts', 'export {};\n')
+        staged.write_text_file(self.workspace / 'node_modules/.pnpm/dep@1/node_modules/dep/index.js', 'ORIG\n')
+        os.symlink('.pnpm/dep@1/node_modules/dep', str(self.workspace / 'node_modules/dep'))
+        (self.workspace / 'node_modules/@vs').mkdir()
+        os.symlink('../../packages/shared', str(self.workspace / 'node_modules/@vs/shared'))
+        staged.write_text_file(self.session.staging / 'src/a.ts', 'export {};\n')
+
+        self.assertEqual(sorted(staged.auto_sandbox(self.session, clone=True)), ['node_modules'])
+        clone = self.session.staging / 'node_modules'
+        self.assertFalse(clone.is_symlink())
+        self.assertEqual(self.session.sandbox_entries()['node_modules']['kind'], 'copy')
+        self.assertEqual(os.readlink(str(clone / 'dep')), '.pnpm/dep@1/node_modules/dep')
+        self.assertEqual(os.readlink(str(clone / '@vs/shared')), str(self.workspace / 'packages/shared'))
+        self.assertTrue((clone / '@vs/shared/index.ts').is_file())
+
+        staged.write_text_file(clone / 'dep/index.js', 'EDITED\n')
+        self.assertEqual((self.workspace / 'node_modules/dep/index.js').read_text(), 'ORIG\n')
+        staged.range_path(self.session, 'node_modules/.pnpm/dep@1/node_modules/dep/index.js', writable=True, sandbox=True)
+        staged.add_sandbox_copy(self.session, 'apps/web/.oxlintrc.json', str(self.workspace / 'node_modules/dep/index.js'))
+        self.assertEqual((self.session.staging / 'apps/web/.oxlintrc.json').read_text(), 'ORIG\n')
+        with self.assertRaises(staged.StagedError):
+            staged.add_sandbox_copy(self.session, 'missing', 'does/not/exist')
+
+        self.assertEqual(staged.remove_sandbox_entries(self.session), ['apps/web/.oxlintrc.json', 'node_modules'])
+        self.assertFalse(clone.exists())
+        self.assertEqual(sorted(self.session.files(fresh=True)), ['src/a.ts'])
+        self.assertTrue((self.workspace / 'node_modules/@vs/shared/index.ts').is_file())
+        self.assertEqual((self.workspace / 'node_modules/dep/index.js').read_text(), 'ORIG\n')
+
+    def test_clean_session_removes_link_without_following_it(self):
+        package = self.workspace / 'node_modules/pkg/index.js'
+        staged.write_text_file(package, 'module.exports = 1;\n')
+        staged.add_sandbox_link(self.session, 'node_modules')
+        shutil.rmtree(self.session.directory)
+        self.assertTrue(package.is_file())
 
 if __name__ == '__main__':
     unittest.main()
