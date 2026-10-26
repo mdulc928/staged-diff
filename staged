@@ -40,7 +40,7 @@ DEFAULT_PROTECTED_BRANCHES = []
 STATUS_COLORS = {'APPLIED': '32', 'MERGED': '1;32', 'UNDONE': '1;36', 'MODIFIED': '33', 'NEW FILE': '36',
                  'RENAMED': '35', 'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
 STATUS_ORDER = ('MISSING', 'NEW FILE', 'MODIFIED', 'RENAMED', 'RELOCATED', 'DELETED', 'APPLIED')
-COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'init', 'diff', 'tui', 'feedback', 'apply', 'undo', 'fmt', 'check', 'exec', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
+COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'init', 'diff', 'tui', 'feedback', 'apply', 'undo', 'fmt', 'check', 'exec', 'sandbox', 'link', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
 
 
 def is_reserved_windows_name(name):
@@ -53,6 +53,7 @@ def is_reserved_windows_name(name):
 MANAGED_METADATA = ('session.json', 'renames.json', 'summaries.json', 'feedback.json')
 SUGGESTED_METADATA = ('staged_changes.md', 'diff_viewer.md')
 META_FILE_COMMANDS = ('read', 'write', 'create', 'copy', 'rename', 'delete', 'path', 'open')
+SANDBOX_FILE_COMMANDS = ('read', 'write', 'create', 'copy', 'delete', 'link', 'path', 'open')
 COMPLETION_MARKER_START = '# >>> staged completions >>>'
 COMPLETION_MARKER_END = '# <<< staged completions <<<'
 
@@ -129,8 +130,9 @@ def is_branch_protected(branch, patterns=None):
                               (DEFAULT_PROTECTED_BRANCHES if patterns is None else patterns)))
 
 
-def safe_path(root, relative):
-    """Reject traversal, metadata paths and symlinks before reading or mutating files."""
+def safe_path(root, relative, allow_link=False):
+    """Reject traversal, metadata paths and symlinks before reading or mutating files.
+    `allow_link` permits only the final component to be a symlink."""
     if not isinstance(relative, str) or not relative or '\\' in relative:
         raise StagedError('Invalid relative path: {!r}'.format(relative))
     part = Path(relative)
@@ -144,12 +146,12 @@ def safe_path(root, relative):
         raise StagedError('Git metadata cannot be staged: {}'.format(relative))
     root = Path(root).resolve()
     dest = root
-    for component in part.parts:
+    for index, component in enumerate(part.parts):
         dest = dest / component
-        if dest.is_symlink():
+        if dest.is_symlink() and not (allow_link and index == len(part.parts) - 1):
             raise StagedError('Symlink paths are not supported: {}'.format(dest))
     try:
-        dest.resolve().relative_to(root)
+        (dest.parent if allow_link else dest).resolve().relative_to(root)
     except ValueError:
         raise StagedError('Path escapes root: {}'.format(relative))
     return dest
@@ -400,12 +402,16 @@ class Session:
                 pass
         result = {}
         self._directory_mtimes = {}
+        sandbox = self.sandbox_entries()
         for root, dirs, files in os.walk(self.staging, followlinks=False):
             self._directory_mtimes[Path(root).relative_to(self.staging).as_posix()] = Path(root).stat().st_mtime_ns
+            dirs[:] = [name for name in dirs if (Path(root) / name).relative_to(self.staging).as_posix() not in sandbox]
             for name in dirs:
                 safe_path(self.staging, (Path(root) / name).relative_to(self.staging).as_posix())
             for name in files:
                 rel = (Path(root) / name).relative_to(self.staging).as_posix()
+                if rel in sandbox:
+                    continue
                 path = safe_path(self.staging, rel)
                 if not path.is_file():
                     raise StagedError('Only regular files can be staged: ' + rel)
@@ -416,6 +422,18 @@ class Session:
         if not self.directory.is_dir():
             return []
         return sorted(p.name for p in self.directory.iterdir() if p.is_file() and not p.name.startswith('.'))
+
+    def sandbox_entries(self):
+        record = self.directory / SANDBOX_RECORD
+        entries = load_json(record).get('entries', {})
+        if not isinstance(entries, dict):
+            raise StagedError('Invalid sandbox record: ' + str(record))
+        for rel, entry in entries.items():
+            part = Path(rel)
+            if (not isinstance(entry, dict) or entry.get('kind') not in ('link', 'file', 'copy') or part.is_absolute()
+                    or part.as_posix() != rel or '..' in part.parts or '.git' in part.parts):
+                raise StagedError('Invalid sandbox record entry {!r}: {}'.format(rel, record))
+        return entries
 
     def openable_paths(self, fresh=False, meta=False):
         return self.session_files() if meta else sorted(self.files(fresh=fresh))
@@ -850,6 +868,11 @@ def resolve_meta_alias(target, paths):
 
 
 def open_file(ctx, session, target):
+    if getattr(ctx.args, 'sandbox', False):
+        path = range_path(session, target, sandbox=True)
+        print('Open: {}'.format(target), flush=True)
+        run_editor(ctx.tool().get_open_command(path))
+        return
     meta = ctx.args.meta
     paths = session.openable_paths(fresh=True, meta=meta)
     if not paths:
@@ -1606,7 +1629,8 @@ PYTHON_EXTENSIONS = frozenset({'.py', '.pyi'})
 C_CPP_EXTENSIONS = frozenset({'.c', '.cc', '.cpp', '.h', '.hpp', '.m', '.mm'})
 CPP_EXTENSIONS = frozenset({'.cc', '.cpp', '.hpp', '.mm'})
 
-HEAVY_SYMLINK_DIRS = frozenset({
+# Cloned wholesale into the exec sandbox instead of walked file by file.
+HEAVY_CLONE_DIRS = frozenset({
     'node_modules', '.venv', 'venv', 'target', '.build', 'build', 'dist',
     'vendor', '.svelte-kit', '.next', '.nuxt', '.gradle', '.m2',
     '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.tox',
@@ -2089,6 +2113,8 @@ def generate_tsconfig_overlay(session, ts_files=None):
     ]
     for rel in sorted(shadowed_ws_rels):
         exclude_list.append(safe_path(session.workspace, rel).as_posix())
+    for rel in sorted(session.sandbox_entries()):
+        exclude_list.append((session.staging.resolve() / rel).as_posix())
 
     config = {
         'compilerOptions': {
@@ -2476,7 +2502,7 @@ def _finalize_check_report(checks, as_json=False):
 
 
 # ---------------------------------------------------------------------------
-# 4. Tier 3: Ephemeral CoW / Hardlink Overlay Sandbox (`staged exec`)
+# 4. Tier 3: Ephemeral Copy-on-Write Overlay Sandbox (`staged exec`)
 # ---------------------------------------------------------------------------
 
 def remove_sandbox(sandbox_dir):
@@ -2498,10 +2524,131 @@ def remove_sandbox(sandbox_dir):
         shutil.rmtree(sandbox_dir, ignore_errors=True)
 
 
+LINUX_FICLONE = 0x40049409
+DARWIN_CLONE_NOFOLLOW = 0x0001
+SANDBOX_TRASH_STALE_SECONDS = 600
+_darwin_libc = []
+
+
+def darwin_clone(source, target):
+    """clonefile(2): copy-on-write clone of a file or a whole directory tree on APFS."""
+    if sys.platform != 'darwin':
+        return False
+    try:
+        if not _darwin_libc:
+            import ctypes
+            _darwin_libc.append(ctypes.CDLL(None, use_errno=True))
+        return _darwin_libc[0].clonefile(os.fsencode(str(source)), os.fsencode(str(target)), DARWIN_CLONE_NOFOLLOW) == 0
+    except (OSError, AttributeError):
+        return False
+
+
+def clone_file(source, target):
+    """Copy `source` to `target` without sharing storage, so writes in the sandbox never reach
+    the workspace. Copy-on-write clones keep this cheap on APFS, Btrfs and XFS."""
+    source, target = str(source), str(target)
+    if darwin_clone(source, target):
+        return
+    if sys.platform.startswith('linux'):
+        try:
+            import fcntl
+            with open(source, 'rb') as src, open(target, 'wb') as dst:
+                fcntl.ioctl(dst.fileno(), LINUX_FICLONE, src.fileno())
+            shutil.copystat(source, target)
+            return
+        except (OSError, ImportError):
+            if os.path.lexists(target):
+                os.unlink(target)
+    shutil.copy2(source, target)
+
+
+def clone_tree(source, target):
+    """Clone a directory without sharing storage: one clonefile() call on APFS, otherwise a
+    per-file copy that still uses reflinks where the filesystem supports them."""
+    if darwin_clone(source, target):
+        return
+    if os.path.lexists(str(target)):
+        shutil.rmtree(str(target), ignore_errors=True)
+    shutil.copytree(str(source), str(target), symlinks=True, copy_function=clone_file)
+
+
+def delete_detached(path):
+    """Delete `path` in the background without holding the caller's stdout/stderr pipes open."""
+    path = str(path)
+    if not hasattr(os, 'fork'):
+        try:
+            subprocess.Popen([sys.executable, '-c', 'import shutil, sys; shutil.rmtree(sys.argv[1], ignore_errors=True)', path],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+        except OSError:
+            remove_sandbox(path)
+        return
+    # Double fork: the grandchild is reparented to init, so nothing is left to reap.
+    try:
+        child = os.fork()
+    except OSError:
+        remove_sandbox(path)
+        return
+    if child:
+        os.waitpid(child, 0)
+        return
+    try:
+        os.setsid()
+        if os.fork() == 0:
+            devnull = os.open(os.devnull, os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(devnull, fd)
+            os.closerange(3, 1024)
+            shutil.rmtree(path, ignore_errors=True)
+    finally:
+        os._exit(0)
+
+
+def discard_sandbox(sandbox_dir):
+    """Move the sandbox aside, then delete it in a detached process: unlinking a cloned
+    node_modules can take several seconds."""
+    sandbox_dir = Path(sandbox_dir)
+    for leftover in sandbox_dir.parent.glob('.sandbox-trash-*'):
+        # Fresh trash still has a deleter running; only retry trash whose deleter died.
+        try:
+            if time.time() - leftover.stat().st_mtime < SANDBOX_TRASH_STALE_SECONDS:
+                continue
+            os.utime(str(leftover))
+        except OSError:
+            continue
+        delete_detached(leftover)
+    if not os.path.lexists(str(sandbox_dir)):
+        return
+    trash = sandbox_dir.with_name('.sandbox-trash-' + uuid.uuid4().hex)
+    try:
+        os.rename(str(sandbox_dir), str(trash))
+        os.utime(str(trash))
+    except OSError:
+        remove_sandbox(sandbox_dir)
+        return
+    delete_detached(trash)
+
+
+def rmtree_ignoring_races(path):
+    def ignore_missing(function, failed, info):
+        if not isinstance(info[1], FileNotFoundError):
+            raise info[1]
+    shutil.rmtree(str(path), onerror=ignore_missing)
+
+
+def sandbox_link_target(link, workspace, sandbox_dir):
+    target = os.readlink(str(link))
+    if os.path.isabs(target):
+        try:
+            return str(sandbox_dir / Path(target).relative_to(workspace))
+        except ValueError:
+            pass
+    return target
+
+
 def materialize_sandbox(session, sandbox_dir=None):
     sandbox_dir = Path(sandbox_dir) if sandbox_dir is not None else (session.directory / '.sandbox')
-    if sandbox_dir.exists() or sandbox_dir.is_symlink():
-        remove_sandbox(sandbox_dir)
+    discard_sandbox(sandbox_dir)
     sandbox_dir.mkdir(parents=True, exist_ok=True)
 
     staged_files = session.files(fresh=True)
@@ -2531,12 +2678,12 @@ def materialize_sandbox(session, sandbox_dir=None):
 
             if ws_subdir.is_symlink():
                 sb_subdir.parent.mkdir(parents=True, exist_ok=True)
-                os.symlink(os.readlink(str(ws_subdir)), str(sb_subdir))
+                os.symlink(sandbox_link_target(ws_subdir, workspace, sandbox_dir), str(sb_subdir))
                 continue
 
-            if d in HEAVY_SYMLINK_DIRS and dir_rel_posix not in touched_dir_prefixes:
+            if d in HEAVY_CLONE_DIRS and dir_rel_posix not in touched_dir_prefixes:
                 sb_subdir.parent.mkdir(parents=True, exist_ok=True)
-                os.symlink(str(ws_subdir), str(sb_subdir))
+                clone_tree(ws_subdir, sb_subdir)
                 continue
 
             kept_dirs.append(d)
@@ -2550,12 +2697,9 @@ def materialize_sandbox(session, sandbox_dir=None):
             sb_file = sandbox_dir / file_rel_posix
             sb_file.parent.mkdir(parents=True, exist_ok=True)
             if ws_file.is_symlink():
-                os.symlink(os.readlink(str(ws_file)), str(sb_file))
+                os.symlink(sandbox_link_target(ws_file, workspace, sandbox_dir), str(sb_file))
             else:
-                try:
-                    os.link(str(ws_file), str(sb_file))
-                except OSError:
-                    shutil.copy2(str(ws_file), str(sb_file))
+                clone_file(ws_file, sb_file)
 
     for rel, staged_path in staged_files.items():
         sb_target = sandbox_dir / rel
@@ -2567,8 +2711,119 @@ def materialize_sandbox(session, sandbox_dir=None):
     return sandbox_dir
 
 
+def tool_env(root, cwd):
+    """Environment for a command in a sandbox `root`: local bins from `cwd` up to `root` first."""
+    env = os.environ.copy()
+    py_existing = env.get('PYTHONPATH', '')
+    env['PYTHONPATH'] = os.pathsep.join([str(root)] + ([py_existing] if py_existing else []))
+    node_modules = root / 'node_modules'
+    if node_modules.exists():
+        node_existing = env.get('NODE_PATH', '')
+        env['NODE_PATH'] = os.pathsep.join([str(node_modules)] + ([node_existing] if node_existing else []))
+    bin_dir = 'Scripts' if os.name == 'nt' else 'bin'
+    extra_bins = []
+    directory = cwd
+    while True:
+        for candidate in (directory / 'node_modules' / '.bin', directory / '.venv' / bin_dir, directory / 'venv' / bin_dir):
+            if candidate.exists():
+                extra_bins.append(str(candidate))
+        if directory == root:
+            break
+        directory = directory.parent
+    if extra_bins:
+        env['PATH'] = os.pathsep.join(extra_bins + [env.get('PATH', '')])
+    return env
+
+
+def run_tool(cmd, cwd, env):
+    try:
+        proc = subprocess.run(cmd, cwd=str(cwd), env=env, capture_output=True, text=True, errors='replace')
+        return proc.returncode, proc.stdout or '', proc.stderr or ''
+    except OSError as exc:
+        return 127, '', str(exc) + '\n'
+
+
+def exec_cwd(root, rel):
+    if not rel:
+        return root
+    cwd = safe_path(root, rel)
+    if not cwd.is_dir():
+        raise StagedError('--cwd must be an existing directory in the sandbox: ' + rel)
+    return cwd
+
+
+def staging_snapshot(session):
+    """Non-entry files, symlinks and directories in staging/."""
+    entries = session.sandbox_entries()
+    items, directories = set(), set()
+    for root, dirs, files in os.walk(session.staging, followlinks=False):
+        base = Path(root)
+        kept = []
+        for name in dirs:
+            rel = (base / name).relative_to(session.staging).as_posix()
+            if rel in entries:
+                continue
+            if (base / name).is_symlink():
+                items.add(rel)
+            else:
+                directories.add(rel)
+                kept.append(name)
+        dirs[:] = kept
+        items.update(rel for rel in ((base / name).relative_to(session.staging).as_posix() for name in files)
+                     if rel not in entries)
+    return items, directories
+
+
+def run_in_staging(session, cmd, cwd_rel=None, sync_back=False):
+    """Run directly in staging/ with only the sandbox entries the agent set up. Afterwards,
+    files the command created are discarded and proposal edits are reverted unless synced."""
+    cwd = exec_cwd(session.staging, cwd_rel)
+    proposals = session.files(fresh=True)
+    _, directories_before = staging_snapshot(session)
+    backup = session.directory / ('.exec-backup-' + uuid.uuid4().hex)
+    versions = {}
+    synced, reverted, discarded = [], [], []
+    try:
+        for rel, path in proposals.items():
+            (backup / rel).parent.mkdir(parents=True, exist_ok=True)
+            clone_file(path, backup / rel)
+            versions[rel] = file_version(path)
+        returncode, raw_stdout, raw_stderr = run_tool(cmd, cwd, tool_env(session.staging, cwd))
+        items_after, directories_after = staging_snapshot(session)
+        for rel in sorted(items_after - set(proposals)):
+            path = session.staging / rel
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            discarded.append(rel)
+        for rel in sorted(proposals):
+            path = session.staging / rel
+            regular = path.is_file() and not path.is_symlink()
+            if regular and (file_version(path) == versions[rel] or equal_files(path, backup / rel)):
+                continue
+            if regular and sync_back:
+                synced.append(rel)
+                continue
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(str(path))
+            copy_atomic(backup / rel, path)
+            reverted.append(rel)
+        for rel in sorted(directories_after - directories_before, key=lambda r: -len(Path(r).parts)):
+            path = session.staging / rel
+            if path.is_dir() and not path.is_symlink() and not any(path.iterdir()):
+                path.rmdir()
+    finally:
+        shutil.rmtree(str(backup), ignore_errors=True)
+    if synced or reverted or discarded:
+        session.refresh_index()
+    return returncode, raw_stdout, raw_stderr, {'synced': synced, 'reverted': reverted, 'discarded': discarded}
+
+
 def exec_in_sandbox(ctx, session, command_args, sync_back=False, as_json=False, keep_sandbox=False):
     args = getattr(ctx, 'args', None)
+    in_staging = bool(getattr(args, 'staging', False))
+    cwd_rel = getattr(args, 'cwd', None)
     if args is not None:
         if not sync_back:
             sync_back = bool(getattr(args, 'sync', False))
@@ -2576,6 +2831,8 @@ def exec_in_sandbox(ctx, session, command_args, sync_back=False, as_json=False, 
             as_json = bool(getattr(args, 'json', False))
         if not keep_sandbox:
             keep_sandbox = bool(getattr(args, 'keep_sandbox', False))
+    if in_staging and keep_sandbox:
+        raise StagedError('--keep-sandbox has no effect with --staging; the command already runs in staging/.')
 
     if isinstance(command_args, str):
         cmd = shlex.split(command_args)
@@ -2586,73 +2843,39 @@ def exec_in_sandbox(ctx, session, command_args, sync_back=False, as_json=False, 
     if not cmd:
         raise StagedError('Provide a command to execute in the sandbox (e.g. staged exec -- pytest).')
 
-    staged_before = {rel: path for rel, path in session.files(fresh=True).items()}
-    sandbox_dir = materialize_sandbox(session)
-    synced = []
-
-    try:
-        env = os.environ.copy()
-        py_existing = env.get('PYTHONPATH', '')
-        env['PYTHONPATH'] = os.pathsep.join([str(sandbox_dir)] + ([py_existing] if py_existing else []))
-
-        node_modules = sandbox_dir / 'node_modules'
-        if node_modules.exists():
-            node_existing = env.get('NODE_PATH', '')
-            env['NODE_PATH'] = os.pathsep.join([str(node_modules)] + ([node_existing] if node_existing else []))
-
-        bin_dir = 'Scripts' if os.name == 'nt' else 'bin'
-        extra_bins = []
-        for candidate in (
-            sandbox_dir / 'node_modules' / '.bin',
-            sandbox_dir / '.venv' / bin_dir,
-            sandbox_dir / 'venv' / bin_dir,
-        ):
-            if candidate.exists():
-                extra_bins.append(str(candidate))
-        if extra_bins:
-            env['PATH'] = os.pathsep.join(extra_bins + [env.get('PATH', '')])
-
+    sandbox_dir = None
+    if in_staging:
+        returncode, raw_stdout, raw_stderr, changes = run_in_staging(session, cmd, cwd_rel, sync_back)
+    else:
+        staged_before = {rel: path for rel, path in session.files(fresh=True).items()}
+        sandbox_dir = materialize_sandbox(session)
+        changes = {'synced': []}
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(sandbox_dir),
-                env=env,
-                capture_output=True,
-                text=True,
-                errors='replace',
-            )
-            returncode = proc.returncode
-            raw_stdout = proc.stdout or ''
-            raw_stderr = proc.stderr or ''
-        except OSError as exc:
-            returncode = 127
-            raw_stdout = ''
-            raw_stderr = str(exc) + '\n'
+            cwd = exec_cwd(sandbox_dir, cwd_rel)
+            returncode, raw_stdout, raw_stderr = run_tool(cmd, cwd, tool_env(sandbox_dir, cwd))
+            if sync_back:
+                for rel, staged_path in staged_before.items():
+                    sb_file = sandbox_dir / rel
+                    if sb_file.is_file() and not equal_files(sb_file, staged_path):
+                        copy_atomic(sb_file, staged_path)
+                        changes['synced'].append(rel)
+                if changes['synced']:
+                    session.refresh_index()
+        finally:
+            if not keep_sandbox:
+                discard_sandbox(sandbox_dir)
 
-        clean_stdout = rewrite_diagnostic_paths(raw_stdout, session, sandbox_dir=sandbox_dir)
-        clean_stderr = rewrite_diagnostic_paths(raw_stderr, session, sandbox_dir=sandbox_dir)
-
-        if sync_back:
-            for rel, staged_path in staged_before.items():
-                sb_file = sandbox_dir / rel
-                if sb_file.is_file() and not equal_files(sb_file, staged_path):
-                    copy_atomic(sb_file, staged_path)
-                    synced.append(rel)
-            if synced:
-                session.refresh_index()
-    finally:
-        if not keep_sandbox:
-            remove_sandbox(sandbox_dir)
-
+    clean_stdout = rewrite_diagnostic_paths(raw_stdout, session, sandbox_dir=sandbox_dir)
+    clean_stderr = rewrite_diagnostic_paths(raw_stderr, session, sandbox_dir=sandbox_dir)
     result = {
         'ok': returncode == 0,
         'returncode': returncode,
         'command': cmd,
         'stdout': clean_stdout,
         'stderr': clean_stderr,
-        'synced': synced,
         'sandbox': str(sandbox_dir) if keep_sandbox else None,
     }
+    result.update(changes)
 
     if as_json:
         print(json.dumps(result))
@@ -2665,8 +2888,236 @@ def exec_in_sandbox(ctx, session, command_args, sync_back=False, as_json=False, 
             sys.stderr.write(clean_stderr)
             if not clean_stderr.endswith('\n'):
                 sys.stderr.write('\n')
+        for key, label in (('reverted', 'Reverted proposal edits (pass --sync to keep)'),
+                           ('discarded', 'Discarded files created in staging/')):
+            if changes.get(key):
+                sys.stderr.write('{}: {}\n'.format(label, ', '.join(changes[key])))
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# 5. Persistent Sandbox Entries (`staged sandbox`)
+# ---------------------------------------------------------------------------
+# Entries live inside staging/ at the workspace-relative path they mirror, so tools that
+# walk up from a staged file (editors, tsc, vite) find packages and configs where they
+# expect them. The record keeps them out of proposals, diffs and apply.
+
+SANDBOX_RECORD = '.sandbox-entries.json'
+
+
+def save_sandbox_entries(session, entries):
+    record = session.directory / SANDBOX_RECORD
+    if entries:
+        save_json(record, {'entries': dict(sorted(entries.items()))})
+    elif record.exists():
+        record.unlink()
+
+
+def new_sandbox_path(session, rel):
+    if rel in session.sandbox_entries():
+        raise StagedError('{} is already a sandbox entry; remove it first.'.format(rel))
+    path = safe_path(session.staging, rel, allow_link=True)
+    if os.path.lexists(str(path)):
+        raise StagedError('{} already exists in staging; sandbox entries never replace proposals.'.format(rel))
+    return path
+
+
+def add_sandbox_link(session, rel, target=None):
+    path = new_sandbox_path(session, rel)
+    source = Path(os.path.expanduser(target or rel))
+    if not source.is_absolute():
+        source = session.workspace / source
+    if not source.exists():
+        raise StagedError('Link target does not exist: {}'.format(source))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(str(source), str(path), target_is_directory=source.is_dir())
+    except OSError as exc:
+        raise StagedError('Could not link {}: {}'.format(rel, exc))
+    entries = session.sandbox_entries()
+    entries[rel] = {'kind': 'link', 'target': str(source)}
+    save_sandbox_entries(session, entries)
+
+
+def register_sandbox_file(session, rel):
+    # Record before the file appears: an unrecorded file in staging/ would read as a proposal.
+    entries = session.sandbox_entries()
+    if not any(p in entries for p in [rel] + [q.as_posix() for q in Path(rel).parents]):
+        entries[rel] = {'kind': 'file'}
+        save_sandbox_entries(session, entries)
+
+
+def add_sandbox_copy(session, rel, source=None):
+    """Clone a workspace file or directory into staging/ as an isolated, writable entry."""
+    path = new_sandbox_path(session, rel)
+    origin = Path(os.path.expanduser(source or rel))
+    if not origin.is_absolute():
+        origin = session.workspace / origin
+    if not origin.exists():
+        raise StagedError('Copy source does not exist: {}'.format(origin))
+    entries = session.sandbox_entries()
+    entries[rel] = {'kind': 'copy', 'source': str(origin)}
+    save_sandbox_entries(session, entries)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if origin.is_dir():
+            clone_tree(origin, path)
+            anchor_escaping_links(path, origin)
+        else:
+            clone_file(origin, path)
+    except (OSError, shutil.Error):
+        remove_sandbox_entries(session, [rel])
+        raise
+
+
+def anchor_escaping_links(clone, origin):
+    """Relative symlinks that leave the cloned tree (pnpm workspace packages, for example) would
+    point into staging/ where their targets do not exist; repoint them at the real targets."""
+    origin_root = os.path.realpath(str(origin))
+    for directory, dirs, files in os.walk(str(clone)):
+        source_dir = os.path.join(origin_root, os.path.relpath(directory, str(clone)))
+        for name in dirs + files:
+            link = os.path.join(directory, name)
+            if not os.path.islink(link):
+                continue
+            target = os.readlink(link)
+            if os.path.isabs(target):
+                continue
+            resolved = os.path.normpath(os.path.join(source_dir, target))
+            if resolved != origin_root and not resolved.startswith(origin_root + os.sep):
+                os.unlink(link)
+                os.symlink(resolved, link)
+
+
+def write_sandbox_file(session, rel, data):
+    path = range_path(session, rel, writable=True, sandbox=True)
+    register_sandbox_file(session, rel)
+    write_bytes_atomic(path, data)
+
+
+def sandbox_operation(session, args):
+    rel = (getattr(args, 'to', None) or args.file) if args.command == 'copy' else args.file
+    if args.command == 'delete':
+        remove_sandbox_entries(session, [args.file])
+        message = 'Removed sandbox entry: '
+    elif args.command == 'link':
+        add_sandbox_link(session, args.file, args.target)
+        message = 'Linked sandbox entry: '
+    elif args.command == 'copy':
+        add_sandbox_copy(session, rel, args.file)
+        message = 'Cloned sandbox entry: '
+    else:
+        if range_path(session, args.file, writable=True, sandbox=True).exists():
+            raise StagedError('Sandbox file already exists; use write --sandbox to edit it: ' + args.file)
+        if args.stdin and sys.stdin.isatty():
+            raise StagedError('--stdin requires piped or redirected input; use --text for inline content.')
+        write_sandbox_file(session, args.file, sys.stdin.buffer.read() if args.stdin else (args.text or '').encode('utf-8'))
+        message = 'Created sandbox file: '
+    if args.json:
+        result = {'operation': args.command, 'path': rel, 'sandbox': True}
+        entry = session.sandbox_entries().get(rel)
+        if entry:
+            result.update(entry)
+        print(json.dumps(result))
+    else:
+        print(message + rel)
+
+
+def remove_sandbox_entries(session, rels=None):
+    entries = session.sandbox_entries()
+    targets = sorted(entries) if rels is None else list(rels)
+    unknown = [rel for rel in targets if rel not in entries]
+    if unknown:
+        raise StagedError('Not a sandbox entry: {}'.format(', '.join(unknown)))
+    for rel in targets:
+        path = session.staging / rel
+        # Unlink links; never follow them into the workspace. Copies are removed in full.
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            rmtree_ignoring_races(path)
+        parent = path.parent
+        while parent != session.staging and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+        entries.pop(rel)
+    save_sandbox_entries(session, entries)
+    return targets
+
+
+def sandbox_tsconfig(session, rel, source):
+    depth = len(Path(rel).parts) - 1
+    config = {
+        'extends': str(source),
+        'compilerOptions': {
+            'noEmit': True,
+            # Relative, so it matches however an editor reaches the session (e.g. /tmp vs /private/tmp).
+            'rootDirs': ['/'.join(['..'] * depth) or '.', str(session.workspace)],
+        },
+        'include': ['**/*'],
+        'exclude': ['**/node_modules'],
+    }
+    return (json.dumps(config, indent=2) + '\n').encode('utf-8')
+
+
+def auto_sandbox(session, clone=False):
+    """Link (or, with `clone`, copy-on-write clone) each workspace node_modules above a staged file,
+    and wrap the nearest tsconfig.json or jsconfig.json so unstaged relative imports resolve."""
+    directories = set()
+    nearest_configs = set()
+    for rel in session.files(fresh=True):
+        parents = list(Path(rel).parents)
+        directories.update(parents)
+        for parent in parents:
+            name = next((n for n in ('tsconfig.json', 'jsconfig.json') if (session.workspace / parent / n).is_file()), None)
+            if name:
+                nearest_configs.add((parent / name).as_posix())
+                break
+    created = []
+    for parent in sorted(directories):
+        rel = (parent / 'node_modules').as_posix()
+        if (session.workspace / rel).is_dir() and not os.path.lexists(str(session.staging / rel)):
+            (add_sandbox_copy if clone else add_sandbox_link)(session, rel)
+            created.append(rel)
+    for rel in sorted(nearest_configs):
+        # A staged config is a proposal and already sits at the right place.
+        if not os.path.lexists(str(session.staging / rel)):
+            write_sandbox_file(session, rel, sandbox_tsconfig(session, rel, session.workspace / rel))
+            created.append(rel)
+    return created
+
+
+def handle_sandbox(session, args):
+    changed = []
+    if args.clone and not args.auto:
+        raise StagedError('--clone requires --auto; use staged copy --sandbox -f <path> for a single clone.')
+    if args.auto:
+        changed = auto_sandbox(session, clone=args.clone)
+    elif args.clear:
+        changed = remove_sandbox_entries(session)
+    entries = session.sandbox_entries()
+    if args.json:
+        result = {'session': session.id, 'staging': str(session.staging),
+                  'entries': [dict(path=rel, **entry) for rel, entry in sorted(entries.items())]}
+        if args.auto or args.clear:
+            result['removed' if args.clear else 'changed'] = changed
+        print(json.dumps(result))
+        return
+    if args.clear:
+        print('Removed: {}'.format(', '.join(changed)) if changed else 'No sandbox entries to remove.')
+        return
+    if args.auto and not changed:
+        print('Nothing new to link for the staged files.')
+    if not entries:
+        print('No sandbox entries. Add them with staged sandbox --auto, link --sandbox, or write --sandbox.')
+        return
+    print('Sandbox entries in {} (not part of the diff):'.format(session.staging))
+    for rel, entry in sorted(entries.items()):
+        marker = '+' if rel in changed else ' '
+        detail = {'link': ' -> ' + entry.get('target', ''), 'copy': ' (clone of {})'.format(entry.get('source', ''))}
+        print(' {} {}'.format(marker, rel) + detail.get(entry['kind'], ''))
+
 
 # ===========================================================================
 # 2-Pane Interactive Diff TUI & Inline Code-Selection Feedback Engine
@@ -4284,7 +4735,7 @@ def clean_session(ctx, session):
                 save_json(GLOBAL_STATE_FILE, ctx.global_state)
             elif GLOBAL_STATE_FILE.exists():
                 GLOBAL_STATE_FILE.unlink()
-        shutil.rmtree(target_session.directory)
+        rmtree_ignoring_races(target_session.directory)
         print('Cleaned session {}.'.format(target_session.id))
         return
 
@@ -4544,7 +4995,7 @@ def file_version(path):
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def range_path(session, relative, workspace=False, meta=False, writable=False):
+def range_path(session, relative, workspace=False, meta=False, writable=False, sandbox=False):
     # File APIs deliberately use exact paths rather than interactive fuzzy matching.
     root = session.workspace if workspace else session.directory if meta else session.staging
     if meta:
@@ -4556,6 +5007,19 @@ def range_path(session, relative, workspace=False, meta=False, writable=False):
             raise StagedError('Metadata files are top-level session files beside staging/: ' + relative)
         if writable and lowered in {name.lower() for name in MANAGED_METADATA}:
             raise StagedError('{} is managed by staged; use summarize, rename or delete instead.'.format(relative))
+    if not workspace and not meta:
+        entries = session.sandbox_entries()
+        hit = next((p for p in [relative] + [q.as_posix() for q in Path(relative).parents] if p in entries), None)
+        if sandbox:
+            if hit is None and not writable:
+                raise StagedError('No sandbox file at exact path: ' + relative)
+            if hit is None and os.path.lexists(str(session.staging / relative)):
+                raise StagedError('{} is a staged proposal; sandbox entries never replace proposals.'.format(relative))
+            if hit is not None and entries[hit]['kind'] == 'link':
+                raise StagedError('{} is a sandbox link; links cannot be read or written through.'.format(hit))
+        elif hit:
+            raise StagedError('{} is a sandbox entry, not a proposal; use --sandbox, or remove it with '
+                              'staged delete --sandbox -f {} first.'.format(relative, hit))
     if not workspace:
         try:
             root.resolve().relative_to(session.workspace.resolve())
@@ -4844,11 +5308,11 @@ def copy_bytes(source, target, count):
 
 
 def read_file_range(session, args):
-    path = range_path(session, args.file, args.workspace, meta=args.meta)
+    path = range_path(session, args.file, args.workspace, meta=args.meta, sandbox=getattr(args, 'sandbox', False))
     before = file_version(path)
     if before is None:
         raise StagedError('File does not exist: ' + args.file)
-    origin = 'workspace' if args.workspace else 'meta' if args.meta else 'staged'
+    origin = 'workspace' if args.workspace else 'meta' if args.meta else 'sandbox' if getattr(args, 'sandbox', False) else 'staged'
     with path.open('rb') as stream:
         start, end, size = selected_range(stream, args)
         if args.json:
@@ -4870,8 +5334,8 @@ def read_file_range(session, args):
 
 
 def write_file_range(session, args):
-    target = range_path(session, args.file, meta=args.meta, writable=True)
-    if not args.meta and args.file in session.deletions:
+    target = range_path(session, args.file, meta=args.meta, writable=True, sandbox=getattr(args, 'sandbox', False))
+    if not args.meta and not getattr(args, 'sandbox', False) and args.file in session.deletions:
         raise StagedError('File is marked for deletion; remove its deletion entry before writing.')
     before = file_version(target)
     source = target
@@ -4906,12 +5370,14 @@ def write_file_range(session, args):
             if mode is not None:
                 os.chmod(temporary, mode)
             # Catch changes during input collection as well as stale caller hashes.
-            range_path(session, args.file, meta=args.meta, writable=True)
+            range_path(session, args.file, meta=args.meta, writable=True, sandbox=getattr(args, 'sandbox', False))
             if file_version(target) != before or file_version(source) != source_version:
                 raise StagedError('File changed while writing; read again before retrying.')
             # Close the source before replacing it, including on Windows.
             original.close()
-            if not args.meta:
+            if getattr(args, 'sandbox', False):
+                register_sandbox_file(session, args.file)
+            elif not args.meta:
                 orig_rel = session.manifest.get(args.file, args.file)
                 record_base_snapshot(session, orig_rel)
                 if orig_rel != args.file:
@@ -4927,14 +5393,18 @@ def write_file_range(session, args):
                   'created': before is None, 'from_workspace': args.from_workspace}
         if args.meta:
             result['meta'] = True
+        if getattr(args, 'sandbox', False):
+            result['sandbox'] = True
         print(json.dumps(result))
     else:
-        print('Wrote {} file: {}'.format('metadata' if args.meta else 'staged', args.file))
+        print('Wrote {} file: {}'.format('metadata' if args.meta else 'sandbox' if getattr(args, 'sandbox', False) else 'staged', args.file))
 
 
 def validate_meta_args(parser, args):
     if args.meta and (getattr(args, 'workspace', False) or getattr(args, 'from_workspace', False)):
         parser.error('--meta cannot be combined with --workspace or --from-workspace')
+    if getattr(args, 'sandbox', False) and (args.meta or getattr(args, 'workspace', False)):
+        parser.error('--sandbox cannot be combined with --meta or --workspace')
 
 
 def validate_file_range_args(parser, args):
@@ -4999,7 +5469,9 @@ def make_parser():
         'undo': 'Atomically roll back the most recent apply operation in this session.',
         'fmt': 'Format staged files in-place using virtual workspace buffers (zero workspace replication).',
         'check': 'Lint, typecheck, and verify imports on staged files using virtual workspace overlays.',
-        'exec': 'Run a build or test command inside an ephemeral hardlink/symlink overlay sandbox.',
+        'exec': 'Run a build or test command inside an ephemeral copy-on-write overlay sandbox.',
+        'sandbox': 'List sandbox entries: non-proposal links and support files in staging/ that let editors and tools resolve staged files.',
+        'link': 'Link a workspace path into staging/ as a sandbox entry (requires --sandbox).',
         'clean': 'Discard staged proposals without changing the workspace.',
         'path': 'Print a raw absolute staged or workspace path.',
         'open': 'Open a staged proposed file or session file in your editor.',
@@ -5097,8 +5569,24 @@ def make_parser():
     p = command_parsers['exec']
     p.add_argument('--sync', action='store_true', help='sync modified staged files from sandbox back to staging/')
     p.add_argument('--keep-sandbox', action='store_true', help='keep .sandbox/ directory after execution for debugging')
+    p.add_argument('--staging', action='store_true',
+                   help='run directly in staging/ with only the sandbox entries (no workspace clone); '
+                        'files it creates are discarded and proposal edits reverted unless --sync')
+    p.add_argument('--cwd', help='run from this sandbox-relative directory (e.g. apps/web)')
     p.add_argument('--json', action='store_true', help='print structured JSON execution result')
     p.add_argument('exec_cmd', nargs=argparse.REMAINDER, metavar='COMMAND', help='command and arguments to run inside the overlay sandbox')
+    p = command_parsers['sandbox']
+    action = p.add_mutually_exclusive_group()
+    action.add_argument('--auto', action='store_true',
+                        help='link every workspace node_modules above staged files and wrap the nearest tsconfig/jsconfig')
+    action.add_argument('--clear', action='store_true', help='remove every sandbox entry')
+    p.add_argument('--clone', action='store_true',
+                   help='with --auto, copy-on-write clone node_modules instead of linking (isolated for exec --staging)')
+    p.add_argument('--json', action='store_true', help='print structured JSON result')
+    p = command_parsers['link']
+    p.add_argument('-f', '--file', required=True, help='exact staging-relative path for the link, mirroring the workspace layout')
+    p.add_argument('--target', help='workspace-relative or absolute target (default: the same path in the workspace)')
+    p.add_argument('--json', action='store_true', help='print structured operation results')
     p = command_parsers['clean']
     p.add_argument('-y', '--yes', action='store_true', help='confirm discarding proposed changes')
     p = command_parsers['path']
@@ -5107,6 +5595,12 @@ def make_parser():
     group.add_argument('-w', '--workspace', action='store_true', help='print the original workspace path')
     group.add_argument('--meta', action='store_true', default=argparse.SUPPRESS,
                        help='print a session metadata file path (it need not exist yet)')
+    group.add_argument('--sandbox', action='store_true', help='print a sandbox entry path')
+    for name in SANDBOX_FILE_COMMANDS:
+        if name != 'path':
+            command_parsers[name].add_argument(
+                '--sandbox', action='store_true',
+                help='use a sandbox entry inside staging/ that is never a proposal (see staged sandbox)')
     for name in ('read', 'write', 'create', 'copy', 'rename', 'delete', 'open'):
         command_parsers[name].add_argument(
             '--meta', action='store_true', default=argparse.SUPPRESS,
@@ -5170,6 +5664,10 @@ def completion_options(words, parser, commands):
         blocked.update(('--workspace', '--from-workspace'))
     if '--workspace' in words or '--from-workspace' in words:
         blocked.add('--meta')
+    if '--sandbox' in words:
+        blocked.update(('--meta', '--workspace'))
+    if '--meta' in words or '--workspace' in words:
+        blocked.add('--sandbox')
     options = [flag for action in selected._actions if action.help != argparse.SUPPRESS
                for flag in action.option_strings if flag not in blocked]
     return (list(commands) if selected is parser else []) + options
@@ -5179,6 +5677,8 @@ def completion_files(ctx, words):
     """Return -f/--to candidates, using metadata names whenever --meta is present."""
     command = next((word for word in words if word in COMMANDS), None)
     session = ctx.active(notify=False)
+    if '--sandbox' in words and command in SANDBOX_FILE_COMMANDS:
+        return sorted(session.sandbox_entries())
     if '--meta' not in words or command not in META_FILE_COMMANDS:
         return session.openable_paths() if command == 'open' else session.paths()
     existing = set(session.session_files())
@@ -5568,7 +6068,7 @@ def uninstall(ctx):
                 path.parent.rmdir()
     if remove_sessions:
         for directory in sessions:
-            shutil.rmtree(directory)
+            rmtree_ignoring_races(directory)
             print('Deleted session: ' + str(directory))
     for name in ('state.json', 'completion-setup.json', 'launcher-setup.json', 'installations.json'):
         path = CONFIG_DIR / name
@@ -5639,6 +6139,8 @@ def main(argv=None):
         validate_file_range_args(commands[args.command], args)
     if args.command in ('read', 'write', 'create', 'copy', 'rename', 'delete'):
         validate_meta_args(commands[args.command], args)
+    if args.command == 'link' and not args.sandbox:
+        commands['link'].error('link creates sandbox entries only; pass --sandbox (proposals cannot be symlinks)')
     if args.summary_json and not args.summary:
         parser.error('--json requires --summary: staged --summary --json')
     if args.summary_file is not None and not args.summary:
@@ -5699,6 +6201,9 @@ def main(argv=None):
         except StagedError as exc:
             if not str(exc).startswith('No staging session'):
                 raise
+        return
+    if args.command in ('create', 'copy', 'delete', 'link') and args.sandbox:
+        sandbox_operation(ctx.active(notify=False), args)
         return
     if args.command in ('create', 'copy', 'rename', 'delete') and args.meta:
         meta_operation(ctx.active(notify=False), args)
@@ -5803,7 +6308,11 @@ def main(argv=None):
         session = ctx.find_session(args.clean_session, require_workspace=False)
     else:
         session = ctx.active()
-    if args.command == 'path' and args.meta:
+    if args.command == 'path' and args.sandbox:
+        if args.file not in session.sandbox_entries():
+            raise StagedError('No sandbox entry at exact path: ' + args.file)
+        print(session.staging / args.file)
+    elif args.command == 'path' and args.meta:
         paths = session.openable_paths(meta=True)
         rel = resolve_meta_alias(args.file, paths)
         print(range_path(session, rel if rel in paths else args.file, meta=True))
@@ -5835,6 +6344,8 @@ def main(argv=None):
         res = exec_in_sandbox(ctx, session, args.exec_cmd)
         if not res['ok']:
             sys.exit(res['returncode'] or 1)
+    elif args.command == 'sandbox':
+        handle_sandbox(session, args)
     elif args.command == 'apply' or (args.command == 'diff' and args.apply):
         apply_changes(ctx, session, args.file)
         if args.command == 'diff' and args.clean:

@@ -119,6 +119,25 @@ staged diff -v -f <relative-path>
 staged apply --all
 ```
 
+### Make staged files resolvable
+
+Staged files sit outside the workspace, so editors and type checkers opening them cannot find the workspace's packages or configs (for example, `JSX element implicitly has type 'any'`). When the user wants diagnostics on staged files, or validation needs them, add sandbox entries: recorded links and support files inside `staging/` at the workspace-relative path they mirror. They are never proposals and never appear in diffs or apply.
+
+```bash
+staged sandbox --auto                                   # Start here: link node_modules above staged files, wrap nearest tsconfig/jsconfig
+staged sandbox --auto --clone                           # Same, with node_modules as copy-on-write clones (before running commands)
+staged link --sandbox -f libs/ui/node_modules           # Link a workspace path at its mirrored location
+staged copy --sandbox -f .oxlintrc.json                 # Clone a workspace file or directory instead of linking it
+staged create --sandbox -f apps/web/vite.config.ts --stdin < config.ts   # Project-specific support file
+staged sandbox --json                                   # Inspect entries
+staged delete --sandbox -f apps/web/vite.config.ts      # Or staged sandbox --clear
+staged exec --staging --cwd apps/web -- tsc -p tsconfig.json   # Run a check in staging/ with only these entries
+```
+
+Inspect the project layout first (workspaces, per-package `node_modules`, path aliases, bundler config, lint config location) and add only what the editor and the checks need; for example, a small Vite config with `resolve.alias` entries pointing at workspace sources, or a clone of the root lint config. `read`, `write`, `create`, `copy`, `delete`, `path`, and `open` accept `--sandbox` for support files, like `--meta` for metadata. Entries cannot be written as proposals; to propose a change to a path that is an entry, remove the entry first. Mention added entries in `staged_changes.md`.
+
+Prefer `staged exec --staging` for typecheck and lint of staged files: it starts immediately and runs against only the entries you set up. Writes through a link reach the workspace, so clone (`copy --sandbox`, `--auto --clone`) anything a command may write to, including `node_modules` with tool caches. Files the command creates are discarded and proposal edits are reverted unless `--sync` is passed. Use plain `staged exec` when a check needs the whole workspace (full test suites, builds).
+
 Explain tests that could not run against the isolated staged files. Do not run formatters or generators against the original workspace while staging. If full project validation needs a separate disposable copy, keep it outside the workspace and report where it ran.
 
 If the user requested review before apply and has not authorized applying, present the proposal and await their decision. Refinements stay in the same staging session.

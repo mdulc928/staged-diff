@@ -72,7 +72,8 @@ Additional discovery roots are configured via `session_roots`. Discovery is expl
   staged_changes.md   # Agent-maintained review dashboard
   .index.json         # Derived file inventory (not authoritative for apply)
   .review/            # Empty placeholder files for GUI diff viewers
-  staging/            # Complete staged files, including dotfiles
+  .sandbox-entries.json # Non-proposal links and support files inside staging/ (optional)
+  staging/            # Complete staged files, including dotfiles, plus any sandbox entries
     src/example.py
 ```
 
@@ -94,7 +95,7 @@ Additional discovery roots are configured via `session_roots`. Discovery is expl
 
 - **Path Format**: Normalized relative paths with forward slashes only.
 - **Mutual Exclusivity**: A path cannot be staged for writing and listed in `_deletions`.
-- **Validation Constraints**: Symlinks, `.git` metadata, directory traversal (`../`), and overlapping rename chains (`A -> B` and `B -> C` in one batch) are rejected.
+- **Validation Constraints**: Symlinks (other than recorded sandbox entries), `.git` metadata, directory traversal (`../`), and overlapping rename chains (`A -> B` and `B -> C` in one batch) are rejected.
 - **Location**: Metadata files must reside outside `staging/`.
 
 ---
@@ -155,6 +156,11 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 | `open [--meta] -f <f>`   | Open File                | Open staged file (or session root metadata with `--meta`)                   |
 | `clean -f <f> \| --all`  | Discard Changes          | Discard staged changes; prompts unless `-y` is passed                       |
 | `clean --session [<id>]` | Delete Session           | Remove session folder from disk and clear shell bindings                    |
+| `sandbox [--auto\|--clear]` | Sandbox Entries | List, auto-create, or remove recorded links and support files inside `staging/` at mirrored workspace paths; entries are never proposals, and entries and proposals never overwrite each other |
+| `link --sandbox -f <path> [--target <path>]` | Sandbox Link | Symlink a workspace (or absolute) target at `staging/<path>` as a sandbox entry |
+| `copy --sandbox -f <path> [--to <path>]` | Sandbox Clone | Copy-on-write clone a workspace file or directory to `staging/<path>` as a writable, isolated entry; relative symlinks leaving a cloned directory are repointed at their real targets. `sandbox --auto --clone` clones `node_modules` instead of linking |
+| `read\|write\|create\|delete\|path\|open --sandbox -f <path>` | Sandbox Files | Operate on sandbox support files; cannot be combined with `--meta` or `--workspace`; `write --sandbox --from-workspace` seeds from the workspace; writes inside clone entries are allowed, through links they are not |
+| `exec --staging [--cwd <path>] [--sync] -- <cmd>` | Staging Run | Run in `staging/` with only sandbox entries; afterwards discard created non-entry files and revert proposal edits unless `--sync`; incompatible with `--keep-sandbox` |
 | `use --session <id>`     | Bind Shell               | Bind session to current shell process                                       |
 | `migrate --from <id>`    | Migrate                  | Copy staged files and manifest entries between sessions; without `--to`, target the active session in the current workspace or create one |
 | `set [--repo]`           | Save Settings            | Store persistent configuration                                              |

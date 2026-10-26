@@ -549,7 +549,7 @@ staged check --sandbox                    # Force check to run in Tier 3 overlay
 - **C/C++**: Virtual include flags (`-I<staging> -I<workspace>`) ensure staged headers shadow workspace headers cleanly.
 - **Java**: `-sourcepath <staging>:<workspace>` allows staged and workspace classes to compile together seamlessly.
 
-### 3. Ephemeral CoW / Hardlink Sandbox (`staged exec`)
+### 3. Ephemeral Copy-on-Write Sandbox (`staged exec`)
 
 Runs arbitrary build commands, compilers, or test suites inside `<session>/.sandbox/`:
 
@@ -560,11 +560,37 @@ staged exec -- make test                  # Run Makefile test targets
 staged exec -- pytest tests/              # Run Python test suite
 staged exec --sync -- npm run lint:fix    # Sync modified files back into staging/
 staged exec --keep-sandbox -- make build  # Retain .sandbox/ directory for debugging
+staged exec --staging --cwd apps/web -- tsc -p tsconfig.json   # Run in staging/ with only sandbox entries (see below)
 ```
 
-- **Millisecond Materialization**: Heavy directories (`node_modules`, `.venv`, `target`, `.build`, `.gradle`) are directory-symlinked; unchanged workspace files are hardlinked; staged files are copied; deletions are omitted.
+- **Isolated, Deduplicated Materialization**: Nothing in the sandbox shares storage with the workspace, so in-place edits, installs, and build output never reach it. Unchanged files are copy-on-write clones; dependency and build directories (`node_modules`, `.venv`, `dist`, `build`, `target`, `.gradle`, …) are cloned wholesale, in a single `clonefile` call on APFS. Clones share disk blocks until written, so a 2 GB `node_modules` costs about two seconds and almost no space. On filesystems without copy-on-write (for example ext4 or NTFS) these become full copies: slower, but still isolated. Relative symlinks (including pnpm's) resolve inside the sandbox; absolute symlinks into the workspace are redirected into the sandbox, except inside wholesale-cloned directories; staged files are copied; deletions are omitted.
 - **Transparent Output**: Sandbox directory paths in stdout/stderr are rewritten back to clean relative paths so build diagnostics match your workspace.
-- **Automatic Teardown**: The sandbox is completely cleaned up after command execution unless `--keep-sandbox` is passed.
+- **Automatic Teardown**: The sandbox is moved aside and deleted in the background after command execution, unless `--keep-sandbox` is passed.
+
+### 4. Sandbox Entries for Editors and Tools (`staged sandbox`)
+
+Staged files live outside the workspace, so an editor opening `<session>/staging/apps/web/src/App.tsx` cannot find the workspace's `node_modules` or `tsconfig.json`. JSX then fails with `JSX element implicitly has type 'any' because no interface 'JSX.IntrinsicElements' exists`. Sandbox entries are links and support files placed inside `staging/` at the workspace-relative path they mirror, so anything that walks up from a staged file finds them where it expects. They are recorded in `<session>/.sandbox-entries.json` and are never proposals: they stay out of diffs, apply, `fmt`, `check`, and `--list`.
+
+```bash
+staged sandbox                                         # List entries
+staged sandbox --auto                                  # Link every node_modules above each staged file; wrap the nearest tsconfig/jsconfig
+staged sandbox --auto --clone                          # Same, but node_modules become copy-on-write clones
+staged link --sandbox -f libs/ui/node_modules          # Link the same workspace path at its mirrored location
+staged copy --sandbox -f .oxlintrc.json                # Clone a workspace file or directory (writable, isolated)
+staged copy --sandbox -f configs/lint.json --to apps/web/.lintrc   # Clone to a different staging path
+staged link --sandbox -f src/generated --target /abs/codegen/out   # Link a different target
+staged create --sandbox -f apps/web/vite.config.ts --stdin < config.ts   # Support file only the sandbox uses
+staged write --sandbox -f apps/web/vite.config.ts --from-workspace --append --text '...'  # Seed from the workspace, then edit
+staged read --sandbox -f apps/web/vite.config.ts --json  # Read, path and open also accept --sandbox
+staged delete --sandbox -f apps/web/vite.config.ts     # Remove one entry; staged sandbox --clear removes all
+```
+
+- **`auto` wrappers**: the generated `tsconfig.json` extends the workspace config, includes the staged files beside it, and sets `rootDirs` so imports of unstaged workspace files resolve. A staged `tsconfig.json` is a proposal and is used as-is.
+- **Project-specific setups**: agents can add whatever a project needs, such as a Vite or Vitest config with `resolve.alias` entries pointing at workspace sources, or links to generated code.
+- **Links versus clones**: a link is free, but anything written through it lands in the workspace. A clone (`copy --sandbox`, `--auto --clone`) shares disk blocks until written, takes a few seconds for a large `node_modules`, and keeps writes in `staging/`. Relative symlinks that leave a cloned directory (pnpm workspace packages) are repointed at their workspace targets. Clone anything a command writes to, such as tool caches under `node_modules`.
+- **Running in staging (`exec --staging`)**: runs the command directly in `staging/` with only the entries you added, so there is no workspace materialization and checks start immediately. `--cwd` picks the directory and local `node_modules/.bin` and virtualenv bins from it upward are on `PATH`. Afterwards, files the command created outside entries are discarded and proposal edits are reverted unless `--sync` is passed; writes into clone entries persist until the entry is removed. Use the full `exec` sandbox when a check needs the whole workspace.
+- **Safety**: entries and proposals never overwrite each other; writing a proposal at an entry path fails until the entry is removed. `remove` and `clean --session` unlink entries without following them into the workspace.
+- **Limits**: editor ESLint still lints with default rules; use `staged check` for the project's lint configuration.
 
 ---
 
@@ -863,6 +889,7 @@ _(After `path`, `-s` means `--staged`; use `--session <id>` for session selectio
 | Session lost between agent calls    | Use persistent shells or pass `STAGED_SHELL_ID` across agent subprocess calls.               |
 | File or session is ambiguous        | Provide exact relative path or full session ID.                                              |
 | Unknown session from `staged -R`    | Use the full session UUID (or ≥8 hex chars), not a local alias, when the session belongs to another workspace. |
+| `JSX.IntrinsicElements` or missing package types in editor | Run `staged sandbox --auto`, or add project-specific entries with `staged link --sandbox` / `staged write --sandbox`. |
 | Editor launcher missing             | Ensure editor CLI is in `PATH`, switch with `staged use --tool`, or use `--tool cli`.        |
 | Agent denied write access           | Add printed staging root path to harness writable directory permissions.                     |
 | Protected or changed branch warning | Use `--force` for protected branches; use `-y` for drifted branches.                         |
