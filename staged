@@ -40,7 +40,7 @@ DEFAULT_PROTECTED_BRANCHES = []
 STATUS_COLORS = {'APPLIED': '32', 'MERGED': '1;32', 'UNDONE': '1;36', 'MODIFIED': '33', 'NEW FILE': '36',
                  'RENAMED': '35', 'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
 STATUS_ORDER = ('MISSING', 'NEW FILE', 'MODIFIED', 'RENAMED', 'RELOCATED', 'DELETED', 'APPLIED')
-COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'init', 'diff', 'tui', 'feedback', 'apply', 'undo', 'fmt', 'check', 'exec', 'sandbox', 'link', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
+COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'intent', 'init', 'diff', 'tui', 'feedback', 'apply', 'undo', 'fmt', 'check', 'exec', 'sandbox', 'link', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
 
 
 def is_reserved_windows_name(name):
@@ -50,7 +50,7 @@ def is_reserved_windows_name(name):
     if hasattr(ntpath, 'isreserved'):
         return ntpath.isreserved(name)
     return PureWindowsPath(name).is_reserved()
-MANAGED_METADATA = ('session.json', 'renames.json', 'summaries.json', 'feedback.json')
+MANAGED_METADATA = ('session.json', 'renames.json', 'summaries.json', 'intent.json', 'feedback.json')
 SUGGESTED_METADATA = ('staged_changes.md', 'diff_viewer.md')
 META_FILE_COMMANDS = ('read', 'write', 'create', 'copy', 'rename', 'delete', 'path', 'open')
 SANDBOX_FILE_COMMANDS = ('read', 'write', 'create', 'copy', 'delete', 'link', 'path', 'open')
@@ -74,8 +74,17 @@ def color(text, code):
     return '\033[{}m{}\033[0m'.format(code, text) if color_enabled() else str(text)
 
 
+STATUS_WIDTH = max(len(status) for status in STATUS_COLORS)
+
+
 def status_token(status, width=0):
-    return color('[{}]'.format(status.ljust(width)), STATUS_COLORS[status])
+    """`[STATUS]`, padded after the bracket to `width` status characters so paths line up."""
+    return color('[{}]'.format(status), STATUS_COLORS[status]) + ' ' * max(0, width - len(status))
+
+
+def status_row(status, rel, indent=''):
+    """One file row: `[STATUS]` aligned to the widest status, then the path."""
+    return '{}{} {}'.format(indent, status_token(status, STATUS_WIDTH), rel)
 
 
 def load_json(path):
@@ -377,8 +386,32 @@ class Session:
     def save_summaries(self, data):
         save_json(safe_path(self.directory, 'summaries.json'), data)
 
+    def intent(self):
+        """The original request behind this session: text, related references and timestamps."""
+        data = load_json(safe_path(self.directory, 'intent.json'))
+        if not isinstance(data.get('text', ''), str):
+            raise StagedError('intent.json requires a text string.')
+        refs = data.get('refs', [])
+        if not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs):
+            raise StagedError('intent.json refs must be a list of strings.')
+        for key in ('recorded_at', 'updated_at'):
+            if data.get(key) is not None and not isinstance(data[key], (int, float)):
+                raise StagedError('intent.json {} must be a timestamp.'.format(key))
+        data.setdefault('text', '')
+        data['refs'] = refs
+        return data
+
+    def save_intent(self, data):
+        path = safe_path(self.directory, 'intent.json')
+        if not data.get('text') and not data.get('refs'):
+            if path.exists():
+                path.unlink()
+            return
+        save_json(path, data)
+
     def modified(self):
-        paths = [self.staging, self.directory / 'session.json', self.directory / 'renames.json', self.directory / 'summaries.json'] + list(self.files().values())
+        paths = [self.staging, self.directory / 'session.json', self.directory / 'renames.json', self.directory / 'summaries.json',
+                 self.directory / 'intent.json'] + list(self.files().values())
         return max(p.stat().st_mtime for p in paths if not p.is_symlink() and p.exists())
 
     def files(self, fresh=False):
@@ -481,7 +514,7 @@ def levenshtein(a, b):
     return previous[-1]
 
 
-def match_file(query, paths):
+def match_file(query, paths, label='staged file'):
     paths = sorted(paths)
     if query in paths:
         return query
@@ -502,7 +535,7 @@ def match_file(query, paths):
     if len(candidates) != 1:
         if candidates:
             raise StagedError('Ambiguous file {!r}; use an exact path:\n  {}'.format(query, '\n  '.join(candidates)))
-        raise StagedError('No staged file matched {!r}.'.format(query))
+        raise StagedError('No {} matched {!r}.'.format(label, query))
     return candidates[0]
 
 
@@ -692,8 +725,39 @@ def summary_text(value):
     return ' '.join(value.split()) or '(no summary yet)'
 
 
+# Human output layout: headings at column 0, file rows at column 2, and anything nested
+# 4 columns deeper than its parent. Labels end in a colon and line up within a block.
+ROW_INDENT = '  '
+NESTED = '    '
+
+
+def text_width(indent):
+    return max(40, min(100, shutil.get_terminal_size((100, 24)).columns) - len(indent))
+
+
+def heading_line(label, value):
+    return '{} {}'.format(color(label, '1'), color(value, '1;36'))
+
+
+def label_lines(pairs, indent=''):
+    """Aligned `Label:  value` lines; a list value continues under the first, wrapped to the terminal."""
+    width = max(len(pair[0]) for pair in pairs) + 2
+    lines = []
+    for label, value, *code in pairs:
+        values = value if isinstance(value, list) else [value]
+        pad = indent + ' ' * (width + 1)
+        first = True
+        for item in values or ['']:
+            wrapped = textwrap.wrap(str(item), text_width(pad), break_long_words=False, break_on_hyphens=False) or ['']
+            for line in wrapped:
+                text = color(line, code[0]) if code and code[0] else line
+                lines.append((indent + color((label + ':').ljust(width), '1') + ' ' if first else pad) + text)
+                first = False
+    return lines
+
+
 def show_session_summary(session, summaries):
-    print('{} {}'.format(color('Session', '1'), color(session.id, '1;36')), flush=True)
+    print(heading_line('Session', session.id), flush=True)
     show_summary_text(summaries['session'])
 
 
@@ -731,14 +795,7 @@ def update_summary(session, args):
         raise StagedError('Nothing to write; pass --message, --stdin or --clear. View summaries with staged --summary.')
     if args.session_message is not None and args.file is None:
         raise StagedError('--session-message requires a file summary update with --file.')
-    value = args.message
-    if args.stdin:
-        if sys.stdin.isatty():
-            raise StagedError('--stdin requires piped or redirected input; use --message for inline content.')
-        try:
-            value = sys.stdin.buffer.read().decode('utf-8')
-        except UnicodeDecodeError as exc:
-            raise StagedError('Summary input must be UTF-8: {}'.format(exc))
+    value = read_message_arg(args, 'Summary')
     value = '' if args.clear else value.strip()
     if args.file is None:
         summaries['session'] = value
@@ -755,12 +812,11 @@ def update_summary(session, args):
         print('Updated summary: ' + (args.file or session.id))
 
 
-def wrapped_summary(value, indent='    '):
+def wrapped_summary(value, indent=NESTED):
     text = summary_text(value)
     if not value.strip():
         return color(indent + text, '2')
-    width = max(40, min(100, shutil.get_terminal_size((100, 24)).columns) - len(indent))
-    lines = textwrap.wrap(text, width) or [text]
+    lines = textwrap.wrap(text, text_width(indent)) or [text]
     return color('\n'.join(indent + line for line in lines), '36')
 
 
@@ -780,6 +836,9 @@ def show_summaries(session, target, as_json=False):
                               'summary': summaries['files'].get(target, '')}))
         return
     if target is None:
+        intent = session.intent()
+        if intent['text'] or intent['refs']:
+            show_intent_block(session, intent)
         show_session_summary(session, summaries)
         if not paths:
             print(color('No staged changes yet.', '2'))
@@ -788,41 +847,180 @@ def show_summaries(session, target, as_json=False):
         if previous is not None and status != previous:
             print(flush=True)
         previous = status
-        print('{} {}'.format(status_token(status, width=9) if status else '', color(rel, '1')).strip())
-        show_summary_text(summaries['files'].get(rel, ''))
+        if status:
+            print(status_row(status, color(rel, '1'), ROW_INDENT))
+        else:
+            print(ROW_INDENT + color(rel, '1'))
+        show_summary_text(summaries['files'].get(rel, ''), indent=ROW_INDENT + NESTED)
 
 
-def overview(ctx, session):
+def read_message_arg(args, label):
+    """Return -m/--stdin text for a write command, or None when neither was given."""
+    if not getattr(args, 'stdin', False):
+        return args.message
+    if sys.stdin.isatty():
+        raise StagedError('--stdin requires piped or redirected input; use --message for inline content.')
+    try:
+        return sys.stdin.buffer.read().decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise StagedError('{} input must be UTF-8: {}'.format(label, exc))
+
+
+def update_intent(session, args):
+    intent = session.intent()
+    adding = [ref.strip() for ref in (args.ref or []) if ref.strip()]
+    removing = [ref.strip() for ref in (getattr(args, 'remove_ref', None) or [])]
+    if not (args.message is not None or args.stdin or args.clear or adding or removing):
+        raise StagedError('Nothing to write; pass --message, --stdin, --ref, --remove-ref or --clear. '
+                          'View the intent with staged --intent.')
+    now = time.time()
+    if args.clear:
+        intent = {'text': '', 'refs': []}
+    value = read_message_arg(args, 'Intent')
+    if value is not None:
+        intent['text'] = value.strip()
+    missing = [ref for ref in removing if ref not in intent['refs']]
+    if missing:
+        raise StagedError('Intent has no reference: ' + ', '.join(missing))
+    intent['refs'] = [ref for ref in intent['refs'] if ref not in removing]
+    intent['refs'] += [ref for ref in dict.fromkeys(adding) if ref not in intent['refs']]
+    if intent['text'] or intent['refs']:
+        intent.setdefault('recorded_at', now)
+        intent['updated_at'] = now
+    session.save_intent(intent)
+    if getattr(args, 'quiet', False):
+        return
+    if args.json:
+        print(json.dumps(session.intent()))
+    else:
+        print(('Cleared intent: ' if not (intent['text'] or intent['refs']) else 'Updated intent: ') + session.id)
+
+
+def format_timestamp(value):
+    return time.strftime('%Y-%m-%d %H:%M', time.localtime(value)) if value else None
+
+
+def show_intent_block(session, intent, indent=NESTED):
+    print(heading_line('Intent', session.id), flush=True)
+    if intent['text']:
+        for paragraph in intent['text'].splitlines():
+            lines = textwrap.wrap(paragraph, text_width(indent)) if paragraph.strip() else ['']
+            print(color('\n'.join(indent + line for line in lines), '35'), flush=True)
+    else:
+        print(color(indent + '(no intent recorded)', '2'), flush=True)
+    pairs = []
+    if intent['refs']:
+        pairs.append(('Refs', intent['refs'], '4;34'))
+    recorded = format_timestamp(intent.get('recorded_at'))
+    if recorded:
+        pairs.append(('Recorded', recorded, '2'))
+    updated = format_timestamp(intent.get('updated_at'))
+    if updated and updated != recorded:
+        pairs.append(('Updated', updated, '2'))
+    if session.metadata.get('branch'):
+        pairs.append(('Branch', '{}'.format(session.metadata['branch']), '2'))
+    if pairs:
+        for line in label_lines(pairs, indent):
+            print(line, flush=True)
+    print(flush=True)
+
+
+def show_intent(session, as_json=False):
+    intent = session.intent()
+    if as_json:
+        print(json.dumps(dict(intent, session=session.id, branch=session.metadata.get('branch'))))
+        return
+    show_intent_block(session, intent)
+    if not (intent['text'] or intent['refs']):
+        print(color('Record it with: staged intent -m "<original request>" --ref <PR/MR/issue URL>', '2'))
+
+
+def list_sessions(sessions, as_json=False):
+    rows = []
+    for session in sessions:
+        count = len(session.paths())
+        rows.append({'session': session.id, 'workspace': str(session.workspace),
+                     'workspace_exists': session.workspace.is_dir(), 'staging': str(session.staging),
+                     'changes': count, 'branch': session.metadata.get('branch'),
+                     'summary': session.summaries()['session'], 'intent': session.intent()})
+    if as_json:
+        print(json.dumps(rows))
+        return
+    id_width = max((len(row['session']) for row in rows), default=0)
+    for index, row in enumerate(rows):
+        if index:
+            print()
+        count = '{} {}'.format(row['changes'], 'change' if row['changes'] == 1 else 'changes')
+        workspace = row['workspace'] + ('' if row['workspace_exists'] else ' (workspace not found)')
+        print('{}  {}  {}'.format(color(row['session'].ljust(id_width), '1;36'), color(count.ljust(10), '33'),
+                                  color(workspace, '1')))
+        pairs = [('Staging', row['staging'], '2')]
+        intent = row['intent']
+        if intent['text']:
+            text = summary_text(intent['text'])
+            pairs.append(('Intent', text if len(text) <= 160 else text[:157] + '...', '35'))
+        if intent['refs']:
+            pairs.append(('Refs', intent['refs'], '4;34'))
+        pairs.append(('Summary', summary_text(row['summary']), '36' if row['summary'].strip() else '2'))
+        for line in label_lines(pairs, NESTED):
+            print(line)
+
+
+def overview_data(ctx, session):
+    branch = get_git_branch(session.workspace)
+    summaries = session.summaries()
+    files = []
+    for status, rel in grouped_by_status(session, session.paths()):
+        path = safe_path(session.staging, rel)
+        stats = file_diff_stats(session, rel)
+        files.append({'path': rel, 'status': status, 'summary': summaries['files'].get(rel, ''),
+                      'staged': str(path) if path.exists() else None, 'workspace': str(session.original(rel)),
+                      'added': stats[0], 'removed': stats[1]})
+    return {'session': session.id, 'workspace': str(session.workspace), 'staging': str(session.staging),
+            'tool': ctx.tool().id, 'branch': branch, 'origin_branch': session.metadata.get('branch'),
+            'intent': session.intent(), 'summary': summaries['session'], 'files': files}
+
+
+def overview(ctx, session, as_json=False):
+    if as_json:
+        print(json.dumps(overview_data(ctx, session)))
+        session.refresh_index()
+        return
     branch = get_git_branch(session.workspace)
     protected = ctx.setting('branch_protection', True) and is_branch_protected(branch, ctx.setting('protected_branches', DEFAULT_PROTECTED_BRANCHES))
-    for label, value in [('Repository:', session.workspace), ('Active Session:', color(session.id, '36')),
-                         ('Active Tool:', color(ctx.tool().name, '36')),
-                         ('Git Branch:', color(branch or '(not a Git repository)', '31' if protected else '32')),
-                         ('Staging:', session.staging)]:
-        print('{} {}'.format(color('{:15}'.format(label), '1'), value))
+    for line in label_lines([('Repository', str(session.workspace)), ('Session', session.id, '36'),
+                             ('Tool', ctx.tool().name, '36'),
+                             ('Branch', branch or '(not a Git repository)', '31' if protected else '32'),
+                             ('Staging', str(session.staging))]):
+        print(line)
+    print(flush=True)
     summaries = session.summaries() if ctx.args.verbose else None
     if summaries is not None:
+        intent = session.intent()
+        if intent['text'] or intent['refs']:
+            show_intent_block(session, intent)
         show_session_summary(session, summaries)
     paths = session.paths()
     if not paths:
-        print('No staged changes yet.')
+        print(color('No staged changes yet.', '2'))
     previous = None
     for status, rel in grouped_by_status(session, paths):
-        if previous is None:
-            if summaries is None:
-                print(flush=True)
-        elif status != previous:
+        if previous is not None and status != previous:
             print(flush=True)
         previous = status
-        print('  {} {}'.format(status_token(status, width=9), rel))
+        print(status_row(status, rel, ROW_INDENT))
         if ctx.args.verbose:
-            show_summary_text(summaries['files'].get(rel, ''), separate=False)
+            nested = ROW_INDENT + NESTED
+            show_summary_text(summaries['files'].get(rel, ''), indent=nested, separate=False)
             path = safe_path(session.staging, rel)
-            print('    Staged:    {}'.format(path if path.exists() else '(deletion)'))
-            print('    Workspace: {}'.format(session.original(rel)))
-            print('    Changes:   {}'.format(format_diff_stats(session, rel)))
+            pairs = [('Staged', str(path) if path.exists() else '(deletion)'),
+                     ('Workspace', str(session.original(rel))),
+                     ('Changes', format_diff_stats(session, rel))]
             if path.exists():
-                print('    Size: {} bytes; modified: {}'.format(path.stat().st_size, time.ctime(path.stat().st_mtime)))
+                pairs += [('Size', '{} bytes'.format(path.stat().st_size)),
+                          ('Modified', time.ctime(path.stat().st_mtime))]
+            for line in label_lines(pairs, nested):
+                print(line)
             print(flush=True)
     session.refresh_index()
 
@@ -867,23 +1065,47 @@ def resolve_meta_alias(target, paths):
     return target
 
 
+def resolve_location(session, query, where='staged', must_exist=False):
+    """Resolve `-f` for `path` and `open` to (name, absolute path).
+
+    `where` is staged (default), workspace, meta or sandbox. Every kind accepts the same fuzzy
+    matching as `diff -f`: exact path, case-insensitive path, file name, subsequence, then a close
+    spelling. A --meta name that matches nothing may be a file that does not exist yet.
+    """
+    if where == 'sandbox':
+        rel = match_file(query, session.sandbox_entries(), 'sandbox entry')
+        return rel, session.staging / rel
+    if where == 'meta':
+        names = session.openable_paths(meta=True)
+        query = resolve_meta_alias(query, names)
+        try:
+            rel = match_file(query, names, 'session file')
+        except StagedError as exc:
+            if must_exist or str(exc).startswith('Ambiguous'):
+                raise
+            rel = query  # A new metadata file: range_path validates the name.
+        return rel, range_path(session, rel, meta=True)
+    rel = match_file(query, session.paths())
+    if where == 'workspace':
+        return rel, session.original(rel)
+    if rel in session.deletions:
+        raise StagedError('Deletion has no staged file; use --workspace: ' + rel)
+    return rel, safe_path(session.staging, rel)
+
+
+def location_kind(args):
+    for kind in ('workspace', 'meta', 'sandbox'):
+        if getattr(args, kind, False):
+            return kind
+    return 'staged'
+
+
 def open_file(ctx, session, target):
-    if getattr(ctx.args, 'sandbox', False):
-        path = range_path(session, target, sandbox=True)
-        print('Open: {}'.format(target), flush=True)
-        run_editor(ctx.tool().get_open_command(path))
-        return
-    meta = ctx.args.meta
-    paths = session.openable_paths(fresh=True, meta=meta)
-    if not paths:
-        raise StagedError('No {} files to open.'.format('metadata' if meta else 'staged'))
-    rel = match_file(resolve_meta_alias(target, paths) if meta else target, paths)
-    path = safe_path(session.directory if meta else session.staging, rel)
-    if not path.is_file():
+    rel, path = resolve_location(session, target, location_kind(ctx.args), must_exist=True)
+    if not path.exists():
         raise StagedError('File does not exist: ' + str(path))
-    tool = ctx.tool()
     print('Open: {}'.format(rel), flush=True)
-    run_editor(tool.get_open_command(path))
+    run_editor(ctx.tool().get_open_command(path))
 
 
 def guard_apply(ctx, session):
@@ -1309,37 +1531,41 @@ def create_backup_dir(session):
     return backup_id, bdir
 
 
+def begin_backup(session, rels):
+    """Snapshot workspace paths before an apply so `staged undo` can restore them."""
+    backup_id, bdir = create_backup_dir(session)
+    entries = []
+    for p_rel in dict.fromkeys(rels):
+        ws_path = safe_path(session.workspace, p_rel)
+        existed = ws_path.is_file()
+        if existed:
+            copy_atomic(ws_path, safe_path(bdir / 'files', p_rel))
+        entries.append({
+            'path': p_rel,
+            'existed': existed,
+            'sha256_before': file_sha256(ws_path) if existed else None,
+            'sha256_after': None,
+            'mode': file_mode(ws_path) if existed else None,
+        })
+    return backup_id, bdir, entries
+
+
+def finish_backup(session, backup_id, bdir, entries):
+    for entry in entries:
+        ws_path = safe_path(session.workspace, entry['path'])
+        entry['sha256_after'] = file_sha256(ws_path) if ws_path.is_file() else None
+    save_json(bdir / 'backup.json', {'id': backup_id, 'created_at': time.time(), 'entries': entries})
+
+
 def apply_changes(ctx, session, target):
     paths = selected(session, target)
     preflight(session, paths)
     guard_apply(ctx, session)
     plan = plan_apply_changes(ctx, session, paths)
 
-    backup_id, bdir = create_backup_dir(session)
-    backup_files_root = bdir / 'files'
-    recorded_paths = []
-    seen_paths = set()
-
-    for item in plan:
-        rel = item['rel']
-        orig_rel = item['orig_rel']
-        for p_rel in ([orig_rel, rel] if orig_rel != rel else [rel]):
-            if p_rel in seen_paths:
-                continue
-            seen_paths.add(p_rel)
-            ws_path = safe_path(session.workspace, p_rel)
-            existed = ws_path.is_file()
-            sha_before = file_sha256(ws_path) if existed else None
-            mode_before = file_mode(ws_path) if existed else None
-            if existed:
-                copy_atomic(ws_path, safe_path(backup_files_root, p_rel))
-            recorded_paths.append({
-                'path': p_rel,
-                'existed': existed,
-                'sha256_before': sha_before,
-                'sha256_after': None,
-                'mode': mode_before,
-            })
+    backup_id, bdir, recorded_paths = begin_backup(
+        session, [p for item in plan for p in (item['orig_rel'], item['rel'])])
+    results = []
 
     for item in plan:
         rel = item['rel']
@@ -1352,7 +1578,7 @@ def apply_changes(ctx, session, target):
             if dest.exists():
                 dest.unlink()
             remove_base_snapshot(session, rel)
-            print(status_token('DELETED') + ' ' + rel)
+            results.append(('DELETED', rel))
         elif action == 'merge':
             write_bytes_atomic(dest, item['merged_bytes'], mode=item['mode'])
             if old != dest and old.is_file():
@@ -1360,28 +1586,25 @@ def apply_changes(ctx, session, target):
                 remove_base_snapshot(session, orig_rel)
             write_bytes_atomic(item['staged'], item['merged_bytes'], mode=item['mode'])
             record_base_snapshot(session, rel, reset=True)
-            print(status_token('MERGED') + ' ' + rel)
+            results.append(('MERGED', rel))
         elif action == 'apply':
             copy_atomic(item['staged'], dest)
             if old != dest and old.is_file():
                 old.unlink()
                 remove_base_snapshot(session, orig_rel)
             record_base_snapshot(session, rel, reset=True)
-            print(status_token('APPLIED') + ' ' + rel)
+            results.append(('APPLIED', rel))
         elif action == 'noop':
             record_base_snapshot(session, rel, reset=True)
-            print(status_token('APPLIED') + ' ' + rel)
+            results.append(('APPLIED', rel))
 
-    for entry in recorded_paths:
-        ws_path = safe_path(session.workspace, entry['path'])
-        entry['sha256_after'] = file_sha256(ws_path) if ws_path.is_file() else None
-
-    save_json(bdir / 'backup.json', {
-        'id': backup_id,
-        'created_at': time.time(),
-        'entries': recorded_paths,
-    })
+    finish_backup(session, backup_id, bdir, recorded_paths)
     session.refresh_index()
+    if not getattr(ctx.args, 'json', False):
+        for status, rel in results:
+            print(status_row(status, rel))
+    return {'session': session.id, 'backup': backup_id,
+            'applied': [{'path': rel, 'status': status} for status, rel in results]}
 
 
 def list_backups(session):
@@ -1459,7 +1682,7 @@ def undo_apply(ctx, session):
         }))
     else:
         for rel in restored_paths:
-            print(status_token('UNDONE') + ' ' + rel)
+            print(status_row('UNDONE', rel))
 
 # ===========================================================================
 # Diff Line Stats, Virtual Buffer Formatter, Overlay Checker & Sandbox Exec
@@ -3473,8 +3696,8 @@ def configure_feedback_parser(parser):
     parser.add_argument('--all-comments', action='store_true', help='include resolved comments in --prompt output')
 
     parser.add_argument('--add', action='store_true', help='add a new inline code review comment')
-    parser.add_argument('--start-line', type=int, help='1-based start line for --add')
-    parser.add_argument('--end-line', type=int, help='1-based inclusive end line for --add (default: start-line)')
+    parser.add_argument('--start-line', type=positive, help='one-based first line for --add')
+    parser.add_argument('--end-line', type=positive, help='one-based inclusive last line for --add (default: --start-line)')
     parser.add_argument('--side', choices=list(VALID_SIDES), default='staged',
                         help='target side for --add (default: staged)')
     parser.add_argument('--select', dest='snippet_focus', help='specific substring/token within the line range to highlight')
@@ -3669,18 +3892,39 @@ def extract_selectable_tokens(line):
 
 
 def compute_intraline_spans(left_line, right_line):
+    """Character spans of the words that differ between two versions of a line.
+
+    Compares whole words, spaces and punctuation rather than characters so emphasis lands on
+    readable units; a line that is mostly rewritten gets no emphasis because its tint says enough.
+    """
     if not left_line or not right_line:
         return ([(0, len(left_line))] if left_line else []), ([(0, len(right_line))] if right_line else [])
-    matcher = difflib.SequenceMatcher(None, left_line, right_line)
+    pattern = re.compile(r'\w+|\s+|[^\w\s]')
+    left_tokens = [m.span() for m in pattern.finditer(left_line)]
+    right_tokens = [m.span() for m in pattern.finditer(right_line)]
+    matcher = difflib.SequenceMatcher(None, [left_line[a:b] for a, b in left_tokens],
+                                      [right_line[a:b] for a, b in right_tokens], autojunk=False)
+    if matcher.ratio() < 0.4:
+        return [], []
     left_spans = []
     right_spans = []
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag != 'equal':
             if i2 > i1:
-                left_spans.append((i1, i2))
+                left_spans.append((left_tokens[i1][0], left_tokens[i2 - 1][1]))
             if j2 > j1:
-                right_spans.append((j1, j2))
+                right_spans.append((right_tokens[j1][0], right_tokens[j2 - 1][1]))
     return left_spans, right_spans
+
+
+def wrap_points(text, width, limit):
+    """Chunk start offsets for soft-wrapping `text[:limit]`, preferring breaks after spaces."""
+    starts = [0]
+    while limit - starts[-1] > width:
+        start = starts[-1]
+        cut = text.rfind(' ', start + width // 2, start + width)
+        starts.append(cut + 1 if cut != -1 else start + width)
+    return starts
 
 
 def compute_diff_hunks(orig_lines, staged_lines):
@@ -3822,98 +4066,245 @@ def file_line_delta(session, rel_path):
     return added, removed
 
 
-def apply_hunk(session, rel_path, hunk_index=0):
+class _TuiApplyContext:
+    """Apply settings for TUI actions: the in-TUI prompt is the confirmation, and --force is never implied."""
+
+    def __init__(self, ctx=None):
+        self.args = argparse.Namespace(force=False, yes=True, no_merge=False, verbose=False, file=None, all=False)
+        self._ctx = ctx
+
+    def setting(self, key, default=None):
+        return self._ctx.setting(key, default) if self._ctx is not None else default
+
+
+def _join_line_pieces(pieces):
+    """Join keepends lines, adding a newline where a final unterminated line is no longer last."""
+    out = []
+    for index, piece in enumerate(pieces):
+        if index < len(pieces) - 1 and not piece.endswith(('\n', '\r')):
+            piece += '\r\n' if any(p.endswith('\r\n') for p in pieces) else '\n'
+        out.append(piece)
+    return ''.join(out)
+
+
+def apply_hunk(session, rel_path, hunk_index=0, ctx=None):
+    """Apply one diff hunk of a staged file to the workspace, recording a backup for `staged undo`."""
     safe_path(session.staging, rel_path)
-    if rel_path in getattr(session, 'deletions', []):
+    if rel_path in session.deletions:
         raise StagedError('Cannot apply a single hunk of a full-file deletion; apply the file instead.')
     staged_file = safe_path(session.staging, rel_path)
     if not staged_file.is_file():
         raise StagedError('Missing staged file: {}'.format(rel_path))
-
     dest_file = safe_path(session.workspace, rel_path)
-    orig_raw = dest_file.read_text(encoding='utf-8', errors='replace') if dest_file.is_file() else ''
-    staged_raw = staged_file.read_text(encoding='utf-8', errors='replace')
+    if session.original(rel_path) != dest_file:
+        raise StagedError('Hunks apply in place only; apply the whole file for a rename: ' + rel_path)
+    guard_apply(_TuiApplyContext(ctx), session)
+    try:
+        orig_raw = dest_file.read_bytes().decode('utf-8') if dest_file.is_file() else ''
+        staged_raw = staged_file.read_bytes().decode('utf-8')
+    except UnicodeDecodeError:
+        raise StagedError('Hunk apply needs UTF-8 text; apply the whole file instead: ' + rel_path) from None
 
-    orig_lines = orig_raw.splitlines()
-    staged_lines = staged_raw.splitlines()
-    hunks = compute_diff_hunks(orig_lines, staged_lines)
+    hunks = compute_diff_hunks(orig_raw.splitlines(), staged_raw.splitlines())
     if not hunks:
         return False
     if hunk_index < 0 or hunk_index >= len(hunks):
         raise StagedError('Hunk index {} out of range (0..{}).'.format(hunk_index, len(hunks) - 1))
-
-    target_hunk = hunks[hunk_index]
-    new_lines = (
-        orig_lines[:target_hunk['orig_start']]
-        + staged_lines[target_hunk['staged_start']:target_hunk['staged_end']]
-        + orig_lines[target_hunk['orig_end']:]
-    )
-    trailing_newline = staged_raw.endswith('\n') or orig_raw.endswith('\n') or bool(new_lines)
-    new_content = '\n'.join(new_lines) + ('\n' if trailing_newline and new_lines else '')
-    write_text_file(dest_file, new_content)
-    if hasattr(session, 'refresh_index'):
-        session.refresh_index()
+    hunk = hunks[hunk_index]
+    # Keep each line's own terminator so CRLF files and a missing final newline survive the splice.
+    orig_keep = orig_raw.splitlines(keepends=True)
+    staged_keep = staged_raw.splitlines(keepends=True)
+    content = _join_line_pieces(orig_keep[:hunk['orig_start']]
+                                + staged_keep[hunk['staged_start']:hunk['staged_end']]
+                                + orig_keep[hunk['orig_end']:])
+    backup_id, bdir, entries = begin_backup(session, [rel_path])
+    mode = file_mode(dest_file) if dest_file.is_file() else file_mode(staged_file)
+    write_bytes_atomic(dest_file, content.encode('utf-8'), mode=mode)
+    finish_backup(session, backup_id, bdir, entries)
+    session.refresh_index()
     return True
 
 
-def apply_file_from_tui(session, rel_path):
-    dest = safe_path(session.workspace, rel_path)
-    old = session.original(rel_path) if hasattr(session, 'original') else dest
-    if rel_path in getattr(session, 'deletions', []):
-        if dest.exists():
-            dest.unlink()
-    else:
-        source = safe_path(session.staging, rel_path)
-        if not source.is_file():
-            raise StagedError('Missing staged file: {}'.format(rel_path))
-        copy_atomic(source, dest)
-        if old != dest and old.is_file():
-            old.unlink()
-    if hasattr(session, 'refresh_index'):
-        session.refresh_index()
-    return session.status(rel_path)
+def apply_file_from_tui(session, rel_path, ctx=None):
+    """Apply one proposed file with the same checks, merge and undo backup as `staged apply -f`."""
+    output = io.StringIO()
+    stdout = sys.stdout
+    sys.stdout = output  # apply_changes reports on stdout; curses owns the screen.
+    try:
+        apply_changes(_TuiApplyContext(ctx), session, rel_path)
+    finally:
+        sys.stdout = stdout
+    lines = [line for line in output.getvalue().splitlines() if line.strip()]
+    status = re.sub(r'\x1b\[[0-9;]*m', '', lines[-1]).split(']')[0].lstrip('[').strip() if lines else ''
+    return status or session.status(rel_path)
+
+
+def branch_drift_note(session):
+    """Describe a change from the session's original branch, for apply prompts."""
+    branch = get_git_branch(session.workspace)
+    origins = {session.metadata.get('branch')}
+    origins.update(item.get('branch') for item in session.metadata.get('migrated_from', []))
+    drifted = sorted(origin for origin in origins if origin and origin != branch)
+    return " Branch changed from '{}' to '{}'.".format(', '.join(drifted), branch) if drifted else ''
+
+
+TUI_KEYS = [
+    ('NAVIGATION', [
+        ('j / k  (Down / Up)', 'Move the cursor one line'),
+        ('Ctrl-d / Ctrl-u  (PgDn / PgUp)', 'Move half a page'),
+        ('g / G', 'Jump to the first / last line'),
+        ('n / p', 'Jump to the next / previous hunk'),
+        ('J / K', 'Open the next / previous file'),
+        ('Tab', 'Switch focus between the file list and the diff'),
+        ('Enter', 'Open the file (file list) or expand a fold (diff)'),
+    ]),
+    ('VIEW', [
+        ('u', 'Toggle side-by-side / unified diff'),
+        ('z  (Enter on a fold)', 'Fold or expand unchanged lines'),
+        ('W', 'Wrap or truncate long lines'),
+        ('[ / ]  (Left / Right)', 'Comment on the workspace / staged side; cycles tokens while one is selected'),
+        ('b', 'Show or hide the file list'),
+        ('i', 'Show intent, session summary and file details'),
+        ('H', 'Toggle syntax highlighting (needs pygments)'),
+        ('R', 'Reload files, summaries and comments from disk'),
+    ]),
+    ('CODE REVIEW & INLINE FEEDBACK', [
+        ('v  (Space)', 'Start or clear a multi-line selection'),
+        ('w', 'Select a token or expression on the current line'),
+        ('c  (Enter with a selection)', 'Comment on the selection (saved to feedback.json)'),
+        ('r', 'Resolve or reopen the comment at the cursor'),
+        ('x', 'Delete the comment at the cursor (asks first)'),
+        ('y', 'Copy open comments to the clipboard as an agent prompt'),
+    ]),
+    ('APPLY TO WORKSPACE', [
+        ('a', 'Apply the hunk at the cursor (the whole file from the file list); asks first'),
+        ('A', 'Apply the whole current file; asks first'),
+        ('', 'Applies keep a backup: run staged undo to roll back the latest one'),
+    ]),
+    ('GENERAL', [
+        ('?', 'Show or hide this reference'),
+        ('q  (Esc)', 'Close this panel, or quit'),
+    ]),
+]
+
+TUI_HINTS = {
+    'files': [('j/k', 'file'), ('Enter', 'open'), ('a', 'apply file'), ('Tab', 'diff'), ('i', 'info'), ('?', 'help'), ('q', 'quit')],
+    'diff': [('j/k', 'line'), ('n/p', 'hunk'), ('J/K', 'file'), ('v', 'select'), ('c', 'comment'),
+             ('a', 'apply hunk'), ('z', 'fold'), ('i', 'info'), ('?', 'help'), ('q', 'quit')],
+}
+
+
+class StyledLine:
+    """A frame line plus (start, length, style) spans; later spans draw over earlier ones."""
+
+    def __init__(self, text='', style=None):
+        self.text = ''
+        self.spans = []
+        if text:
+            self.add(text, style)
+
+    def add(self, text, style=None):
+        text = str(text)
+        if style and text:
+            self.spans.append((len(self.text), len(text), style))
+        self.text += text
+        return self
+
+    def mark(self, start, length, style):
+        if length > 0 and style:
+            self.spans.append((start, length, style))
+        return self
+
+    def extend(self, other):
+        offset = len(self.text)
+        self.text += other.text
+        self.spans.extend((offset + start, length, style) for start, length, style in other.spans)
+        return self
+
+    def fit(self, width, style=None):
+        out = StyledLine()
+        out.text = self.text[:width].ljust(width)
+        if style:
+            out.spans.append((0, width, style))
+        out.spans.extend((start, min(length, width - start), s) for start, length, s in self.spans if start < width)
+        return out
+
+
+TUI_CONTEXT_LINES = 3
+
+
+def fold_unchanged_rows(rows, hunks, keep=lambda row: False, context=TUI_CONTEXT_LINES):
+    """Collapse long unchanged runs into one fold row, keeping `context` lines around each hunk."""
+    out = []
+    i = 0
+    while i < len(rows):
+        if rows[i]['kind'] != 'equal':
+            out.append(rows[i])
+            i += 1
+            continue
+        j = i
+        while j < len(rows) and rows[j]['kind'] == 'equal':
+            j += 1
+        run = rows[i:j]
+        lead = 0 if i == 0 else context
+        trail = 0 if j == len(rows) else context
+        hidden = run[lead:len(run) - trail]
+        if len(hidden) > 1 and not any(keep(row) for row in hidden):
+            out.extend(run[:lead])
+            out.append({'kind': 'fold', 'count': len(hidden), 'hunk_index': None, 'prefix': ' ', 'text': '',
+                        'left_lineno': None, 'right_lineno': None, 'left_text': None, 'right_text': None,
+                        'left_spans': [], 'right_spans': [], 'first_left': hidden[0]['left_lineno']})
+            out.extend(run[len(run) - trail:])
+        else:
+            out.extend(run)
+        i = j
+    seen = set()
+    for index, row in enumerate(out):
+        if row.get('hunk_index') is not None and row['hunk_index'] not in seen:
+            seen.add(row['hunk_index'])
+            hunks[row['hunk_index']]['first_row'] = index
+    return out, hunks
+
+
+def _clip_path(path, width):
+    return path if len(path) <= width else '…' + path[-max(1, width - 1):]
 
 
 class TuiState:
-    """Pure state machine and frame renderer for the 2-Pane Interactive Diff TUI."""
+    """Pure state machine and frame renderer for the 2-pane interactive diff TUI."""
 
     def __init__(self, session, target_file=None, ctx=None, clipboard_runner=None):
         self.session = session
         self.ctx = ctx
         self.clipboard_runner = clipboard_runner
         self.branch = get_git_branch(session.workspace) or '(detached)'
-
-        try:
-            import pygments
-            has_pygments = True
-        except ImportError:
-            has_pygments = False
+        self.has_pygments = self._pygments_available()
 
         self.show_sidebar = True
         self.focus_pane = 'diff'
         self.diff_mode = 'side-by-side'
-        self.syntax_highlight = has_pygments
-        self.show_help = False
+        self.fold_context = True
+        self.wrap_lines = True
+        self.syntax_highlight = self.has_pygments
+        self.panel = None  # None, 'help' or 'info'
         self.active_side = 'staged'
-        if not has_pygments:
-            self.status_message = "Tip: Install 'pygments' (pip install pygments) for syntax highlighting. Press [?] for help."
-        else:
-            self.status_message = "Ready. Press [?] for help."
 
         self.file_index = 0
         self.cursor_row = 0
         self.scroll_offset = 0
-
+        self.sidebar_offset = 0
+        self.page_rows = 10
         self.visual_anchor_row = None
-
         self.token_candidates = []
         self.token_index = None
 
         self.input_mode = False
         self.input_buffer = ''
         self.pending_comment_meta = None
+        self.pending_confirm = None
 
-        self.status_message = 'Press ? or see header for keys. v:select w:token c:comment a:apply hunk q:quit'
+        self.status_message = 'Ready. Press ? for keys.'
+        self.status_is_error = False
         self.comments_added_count = 0
         self.should_quit = False
 
@@ -3922,27 +4313,49 @@ class TuiState:
         self.hunks = []
         self.feedback_data = {'version': FEEDBACK_VERSION, 'comments': []}
         self.summaries_data = {'session': '', 'files': {}}
+        self.intent_data = {'text': '', 'refs': []}
+        self.frame_styles = []
 
         self.refresh_inventory(select_file=target_file)
+
+    @staticmethod
+    def _pygments_available():
+        try:
+            import pygments  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    @property
+    def show_help(self):
+        return self.panel == 'help'
+
+    @show_help.setter
+    def show_help(self, value):
+        self.panel = 'help' if value else None
+
+    # ----- data ---------------------------------------------------------
 
     def refresh_inventory(self, select_file=None):
         current_path = select_file or self.current_file
         self.feedback_data = load_feedback(self.session)
         try:
             self.summaries_data = self.session.summaries()
-        except Exception:
+        except StagedError:
             self.summaries_data = {'session': '', 'files': {}}
+        try:
+            self.intent_data = self.session.intent()
+        except StagedError:
+            self.intent_data = {'text': '', 'refs': []}
 
         paths = self.session.paths(fresh=True)
-        grouped = grouped_by_status(self.session, paths, paths)
-
         comment_counts = {}
         for c in self.feedback_data['comments']:
             if c['status'] == 'open':
                 comment_counts[c['file']] = comment_counts.get(c['file'], 0) + 1
 
         entries = []
-        for status, rel in grouped:
+        for status, rel in grouped_by_status(self.session, paths, paths):
             added, removed = file_line_delta(self.session, rel)
             entries.append({
                 'path': rel,
@@ -3962,17 +4375,13 @@ class TuiState:
             else:
                 try:
                     matched = match_file(current_path, [e['path'] for e in entries])
-                    for idx, entry in enumerate(entries):
-                        if entry['path'] == matched:
-                            self.file_index = idx
-                            break
+                    self.file_index = next(i for i, e in enumerate(entries) if e['path'] == matched)
                 except StagedError:
                     self.file_index = min(self.file_index, len(entries) - 1)
         elif entries:
             self.file_index = min(self.file_index, len(entries) - 1)
         else:
             self.file_index = 0
-
         self.rebuild_diff_rows()
 
     @property
@@ -3995,24 +4404,52 @@ class TuiState:
             return []
         return [c for c in self.feedback_data['comments'] if c['file'] == rel]
 
-    def rebuild_diff_rows(self):
+    def rebuild_diff_rows(self, preserve=False):
         rel = self.current_file
+        anchor = None
+        if preserve and self.rows and 0 <= self.cursor_row < len(self.rows):
+            row = self.rows[self.cursor_row]
+            anchor = (row.get('left_lineno'), row.get('right_lineno'), row.get('first_left'))
         if not rel:
-            self.rows = []
-            self.hunks = []
-            self.cursor_row = 0
+            self.rows, self.hunks, self.cursor_row = [], [], 0
             return
-        orig_lines = read_side_lines(self.session, rel, side='workspace')
-        staged_lines = read_side_lines(self.session, rel, side='staged')
-        if self.diff_mode == 'side-by-side':
-            self.rows, self.hunks = build_side_by_side_rows(orig_lines, staged_lines)
-        else:
-            self.rows, self.hunks = build_unified_rows(orig_lines, staged_lines)
-        if not self.rows:
-            self.cursor_row = 0
-        else:
-            self.cursor_row = max(0, min(self.cursor_row, len(self.rows) - 1))
+        # Expand tabs so terminal columns match character offsets.
+        orig_lines = [line.expandtabs(4) for line in read_side_lines(self.session, rel, side='workspace')]
+        staged_lines = [line.expandtabs(4) for line in read_side_lines(self.session, rel, side='staged')]
+        build = build_side_by_side_rows if self.diff_mode == 'side-by-side' else build_unified_rows
+        self.rows, self.hunks = build(orig_lines, staged_lines)
+        if self.fold_context:
+            commented = {(c['side'], line) for c in self.file_comments(rel)
+                         for line in range(c['start_line'], c['end_line'] + 1)}
+            self.rows, self.hunks = fold_unchanged_rows(
+                self.rows, self.hunks,
+                keep=lambda row: ('workspace', row['left_lineno']) in commented
+                or ('staged', row['right_lineno']) in commented)
+        if anchor is not None:
+            left, right, first_left = anchor
+            for index, row in enumerate(self.rows):
+                if ((left is not None and row.get('left_lineno') == left)
+                        or (right is not None and row.get('right_lineno') == right)
+                        or (first_left is not None and row.get('left_lineno') == first_left)):
+                    self.cursor_row = index
+                    break
+        self.cursor_row = max(0, min(self.cursor_row, len(self.rows) - 1)) if self.rows else 0
         self._clear_token_selection()
+
+    def _select_file(self, index):
+        if not self.file_entries:
+            return False
+        index = max(0, min(len(self.file_entries) - 1, index))
+        if index == self.file_index:
+            return False
+        self.file_index = index
+        self.cursor_row = 0
+        self.scroll_offset = 0
+        self.visual_anchor_row = None
+        self.rebuild_diff_rows()
+        return True
+
+    # ----- selection ----------------------------------------------------
 
     def _clear_token_selection(self):
         self.token_candidates = []
@@ -4020,65 +4457,47 @@ class TuiState:
 
     def _row_line_for_side(self, row, side=None):
         side = side or self.active_side
-        if side == 'staged':
-            if row.get('right_lineno') is not None:
-                return 'staged', row['right_lineno'], row.get('right_text') or ''
-            if row.get('left_lineno') is not None:
-                return 'workspace', row['left_lineno'], row.get('left_text') or ''
-        else:
-            if row.get('left_lineno') is not None:
-                return 'workspace', row['left_lineno'], row.get('left_text') or ''
-            if row.get('right_lineno') is not None:
-                return 'staged', row['right_lineno'], row.get('right_text') or ''
+        order = (('right', 'staged'), ('left', 'workspace'))
+        if side != 'staged':
+            order = order[::-1]
+        for prefix, name in order:
+            if row.get(prefix + '_lineno') is not None:
+                return name, row[prefix + '_lineno'], row.get(prefix + '_text') or ''
         return side, 1, ''
 
     def current_selection_range(self):
         if not self.rows or not self.current_file:
             return (self.active_side, 1, 1, '', '')
-
-        lo_row = self.cursor_row
-        hi_row = self.cursor_row
-        if self.visual_anchor_row is not None:
-            lo_row = min(self.visual_anchor_row, self.cursor_row)
-            hi_row = max(self.visual_anchor_row, self.cursor_row)
-
-        side, first_line, _ = self._row_line_for_side(self.rows[lo_row], self.active_side)
-        line_numbers = []
-        for r_idx in range(lo_row, hi_row + 1):
-            row = self.rows[r_idx]
-            lineno = row.get('right_lineno') if side == 'staged' else row.get('left_lineno')
-            if lineno is not None:
-                line_numbers.append(lineno)
+        lo_row, hi_row = self._selected_row_bounds()
+        side, _, _ = self._row_line_for_side(self.rows[lo_row], self.active_side)
+        key = 'right_lineno' if side == 'staged' else 'left_lineno'
+        line_numbers = [self.rows[i][key] for i in range(lo_row, hi_row + 1) if self.rows[i].get(key) is not None]
         if not line_numbers:
-            _, fallback_line, fallback_text = self._row_line_for_side(self.rows[self.cursor_row], self.active_side)
+            _, fallback_line, _ = self._row_line_for_side(self.rows[self.cursor_row], self.active_side)
             line_numbers = [fallback_line]
-
-        start_line = min(line_numbers)
-        end_line = max(line_numbers)
+        start_line, end_line = min(line_numbers), max(line_numbers)
         try:
             selected_text = extract_lines_text(self.session, self.current_file, start_line, end_line, side=side)
         except StagedError:
             _, _, selected_text = self._row_line_for_side(self.rows[self.cursor_row], side)
-
         snippet_focus = ''
         if self.token_index is not None and 0 <= self.token_index < len(self.token_candidates):
             candidate = self.token_candidates[self.token_index]['text']
             if candidate in selected_text:
                 snippet_focus = candidate
-
         return (side, start_line, end_line, selected_text, snippet_focus)
+
+    def _selected_row_bounds(self):
+        if self.visual_anchor_row is None:
+            return (self.cursor_row, self.cursor_row)
+        return (min(self.visual_anchor_row, self.cursor_row), max(self.visual_anchor_row, self.cursor_row))
 
     def comments_at_row(self, row_idx):
         if not (0 <= row_idx < len(self.rows)) or not self.current_file:
             return []
         row = self.rows[row_idx]
-        matched = []
-        for c in self.file_comments():
-            if c['side'] == 'staged' and row.get('right_lineno') == c['end_line']:
-                matched.append(c)
-            elif c['side'] == 'workspace' and row.get('left_lineno') == c['end_line']:
-                matched.append(c)
-        return matched
+        return [c for c in self.file_comments()
+                if row.get('right_lineno' if c['side'] == 'staged' else 'left_lineno') == c['end_line']]
 
     def comments_covering_row(self, row_idx):
         if not (0 <= row_idx < len(self.rows)) or not self.current_file:
@@ -4102,302 +4521,338 @@ class TuiState:
                 return hunk['index']
         return self.hunks[-1]['index']
 
-    def handle_key(self, key):
+    # ----- input --------------------------------------------------------
+
+    @staticmethod
+    def normalize_key(key):
         if isinstance(key, int):
+            named = {}
             if curses is not None:
-                if key == getattr(curses, 'KEY_DOWN', -1):
-                    key = 'DOWN'
-                elif key == getattr(curses, 'KEY_UP', -1):
-                    key = 'UP'
-                elif key == getattr(curses, 'KEY_LEFT', -1):
-                    key = 'LEFT'
-                elif key == getattr(curses, 'KEY_RIGHT', -1):
-                    key = 'RIGHT'
-                elif key in (getattr(curses, 'KEY_BACKSPACE', -1), 127, 8):
-                    key = 'BACKSPACE'
-                elif key in (getattr(curses, 'KEY_ENTER', -1), 10, 13):
-                    key = 'ENTER'
-                elif key == 27:
-                    key = 'ESC'
-                elif key == 9:
-                    key = 'TAB'
-                elif 0 <= key < 256:
-                    key = chr(key)
+                for attr, name in (('KEY_DOWN', 'DOWN'), ('KEY_UP', 'UP'), ('KEY_LEFT', 'LEFT'), ('KEY_RIGHT', 'RIGHT'),
+                                   ('KEY_NPAGE', 'PGDN'), ('KEY_PPAGE', 'PGUP'), ('KEY_HOME', 'HOME'),
+                                   ('KEY_END', 'END'), ('KEY_BACKSPACE', 'BACKSPACE'), ('KEY_ENTER', 'ENTER'),
+                                   ('KEY_RESIZE', 'RESIZE')):
+                    if hasattr(curses, attr):
+                        named[getattr(curses, attr)] = name
+            if key in named:
+                return named[key]
+            if key in (127, 8):
+                return 'BACKSPACE'
+            if key in (10, 13):
+                return 'ENTER'
+            if 0 <= key < 0x110000:
+                key = chr(key)
+            else:
+                return 'UNKNOWN'
+        return {'\t': 'TAB', '\n': 'ENTER', '\r': 'ENTER', '\x1b': 'ESC', 'Escape': 'ESC', '\x7f': 'BACKSPACE',
+                '\x08': 'BACKSPACE', '\x04': 'CTRL_D', '\x15': 'CTRL_U'}.get(key, key)
 
-        if key == '\t':
-            key = 'TAB'
-        elif key in ('\n', '\r'):
-            key = 'ENTER'
-        elif key == '\x1b':
-            key = 'ESC'
-        elif key in ('\x7f', '\x08'):
-            key = 'BACKSPACE'
+    def set_status(self, message, error=False):
+        self.status_message = message
+        self.status_is_error = error
 
+    def handle_key(self, key):
+        key = self.normalize_key(key)
+        try:
+            return self._dispatch_key(key)
+        except (StagedError, OSError, ValueError) as exc:
+            self.pending_confirm = None
+            self.set_status('Error: {}'.format(exc), error=True)
+            return 'error'
+
+    def _dispatch_key(self, key):
+        self.status_is_error = False
         if self.input_mode:
             return self._handle_input_key(key)
-
-        if self.show_help:
-            if key in ('?', 'h', 'q', 'ESC', 'Escape'):
-                self.show_help = False
-                self.status_message = 'Closed help.'
+        if self.pending_confirm is not None:
+            return self._handle_confirm_key(key)
+        if self.panel is not None:
+            if key in ('?', 'h', 'i', 'q', 'ESC'):
+                if key == 'i' and self.panel == 'help':
+                    self.panel = 'info'
+                    return 'open_info'
+                self.panel = None
+                self.set_status('Closed panel.')
                 return 'close_help'
             return 'help_open'
 
-        if key in ('?', 'h'):
-            self.show_help = True
-            self.status_message = 'Showing command reference. Press [?] or [q] to close.'
-            return 'open_help'
+        handler = self.KEY_HANDLERS.get(key)
+        if handler is None and key == 'ENTER':
+            handler = TuiState._key_enter
+        return handler(self, key) if handler else 'noop'
 
-        if key == 'q':
-            self.should_quit = True
-            return 'quit'
+    def _key_help(self, key):
+        self.panel = 'help'
+        self.set_status('Key reference. Press ? or Esc to close.')
+        return 'open_help'
 
-        if key == 'b':
-            self.show_sidebar = not self.show_sidebar
-            if not self.show_sidebar and self.focus_pane == 'files':
-                self.focus_pane = 'diff'
-            self.status_message = 'File sidebar {}.'.format('shown' if self.show_sidebar else 'hidden')
-            return 'toggle_sidebar'
+    def _key_info(self, key):
+        self.panel = 'info'
+        self.set_status('Session info. Press i or Esc to close.')
+        return 'open_info'
 
-        if key == 'TAB':
-            if not self.show_sidebar:
-                self.show_sidebar = True
-                self.focus_pane = 'files'
-            else:
-                self.focus_pane = 'files' if self.focus_pane == 'diff' else 'diff'
-            self.status_message = 'Focused {} pane.'.format(self.focus_pane)
-            return 'switch_focus'
-
-        if key == 'u':
-            self.diff_mode = 'unified' if self.diff_mode == 'side-by-side' else 'side-by-side'
-            self.rebuild_diff_rows()
-            self.status_message = 'Switched to {} diff mode.'.format(self.diff_mode)
-            return 'toggle_diff_mode'
-
-        if key == 'H':
-            try:
-                import pygments
-                has_pygments = True
-            except ImportError:
-                has_pygments = False
-            if not has_pygments:
-                self.syntax_highlight = False
-                self.status_message = "Syntax highlighting requires 'pygments' (pip install pygments). Showing clean diff."
-                return 'syntax_unavailable'
-            self.syntax_highlight = not self.syntax_highlight
-            self.status_message = 'Syntax highlighting (Pygments) {}.'.format('enabled' if self.syntax_highlight else 'disabled')
-            return 'toggle_syntax'
-
-        if key in ('j', 'DOWN'):
-            if self.focus_pane == 'files':
-                if self.file_entries:
-                    self.file_index = min(len(self.file_entries) - 1, self.file_index + 1)
-                    self.cursor_row = 0
-                    self.visual_anchor_row = None
-                    self.rebuild_diff_rows()
-            else:
-                if self.rows:
-                    self.cursor_row = min(len(self.rows) - 1, self.cursor_row + 1)
-                    self._clear_token_selection()
-            return 'down'
-
-        if key in ('k', 'UP'):
-            if self.focus_pane == 'files':
-                if self.file_entries:
-                    self.file_index = max(0, self.file_index - 1)
-                    self.cursor_row = 0
-                    self.visual_anchor_row = None
-                    self.rebuild_diff_rows()
-            else:
-                if self.rows:
-                    self.cursor_row = max(0, self.cursor_row - 1)
-                    self._clear_token_selection()
-            return 'up'
-
-        if key == 'n':
-            if self.hunks:
-                for hunk in self.hunks:
-                    if hunk['first_row'] > self.cursor_row:
-                        self.cursor_row = hunk['first_row']
-                        self._clear_token_selection()
-                        self.status_message = 'Jumped to hunk {}/{}.'.format(hunk['index'] + 1, len(self.hunks))
-                        return 'next_hunk'
-                self.cursor_row = self.hunks[0]['first_row']
-                self._clear_token_selection()
-                self.status_message = 'Wrapped to hunk 1/{}.'.format(len(self.hunks))
-            return 'next_hunk'
-
-        if key == 'p':
-            if self.hunks:
-                for hunk in reversed(self.hunks):
-                    if hunk['first_row'] < self.cursor_row:
-                        self.cursor_row = hunk['first_row']
-                        self._clear_token_selection()
-                        self.status_message = 'Jumped to hunk {}/{}.'.format(hunk['index'] + 1, len(self.hunks))
-                        return 'prev_hunk'
-                self.cursor_row = self.hunks[-1]['first_row']
-                self._clear_token_selection()
-                self.status_message = 'Wrapped to hunk {}/{}.'.format(len(self.hunks), len(self.hunks))
-            return 'prev_hunk'
-
-        if key in ('[', 'LEFT'):
-            if self.token_candidates and self.token_index is not None:
-                self.token_index = (self.token_index - 1) % len(self.token_candidates)
-                tok = self.token_candidates[self.token_index]['text']
-                self.status_message = 'Selected token [{}/{}]: `{}`'.format(
-                    self.token_index + 1, len(self.token_candidates), tok
-                )
-                return 'prev_token'
-            self.active_side = 'workspace'
-            self._clear_token_selection()
-            self.status_message = 'Active side: workspace (original)'
-            return 'side_workspace'
-
-        if key in (']', 'RIGHT'):
-            if self.token_candidates and self.token_index is not None:
-                self.token_index = (self.token_index + 1) % len(self.token_candidates)
-                tok = self.token_candidates[self.token_index]['text']
-                self.status_message = 'Selected token [{}/{}]: `{}`'.format(
-                    self.token_index + 1, len(self.token_candidates), tok
-                )
-                return 'next_token'
-            self.active_side = 'staged'
-            self._clear_token_selection()
-            self.status_message = 'Active side: staged (proposal)'
-            return 'side_staged'
-
-        if key in ('v', ' '):
-            if self.visual_anchor_row is None:
-                self.visual_anchor_row = self.cursor_row
-                side, s_line, e_line, _, _ = self.current_selection_range()
-                self.status_message = 'Visual selection started at {} {}. Move j/k, press c or Enter to comment.'.format(
-                    side, format_line_range(s_line, e_line)
-                )
-            else:
-                self.visual_anchor_row = None
-                self.status_message = 'Visual selection cleared.'
-            return 'toggle_visual'
-
+    def _key_quit(self, key):
         if key == 'ESC':
-            self.visual_anchor_row = None
-            self._clear_token_selection()
-            self.status_message = 'Selection cleared.'
-            return 'escape'
+            if self.visual_anchor_row is not None or self.token_index is not None:
+                self.visual_anchor_row = None
+                self._clear_token_selection()
+                self.set_status('Selection cleared.')
+                return 'escape'
+            return 'noop'
+        self.should_quit = True
+        return 'quit'
 
-        if key == 'w':
-            if not self.rows:
-                return 'noop'
-            row = self.rows[self.cursor_row]
-            _, _, line_text = self._row_line_for_side(row, self.active_side)
-            if not self.token_candidates:
-                self.token_candidates = extract_selectable_tokens(line_text)
-                if not self.token_candidates:
-                    self.status_message = 'No selectable tokens on current line.'
-                    return 'no_tokens'
-                self.token_index = 0
-            else:
-                self.token_index = (self.token_index + 1) % len(self.token_candidates)
-            tok = self.token_candidates[self.token_index]['text']
-            self.status_message = 'Selected token [{}/{}]: `{}` (press c to comment on this expression)'.format(
-                self.token_index + 1, len(self.token_candidates), tok
-            )
-            return 'cycle_token'
-
-        if key == 'c' or (key == 'ENTER' and (self.visual_anchor_row is not None or self.token_index is not None)):
-            if not self.current_file or not self.rows:
-                return 'noop'
-            side, s_line, e_line, sel_text, focus = self.current_selection_range()
-            self.input_mode = True
-            self.input_buffer = ''
-            self.pending_comment_meta = {
-                'file': self.current_file,
-                'side': side,
-                'start_line': s_line,
-                'end_line': e_line,
-                'selected_text': sel_text,
-                'snippet_focus': focus,
-            }
-            rng = format_line_range(s_line, e_line)
-            focus_hint = ' [focus: `{}`]'.format(focus) if focus else ''
-            self.status_message = 'Comment on {} {} {}{}: '.format(self.current_file, side, rng, focus_hint)
-            return 'start_comment'
-
-        if key == 'ENTER' and self.focus_pane == 'files':
+    def _key_sidebar(self, key):
+        self.show_sidebar = not self.show_sidebar
+        if not self.show_sidebar and self.focus_pane == 'files':
             self.focus_pane = 'diff'
-            self.status_message = 'Focused diff pane for {}.'.format(self.current_file or '')
+        self.set_status('File list {}.'.format('shown' if self.show_sidebar else 'hidden'))
+        return 'toggle_sidebar'
+
+    def _key_tab(self, key):
+        if not self.show_sidebar:
+            self.show_sidebar = True
+            self.focus_pane = 'files'
+        else:
+            self.focus_pane = 'files' if self.focus_pane == 'diff' else 'diff'
+        self.set_status('Focused {} pane.'.format('file list' if self.focus_pane == 'files' else 'diff'))
+        return 'switch_focus'
+
+    def _key_mode(self, key):
+        self.diff_mode = 'unified' if self.diff_mode == 'side-by-side' else 'side-by-side'
+        self.rebuild_diff_rows(preserve=True)
+        self.set_status('Switched to {} diff.'.format(self.diff_mode))
+        return 'toggle_diff_mode'
+
+    def _key_syntax(self, key):
+        if not self.has_pygments:
+            self.syntax_highlight = False
+            self.set_status("Syntax highlighting needs pygments: pip install pygments")
+            return 'syntax_unavailable'
+        self.syntax_highlight = not self.syntax_highlight
+        self.set_status('Syntax highlighting {}.'.format('on' if self.syntax_highlight else 'off'))
+        return 'toggle_syntax'
+
+    def _key_fold(self, key):
+        self.fold_context = not self.fold_context
+        self.rebuild_diff_rows(preserve=True)
+        self.set_status('Unchanged lines {}.'.format('folded' if self.fold_context else 'expanded'))
+        return 'toggle_fold'
+
+    def _on_fold_row(self):
+        return bool(self.rows) and self.rows[self.cursor_row]['kind'] == 'fold'
+
+    def _key_wrap(self, key):
+        self.wrap_lines = not self.wrap_lines
+        self.set_status('Long lines {}.'.format('wrapped' if self.wrap_lines else 'truncated'))
+        return 'toggle_wrap'
+
+    def _key_reload(self, key):
+        self.refresh_inventory()
+        self.set_status('Reloaded {} file(s) from disk.'.format(len(self.file_entries)))
+        return 'reload'
+
+    def _move_cursor(self, delta):
+        if self.rows:
+            self.cursor_row = max(0, min(len(self.rows) - 1, self.cursor_row + delta))
+            self._clear_token_selection()
+
+    def _key_down(self, key):
+        if self.focus_pane == 'files':
+            self._select_file(self.file_index + 1)
+        else:
+            self._move_cursor(1)
+        return 'down'
+
+    def _key_up(self, key):
+        if self.focus_pane == 'files':
+            self._select_file(self.file_index - 1)
+        else:
+            self._move_cursor(-1)
+        return 'up'
+
+    def _key_page(self, key):
+        step = max(1, self.page_rows // 2)
+        self._move_cursor(step if key in ('CTRL_D', 'PGDN') else -step)
+        return 'page'
+
+    def _key_edge(self, key):
+        if self.rows:
+            self.cursor_row = 0 if key in ('g', 'HOME') else len(self.rows) - 1
+            self._clear_token_selection()
+        return 'top' if key in ('g', 'HOME') else 'bottom'
+
+    def _key_file(self, key):
+        step = 1 if key == 'J' else -1
+        if self._select_file(self.file_index + step):
+            self.set_status('File {}/{}: {}'.format(self.file_index + 1, len(self.file_entries), self.current_file))
+        else:
+            self.set_status('No {} file.'.format('next' if step > 0 else 'previous'))
+        return 'next_file' if step > 0 else 'prev_file'
+
+    def _key_hunk(self, key):
+        if not self.hunks:
+            self.set_status('No hunks in this file.')
+            return 'next_hunk' if key == 'n' else 'prev_hunk'
+        total = len(self.hunks)
+        if key == 'n':
+            target = next((h for h in self.hunks if h['first_row'] > self.cursor_row), None)
+            wrapped = target is None
+            target = target or self.hunks[0]
+        else:
+            target = next((h for h in reversed(self.hunks) if h['first_row'] < self.cursor_row), None)
+            wrapped = target is None
+            target = target or self.hunks[-1]
+        self.cursor_row = target['first_row']
+        self.focus_pane = 'diff'
+        self._clear_token_selection()
+        self.set_status('{}hunk {}/{}.'.format('Wrapped to ' if wrapped else '', target['index'] + 1, total).capitalize())
+        return 'next_hunk' if key == 'n' else 'prev_hunk'
+
+    def _cycle_token(self, step):
+        self.token_index = (self.token_index + step) % len(self.token_candidates)
+        self.set_status('Token {}/{}: `{}`  (c to comment on it)'.format(
+            self.token_index + 1, len(self.token_candidates), self.token_candidates[self.token_index]['text']))
+
+    def _key_side(self, key):
+        left = key in ('[', 'LEFT')
+        if self.token_candidates and self.token_index is not None:
+            self._cycle_token(-1 if left else 1)
+            return 'prev_token' if left else 'next_token'
+        self.active_side = 'workspace' if left else 'staged'
+        self._clear_token_selection()
+        self.set_status('Comments target the {} side.'.format(
+            'workspace (original)' if left else 'staged (proposal)'))
+        return 'side_workspace' if left else 'side_staged'
+
+    def _key_visual(self, key):
+        if self.visual_anchor_row is None:
+            self.visual_anchor_row = self.cursor_row
+            side, s_line, e_line, _, _ = self.current_selection_range()
+            self.set_status('Selecting from {} {}. Move with j/k, then c to comment.'.format(
+                side, format_line_range(s_line, e_line)))
+        else:
+            self.visual_anchor_row = None
+            self.set_status('Selection cleared.')
+        return 'toggle_visual'
+
+    def _key_token(self, key):
+        if not self.rows:
+            return 'noop'
+        if not self.token_candidates:
+            _, _, line_text = self._row_line_for_side(self.rows[self.cursor_row], self.active_side)
+            self.token_candidates = extract_selectable_tokens(line_text)
+            if not self.token_candidates:
+                self.set_status('No selectable tokens on this line.')
+                return 'no_tokens'
+            self.token_index = -1
+        self._cycle_token(1)
+        return 'cycle_token'
+
+    def _key_comment(self, key):
+        if not self.current_file or not self.rows:
+            return 'noop'
+        if self._on_fold_row() and self.visual_anchor_row is None:
+            return self._key_fold(key)
+        side, s_line, e_line, sel_text, focus = self.current_selection_range()
+        self.input_mode = True
+        self.input_buffer = ''
+        self.pending_comment_meta = {'file': self.current_file, 'side': side, 'start_line': s_line,
+                                     'end_line': e_line, 'selected_text': sel_text, 'snippet_focus': focus}
+        self.set_status('Comment on {} {} {}'.format(self.current_file, side, format_line_range(s_line, e_line)))
+        return 'start_comment'
+
+    def _key_enter(self, key):
+        if self.visual_anchor_row is not None or self.token_index is not None:
+            return self._key_comment(key)
+        if self.focus_pane == 'files':
+            self.focus_pane = 'diff'
+            self.set_status('Viewing {}.'.format(self.current_file or ''))
             return 'enter_diff'
-
-        if key == 'r':
-            comments = self.comments_covering_row(self.cursor_row) or self.comments_at_row(self.cursor_row)
-            if not comments:
-                self.status_message = 'No feedback comment on current line.'
-                return 'noop'
-            target = comments[-1]
-            updated = resolve_feedback(self.session, comment_id=target['id'], toggle=True)
-            new_status = updated[0]['status'] if updated else target['status']
-            self.refresh_inventory()
-            self.status_message = 'Marked {} as {}.'.format(target['id'], new_status)
-            return 'toggle_resolve'
-
-        if key == 'x':
-            comments = self.comments_covering_row(self.cursor_row) or self.comments_at_row(self.cursor_row)
-            if not comments:
-                self.status_message = 'No feedback comment on current line to delete.'
-                return 'noop'
-            target = comments[-1]
-            delete_feedback(self.session, comment_id=target['id'])
-            self.refresh_inventory()
-            self.status_message = 'Deleted feedback comment {}.'.format(target['id'])
-            return 'delete_comment'
-
-        if key == 'a':
-            if not self.current_file:
-                return 'noop'
-            if self.focus_pane == 'files':
-                status = apply_file_from_tui(self.session, self.current_file)
-                self.refresh_inventory()
-                self.status_message = 'Applied file {} ({}).'.format(self.current_file, status)
-                return 'apply_file'
-            hunk_idx = self.current_hunk_index()
-            if hunk_idx is None:
-                self.status_message = 'No diff hunk to apply in {}.'.format(self.current_file)
-                return 'noop'
-            apply_hunk(self.session, self.current_file, hunk_idx)
-            self.refresh_inventory()
-            self.status_message = 'Applied hunk {} of {} to workspace.'.format(hunk_idx + 1, self.current_file)
-            return 'apply_hunk'
-
-        if key == 'A':
-            if not self.current_file:
-                return 'noop'
-            status = apply_file_from_tui(self.session, self.current_file)
-            self.refresh_inventory()
-            self.status_message = 'Applied entire file {} ({}).'.format(self.current_file, status)
-            return 'apply_file'
-
-        if key == 'y':
-            prompt_text = format_feedback_prompt(self.session, only_open=True)
-            ok, tool_name = copy_to_clipboard(prompt_text, runner=self.clipboard_runner)
-            if ok:
-                self.status_message = 'Copied open feedback prompt to clipboard ({}).'.format(tool_name)
-            else:
-                self.status_message = 'Clipboard tool unavailable; run `staged feedback --prompt`.'
-            return 'yank_prompt'
-
+        if self._on_fold_row():
+            return self._key_fold(key)
         return 'noop'
+
+    def _comment_at_cursor(self):
+        comments = self.comments_covering_row(self.cursor_row) or self.comments_at_row(self.cursor_row)
+        return comments[-1] if comments else None
+
+    def _key_resolve(self, key):
+        target = self._comment_at_cursor()
+        if target is None:
+            self.set_status('No comment on this line.')
+            return 'noop'
+        updated = resolve_feedback(self.session, comment_id=target['id'], toggle=True)
+        self.refresh_inventory()
+        self.set_status('Marked {} as {}.'.format(target['id'], updated[0]['status'] if updated else target['status']))
+        return 'toggle_resolve'
+
+    def _key_delete_comment(self, key):
+        target = self._comment_at_cursor()
+        if target is None:
+            self.set_status('No comment on this line to delete.')
+            return 'noop'
+        return self._ask('delete_comment', 'Delete comment {}?'.format(target['id']), comment_id=target['id'])
+
+    def _key_apply(self, key):
+        rel = self.current_file
+        if not rel:
+            return 'noop'
+        drift = branch_drift_note(self.session)
+        if key == 'A' or self.focus_pane == 'files' or rel in self.session.deletions:
+            verb = 'Delete' if rel in self.session.deletions else 'Apply'
+            return self._ask('apply_file', '{} {} in the workspace?{}'.format(verb, rel, drift), rel=rel)
+        hunk_idx = self.current_hunk_index()
+        if hunk_idx is None:
+            self.set_status('No hunk to apply in {}.'.format(rel))
+            return 'noop'
+        return self._ask('apply_hunk', 'Apply hunk {}/{} of {} to the workspace?{}'.format(
+            hunk_idx + 1, len(self.hunks), rel, drift), rel=rel, hunk=hunk_idx)
+
+    def _key_yank(self, key):
+        ok, tool_name = copy_to_clipboard(format_feedback_prompt(self.session, only_open=True),
+                                          runner=self.clipboard_runner)
+        if ok:
+            self.set_status('Copied open comments as an agent prompt ({}).'.format(tool_name))
+        else:
+            self.set_status('No clipboard tool found; run staged feedback --prompt.', error=True)
+        return 'yank_prompt'
+
+    def _ask(self, action, question, **details):
+        self.pending_confirm = dict(details, action=action, question=question)
+        self.set_status(question)
+        return 'confirm_' + action
+
+    def _handle_confirm_key(self, key):
+        pending, self.pending_confirm = self.pending_confirm, None
+        if key not in ('y', 'Y'):
+            self.set_status('Cancelled.')
+            return 'cancel_confirm'
+        action = pending['action']
+        if action == 'delete_comment':
+            delete_feedback(self.session, comment_id=pending['comment_id'])
+            self.refresh_inventory()
+            self.set_status('Deleted comment {}.'.format(pending['comment_id']))
+        elif action == 'apply_hunk':
+            apply_hunk(self.session, pending['rel'], pending['hunk'], ctx=self.ctx)
+            self.refresh_inventory()
+            self.set_status('Applied hunk {} of {}. Undo with staged undo.'.format(pending['hunk'] + 1, pending['rel']))
+        elif action == 'apply_file':
+            status = apply_file_from_tui(self.session, pending['rel'], ctx=self.ctx)
+            self.refresh_inventory()
+            self.set_status('{} {}. Undo with staged undo.'.format(status.capitalize(), pending['rel']))
+        return action
 
     def _handle_input_key(self, key):
         if key == 'ESC':
             self.input_mode = False
             self.input_buffer = ''
             self.pending_comment_meta = None
-            self.status_message = 'Comment cancelled.'
+            self.set_status('Comment cancelled.')
             return 'cancel_comment'
-
         if key == 'BACKSPACE':
             self.input_buffer = self.input_buffer[:-1]
             return 'input_backspace'
-
         if key == 'ENTER':
             text = self.input_buffer.strip()
             meta = self.pending_comment_meta
@@ -4405,252 +4860,429 @@ class TuiState:
             self.input_buffer = ''
             self.pending_comment_meta = None
             if not text or not meta:
-                self.status_message = 'Empty comment discarded.'
+                self.set_status('Empty comment discarded.')
                 return 'discard_comment'
             created = add_feedback_comment(
-                self.session,
-                file_path=meta['file'],
-                comment=text,
-                start_line=meta['start_line'],
-                end_line=meta['end_line'],
-                side=meta['side'],
-                snippet_focus=meta['snippet_focus'],
-                selected_text=meta['selected_text'],
-            )
+                self.session, file_path=meta['file'], comment=text, start_line=meta['start_line'],
+                end_line=meta['end_line'], side=meta['side'], snippet_focus=meta['snippet_focus'],
+                selected_text=meta['selected_text'])
             self.visual_anchor_row = None
             self._clear_token_selection()
             self.comments_added_count += 1
             self.refresh_inventory()
-            self.status_message = 'Saved {} on {} ({}).'.format(
-                created['id'],
-                created['file'],
-                format_line_range(created['start_line'], created['end_line']),
-            )
+            self.set_status('Saved {} on {} ({}).'.format(
+                created['id'], created['file'], format_line_range(created['start_line'], created['end_line'])))
             return 'save_comment'
-
         if isinstance(key, str) and len(key) == 1 and key.isprintable():
             self.input_buffer += key
             return 'input_char'
         return 'noop'
 
-    def _selected_row_bounds(self):
-        if self.visual_anchor_row is None:
-            return (self.cursor_row, self.cursor_row)
-        return (min(self.visual_anchor_row, self.cursor_row), max(self.visual_anchor_row, self.cursor_row))
+    KEY_HANDLERS = {
+        '?': _key_help, 'h': _key_help, 'i': _key_info, 'q': _key_quit, 'ESC': _key_quit,
+        'b': _key_sidebar, 'TAB': _key_tab, 'u': _key_mode, 'z': _key_fold, 'W': _key_wrap, 'H': _key_syntax, 'R': _key_reload,
+        'j': _key_down, 'DOWN': _key_down, 'k': _key_up, 'UP': _key_up,
+        'CTRL_D': _key_page, 'PGDN': _key_page, 'CTRL_U': _key_page, 'PGUP': _key_page,
+        'g': _key_edge, 'HOME': _key_edge, 'G': _key_edge, 'END': _key_edge,
+        'J': _key_file, 'K': _key_file, 'n': _key_hunk, 'p': _key_hunk,
+        '[': _key_side, 'LEFT': _key_side, ']': _key_side, 'RIGHT': _key_side,
+        'v': _key_visual, ' ': _key_visual, 'w': _key_token, 'c': _key_comment,
+        'r': _key_resolve, 'x': _key_delete_comment, 'a': _key_apply, 'A': _key_apply, 'y': _key_yank,
+    }
 
-    def render_frame(self, width=120, height=32):
-        width = max(60, int(width))
-        height = max(12, int(height))
+    # ----- rendering ----------------------------------------------------
 
-        def fit(text, w):
-            text = str(text)
-            return text[:w].ljust(w)
+    def _code_chunks(self, text, width, base_style, change_spans=()):
+        """Split code into cells of `width`, layering syntax colors and intraline change emphasis."""
+        width = max(1, width)
+        syntax = []
+        if self.syntax_highlight and base_style is None and text:
+            syntax = [(start, end, 'syn_' + kind) for start, end, kind in _cached_syntax_spans(text, self.current_file)]
+        emphasis = [(start, end, base_style + '_em') for start, end in change_spans] if base_style else []
+        limit = len(text) if self.wrap_lines else min(len(text), width)
+        starts = wrap_points(text, width, limit)
+        cells = []
+        for index, offset in enumerate(starts):
+            stop = starts[index + 1] if index + 1 < len(starts) else limit
+            cell = StyledLine(text[offset:stop], base_style)
+            for start, end, style in syntax + emphasis:
+                lo, hi = max(start, offset), min(end, stop)
+                if hi > lo:
+                    cell.mark(lo - offset, hi - lo, style)
+            cells.append(cell.fit(width, base_style))
+        return cells
 
-        mode_label = '2-Pane Side-by-Side' if self.diff_mode == 'side-by-side' else 'Unified'
-        open_cnt = self.open_comments_count()
-        header = (
-            ' staged TUI | Session: {} | Branch: {} | Mode: {} | Side: {} | Open Comments: {} '
-            '| [?]Help [Tab]Pane [b]Files [u]Mode [v]Select [w]Token [c]Comment [a]Apply [q]Quit'
-        ).format(self.session.id, self.branch, mode_label, self.active_side, open_cnt)
-
-        frame = [fit(header, width)]
-        body_height = height - 2
-
-        sidebar_w = min(38, max(24, width // 4)) if self.show_sidebar else 0
-        diff_w = width - sidebar_w - (1 if sidebar_w else 0)
-
-        left_lines = []
-        if sidebar_w:
-            pane_marker = '*' if self.focus_pane == 'files' else ' '
-            left_lines.append(fit(' {}FILES ({})'.format(pane_marker, len(self.file_entries)), sidebar_w))
-            left_lines.append(fit(' ' + '-' * (sidebar_w - 2), sidebar_w))
-            last_status = None
-            for idx, entry in enumerate(self.file_entries):
-                if entry['status'] != last_status:
-                    left_lines.append(fit(' [{}]'.format(entry['status']), sidebar_w))
-                    last_status = entry['status']
-                cursor_prefix = '>' if idx == self.file_index else ' '
-                badge = ' 💬{}'.format(entry['open_comments']) if entry['open_comments'] else ''
-                delta = '+{}-{}'.format(entry['added'], entry['removed'])
-                item_str = ' {} {} ({}){}'.format(cursor_prefix, entry['path'], delta, badge)
-                left_lines.append(fit(item_str, sidebar_w))
-            while len(left_lines) < body_height:
-                left_lines.append(' ' * sidebar_w)
-
-        right_lines = []
-        if self.show_help:
-            right_lines.append(fit(' staged TUI Command Reference & Shortcuts', diff_w))
-            right_lines.append(fit(' ' + '─' * max(10, diff_w - 4), diff_w))
-            help_sections = [
-                ('NAVIGATION', [
-                    ('j / k (or Down/Up)', 'Move cursor line by line'),
-                    ('n / p', 'Jump to next / previous diff hunk'),
-                    ('Tab', 'Switch focus between File Rail and Diff Viewport'),
-                    ('[ / ]', 'Switch active side (workspace vs staged) or cycle tokens'),
-                    ('b', 'Toggle file rail sidebar on / off'),
-                    ('u', 'Toggle 2-Pane Side-by-Side vs Unified diff mode'),
-                ]),
-                ('CODE REVIEW & INLINE FEEDBACK', [
-                    ('v (or Space)', 'Toggle visual multi-line selection mode'),
-                    ('w', 'Select sub-line token / expression on current line'),
-                    ('c (or Enter)', 'Add inline comment anchored to selection (saves to feedback.json)'),
-                    ('r', 'Toggle [OPEN] / [RESOLVED] status on comment at cursor'),
-                    ('x', 'Delete comment at cursor'),
-                    ('y', 'Copy all open review comments to clipboard as AI prompt'),
-                ]),
-                ('STAGING & APPLY', [
-                    ('a', 'Selectively apply current diff hunk directly to workspace'),
-                    ('A', 'Apply entire current file to workspace'),
-                ]),
-                ('DISPLAY & SYNTAX HIGHLIGHTING', [
-                    ('H', 'Toggle Pygments syntax highlighting on / off'),
-                    ('? or h', 'Toggle this help reference screen'),
-                    ('q', 'Quit TUI / Close help'),
-                ]),
-            ]
-            for section_title, items in help_sections:
-                if len(right_lines) >= body_height - 3:
-                    break
-                right_lines.append(fit(' ' + section_title + ':', diff_w))
-                for key_combo, desc in items:
-                    if len(right_lines) >= body_height - 3:
-                        break
-                    row_txt = '   {:<24} {}'.format(key_combo, desc)
-                    right_lines.append(fit(row_txt, diff_w))
-                right_lines.append(fit('', diff_w))
-            right_lines.append(fit(' ' + '─' * max(10, diff_w - 4), diff_w))
-            right_lines.append(fit(' Press [?] or [q] or [Esc] to return to diff view', diff_w))
-        else:
-            entry = self.current_file_entry
-            if not entry:
-                right_lines.append(fit(' No staged files in session {}.'.format(self.session.id), diff_w))
-            else:
-                focus_marker = '*' if self.focus_pane == 'diff' else ' '
-                summary_str = entry['summary'] or '(no file summary)'
-                sub_hdr = ' {}[{}] {} (+{} -{}) — {}'.format(
-                    focus_marker, entry['status'], entry['path'], entry['added'], entry['removed'], summary_str
-                )
-                right_lines.append(fit(sub_hdr, diff_w))
-
-                if self.diff_mode == 'side-by-side':
-                    half_w = max(10, (diff_w - 3) // 2)
-                    w_marker = '<ACTIVE>' if self.active_side == 'workspace' else ''
-                    s_marker = '<ACTIVE>' if self.active_side == 'staged' else ''
-                    col_hdr = '{} | {}'.format(
-                        fit(' Workspace Original {}'.format(w_marker), half_w),
-                        fit(' Staged Proposal {}'.format(s_marker), diff_w - half_w - 3),
-                    )
-                    right_lines.append(fit(col_hdr, diff_w))
-                else:
-                    right_lines.append(fit(' Unified Diff (Active Side: {})'.format(self.active_side), diff_w))
-
-                viewport_items = []
-                lo_sel, hi_sel = self._selected_row_bounds()
-                cursor_viewport_idx = 0
-
-                for r_idx, row in enumerate(self.rows):
-                    if r_idx == self.cursor_row:
-                        cursor_viewport_idx = len(viewport_items)
-                    is_cursor = (r_idx == self.cursor_row)
-                    is_selected = (self.visual_anchor_row is not None and lo_sel <= r_idx <= hi_sel)
-                    sel_flag = '>' if is_cursor else ('*' if is_selected else ' ')
-
-                    if self.diff_mode == 'side-by-side':
-                        half_w = max(10, (diff_w - 3) // 2)
-                        right_half_w = diff_w - half_w - 3
-                        l_no = '{:4d}'.format(row['left_lineno']) if row['left_lineno'] is not None else '    '
-                        r_no = '{:4d}'.format(row['right_lineno']) if row['right_lineno'] is not None else '    '
-                        l_sign = '-' if row['kind'] in ('delete', 'replace') and row['left_lineno'] is not None else ' '
-                        r_sign = '+' if row['kind'] in ('insert', 'replace') and row['right_lineno'] is not None else ' '
-                        l_txt = row['left_text'] if row['left_text'] is not None else ''
-                        r_txt = row['right_text'] if row['right_text'] is not None else ''
-                        left_cell = fit('{}{} {} {}'.format(sel_flag, l_no, l_sign, l_txt), half_w)
-                        right_cell = fit('{}{} {} {}'.format(sel_flag, r_no, r_sign, r_txt), right_half_w)
-                        line_str = '{} | {}'.format(left_cell, right_cell)
+    def _diff_row(self, row, width, flag):
+        """Display lines for one diff row; long lines wrap onto continuation lines when wrapping is on."""
+        if row['kind'] == 'fold':
+            label = '{} ⋯ {} unchanged lines'.format(flag, row['count'])
+            return [StyledLine(label, 'fold').add('   (Enter or z to expand)', 'fold_hint').fit(width, 'fold')]
+        if self.diff_mode == 'side-by-side':
+            half_w = max(10, (width - 3) // 2)
+            columns = []
+            for side, cell_w in (('left', half_w), ('right', width - half_w - 3)):
+                lineno = row[side + '_lineno']
+                if lineno is None:
+                    columns.append(([StyledLine(flag).add(' ' * (cell_w - 1), 'filler')], 'filler', cell_w))
+                    continue
+                changed = row['kind'] != 'equal'
+                style = ('del' if side == 'left' else 'add') if changed else None
+                gutter_style = style + '_gutter' if changed else 'gutter'
+                gutter = '{}{:4d} {} '.format(flag, lineno, ('-' if side == 'left' else '+') if changed else ' ')
+                spans = row.get(side + '_spans', []) if row['kind'] == 'replace' else ()
+                cells = self._code_chunks(row[side + '_text'] or '', cell_w - len(gutter), style, spans)
+                lines = [StyledLine(gutter if i == 0 else ' ' * len(gutter), gutter_style).extend(cell).fit(cell_w)
+                         for i, cell in enumerate(cells)]
+                columns.append((lines, style or None, cell_w))
+            height = max(len(lines) for lines, _, _ in columns)
+            out = []
+            for i in range(height):
+                line = StyledLine()
+                for index, (lines, style, cell_w) in enumerate(columns):
+                    if i < len(lines):
+                        line.extend(lines[i])
                     else:
-                        l_no = '{:4d}'.format(row['left_lineno']) if row['left_lineno'] is not None else '    '
-                        r_no = '{:4d}'.format(row['right_lineno']) if row['right_lineno'] is not None else '    '
-                        line_str = '{} {} {} {} {}'.format(sel_flag, l_no, r_no, row['prefix'], row['text'])
+                        line.extend(StyledLine().fit(cell_w, style))  # keep the band tinted beside wrapped text
+                    if index == 0:
+                        line.add(' │ ', 'border')
+                out.append(line)
+            return out
+        style = {'delete': 'del', 'insert': 'add'}.get(row['kind'])
+        l_no = '{:4d}'.format(row['left_lineno']) if row['left_lineno'] is not None else '    '
+        r_no = '{:4d}'.format(row['right_lineno']) if row['right_lineno'] is not None else '    '
+        gutter = '{} {} {} {} '.format(flag, l_no, r_no, row['prefix'])
+        gutter_style = style + '_gutter' if style else 'gutter'
+        cells = self._code_chunks(row['text'], width - len(gutter), style)
+        return [StyledLine(gutter if i == 0 else ' ' * len(gutter), gutter_style).extend(cell)
+                for i, cell in enumerate(cells)]
 
-                    if is_cursor and self.token_index is not None and 0 <= self.token_index < len(self.token_candidates):
-                        tok_text = self.token_candidates[self.token_index]['text']
-                        line_str = fit(line_str, max(1, diff_w - len(tok_text) - 10)) + ' [tok:{}]'.format(tok_text)
+    def _sidebar_lines(self, width, height):
+        marker = '▸' if self.focus_pane == 'files' else ' '
+        lines = [StyledLine(' {}FILES ({})'.format(marker, len(self.file_entries)),
+                            'title_focus' if self.focus_pane == 'files' else 'title').fit(width),
+                 StyledLine(' ' + '─' * (width - 2), 'border').fit(width)]
+        items = []
+        last_status = None
+        for idx, entry in enumerate(self.file_entries):
+            if entry['status'] != last_status:
+                items.append((None, StyledLine(' ' + (entry['status'] or 'UNKNOWN'),
+                                               'status_' + (entry['status'] or 'MISSING').replace(' ', '_'))))
+                last_status = entry['status']
+            delta = ' +{} -{}'.format(entry['added'], entry['removed'])
+            badge = ' ●{}'.format(entry['open_comments']) if entry['open_comments'] else ''
+            selected = idx == self.file_index
+            path_w = max(4, width - 3 - len(delta) - len(badge))
+            line = StyledLine(' {} '.format('>' if selected else ' '))
+            line.add(_clip_path(entry['path'], path_w).ljust(path_w), 'cursor' if selected else None)
+            line.add(' +{}'.format(entry['added']), 'add' if entry['added'] else 'dim')
+            line.add(' -{}'.format(entry['removed']), 'del' if entry['removed'] else 'dim')
+            line.add(badge, 'comment')
+            items.append((idx, line))
+        avail = max(1, height - len(lines))
+        selected_pos = next((i for i, (idx, _) in enumerate(items) if idx == self.file_index), 0)
+        if selected_pos < self.sidebar_offset:
+            self.sidebar_offset = max(0, selected_pos - 1)
+        elif selected_pos >= self.sidebar_offset + avail:
+            self.sidebar_offset = selected_pos - avail + 1
+        self.sidebar_offset = max(0, min(self.sidebar_offset, max(0, len(items) - avail)))
+        for _, line in items[self.sidebar_offset:self.sidebar_offset + avail]:
+            lines.append(line.fit(width))
+        return lines
 
-                    viewport_items.append((fit(line_str, diff_w), row['kind'], is_cursor, is_selected, r_idx))
+    def _panel_lines(self, width, height):
+        lines = []
 
-                    for c in self.comments_at_row(r_idx):
-                        badge = 'OPEN' if c['status'] == 'open' else 'RESOLVED'
-                        rng = format_line_range(c['start_line'], c['end_line'])
-                        focus_part = ' (focus: `{}`)'.format(c['snippet_focus']) if c.get('snippet_focus') else ''
-                        comment_line = '   💬 [{} {} {} {}]{}: {}'.format(
-                            c['id'], badge, c['side'], rng, focus_part, c['comment']
-                        )
-                        viewport_items.append((fit(comment_line, diff_w), 'comment', is_cursor, False, r_idx))
+        def heading(text):
+            lines.append(StyledLine(' ' + text, 'title').fit(width))
 
-                avail_rows = max(1, body_height - len(right_lines))
-                if cursor_viewport_idx < self.scroll_offset:
-                    self.scroll_offset = cursor_viewport_idx
-                elif cursor_viewport_idx >= self.scroll_offset + avail_rows:
-                    self.scroll_offset = cursor_viewport_idx - avail_rows + 1
-                self.scroll_offset = max(0, min(self.scroll_offset, max(0, len(viewport_items) - avail_rows)))
+        def wrapped(text, style=None, indent='   '):
+            for paragraph in (text or '').splitlines() or ['']:
+                for chunk in textwrap.wrap(paragraph, max(10, width - len(indent) - 1)) or ['']:
+                    lines.append(StyledLine(indent + chunk, style).fit(width))
 
-                visible = viewport_items[self.scroll_offset:self.scroll_offset + avail_rows]
-                for text_line, _, _, _, _ in visible:
-                    right_lines.append(fit(text_line, diff_w))
+        if self.panel == 'help':
+            heading('staged TUI Command Reference')
+            lines.append(StyledLine(' ' + '─' * max(10, width - 4), 'border').fit(width))
+            key_w = min(32, max(16, width // 3))
+            for section_title, items in TUI_KEYS:
+                heading(section_title + ':')
+                for combo, desc in items:
+                    lines.append(StyledLine('   ').add(combo.ljust(key_w), 'key').add(' ' + desc).fit(width))
+                lines.append(StyledLine().fit(width))
+            lines.append(StyledLine(' Press ? or Esc to return to the diff.', 'dim').fit(width))
+            return lines[:height]
 
-        while len(right_lines) < body_height:
-            right_lines.append(' ' * diff_w)
+        heading('Intent')
+        if self.intent_data.get('text'):
+            wrapped(self.intent_data['text'], 'intent')
+        else:
+            wrapped('(none recorded; staged intent -m "<original request>" --ref <PR/MR URL>)', 'dim')
+        for ref in self.intent_data.get('refs', []):
+            lines.append(StyledLine('   ' + ref, 'ref').fit(width))
+        lines.append(StyledLine().fit(width))
+        heading('Session summary')
+        wrapped(self.summaries_data.get('session') or '(no summary yet)',
+                'summary' if self.summaries_data.get('session') else 'dim')
+        lines.append(StyledLine().fit(width))
+        entry = self.current_file_entry
+        if entry:
+            heading('File: ' + entry['path'])
+            wrapped(entry['summary'] or '(no file summary)', 'summary' if entry['summary'] else 'dim')
+            wrapped('Workspace: {}'.format(self.session.original(entry['path'])), 'dim')
+            wrapped('Staged:    {}'.format(safe_path(self.session.staging, entry['path'])), 'dim')
+            comments = self.file_comments()
+            wrapped('{} hunk(s), {} comment(s), {} open'.format(
+                len(self.hunks), len(comments), sum(1 for c in comments if c['status'] == 'open')), 'dim')
+        lines.append(StyledLine().fit(width))
+        lines.append(StyledLine(' Press i or Esc to return to the diff.', 'dim').fit(width))
+        return lines[:height]
 
-        for row_i in range(body_height):
-            if sidebar_w:
-                combined = left_lines[row_i] + '│' + right_lines[row_i]
-            else:
-                combined = right_lines[row_i]
-            frame.append(fit(combined, width))
+    def _diff_lines(self, width, height):
+        entry = self.current_file_entry
+        if not entry:
+            return [StyledLine(' No staged files in session {}.'.format(self.session.id), 'dim').fit(width)]
+        focus = '▸' if self.focus_pane == 'diff' else ' '
+        title = StyledLine(' {}'.format(focus), 'title_focus' if self.focus_pane == 'diff' else 'title')
+        title.add(entry['status'] or 'UNKNOWN', 'status_' + (entry['status'] or 'MISSING').replace(' ', '_'))
+        title.add(' {} '.format(entry['path']), 'title')
+        title.add('+{}'.format(entry['added']), 'add').add(' -{}'.format(entry['removed']), 'del')
+        if self.hunks:
+            hunk = self.current_hunk_index()
+            title.add('  hunk {}/{}'.format((hunk or 0) + 1, len(self.hunks)), 'dim')
+        lines = [title.fit(width)]
+        summary = entry['summary'] or self.summaries_data.get('session') or ''
+        lines.append(StyledLine(' ' + (summary_text(summary) if summary else '(no summary yet)'),
+                                'summary' if summary else 'dim').fit(width))
+        if self.diff_mode == 'side-by-side':
+            half_w = max(10, (width - 3) // 2)
+            header = StyledLine()
+            for label, side, cell_w in (('Workspace Original', 'workspace', half_w),
+                                        ('Staged Proposal', 'staged', width - half_w - 3)):
+                active = self.active_side == side
+                header.extend(StyledLine(' {}{}'.format(label, ' ◂ comments' if active else ''),
+                                         'col_active' if active else 'col').fit(cell_w))
+                if side == 'workspace':
+                    header.add(' │ ', 'border')
+            lines.append(header.fit(width))
+        else:
+            lines.append(StyledLine(' Unified Diff (comments target the {} side)'.format(self.active_side), 'col').fit(width))
 
+        viewport = []
+        lo_sel, hi_sel = self._selected_row_bounds()
+        cursor_pos = cursor_end = 0
+        for r_idx, row in enumerate(self.rows):
+            is_cursor = r_idx == self.cursor_row
+            is_selected = self.visual_anchor_row is not None and lo_sel <= r_idx <= hi_sel
+            row_lines = self._diff_row(row, width, '>' if is_cursor else ('*' if is_selected else ' '))
+            if is_cursor:
+                cursor_pos, cursor_end = len(viewport), len(viewport) + len(row_lines) - 1
+                if self.token_index is not None and 0 <= self.token_index < len(self.token_candidates):
+                    tok = self.token_candidates[self.token_index]['text']
+                    row_lines[0] = row_lines[0].fit(max(1, width - len(tok) - 8)).add(' [tok:{}]'.format(tok), 'key')
+            for line in row_lines:
+                line = line.fit(width)
+                if is_selected:
+                    line.mark(0, width, 'selected')
+                if is_cursor:
+                    line.mark(0, 1, 'cursor')
+                viewport.append(line)
+            for c in self.comments_at_row(r_idx):
+                badge = 'OPEN' if c['status'] == 'open' else 'RESOLVED'
+                focus_part = ' (focus: `{}`)'.format(c['snippet_focus']) if c.get('snippet_focus') else ''
+                viewport.append(StyledLine('   💬 [{} {} {} {}]{}: {}'.format(
+                    c['id'], badge, c['side'], format_line_range(c['start_line'], c['end_line']), focus_part,
+                    c['comment']), 'comment' if c['status'] == 'open' else 'dim').fit(width, 'comment_bg'))
+
+        avail = max(1, height - len(lines))
+        self.page_rows = avail
+        if cursor_pos < self.scroll_offset:
+            self.scroll_offset = cursor_pos
+        elif cursor_end >= self.scroll_offset + avail:
+            self.scroll_offset = min(cursor_pos, cursor_end - avail + 1)
+        self.scroll_offset = max(0, min(self.scroll_offset, max(0, len(viewport) - avail)))
+        return lines + viewport[self.scroll_offset:self.scroll_offset + avail]
+
+    def _header_line(self, width):
+        line = StyledLine(' staged TUI ', 'header_title')
+        mode = 'side-by-side' if self.diff_mode == 'side-by-side' else 'unified'
+        line.add(' session {} · branch {} · {} file(s) · {} open comment(s) · {} '.format(
+            self.session.id, self.branch, len(self.file_entries), self.open_comments_count(), mode), 'header')
+        intent = summary_text(self.intent_data.get('text', '')) if self.intent_data.get('text') else ''
+        if intent:
+            line.add('· intent: ' + intent, 'header_dim')
+        return line.fit(width, 'header')
+
+    def _footer_line(self, width):
         if self.input_mode:
             meta = self.pending_comment_meta or {}
-            rng = format_line_range(meta.get('start_line', 1), meta.get('end_line', 1))
-            focus_tag = ' [{}]'.format(meta['snippet_focus']) if meta.get('snippet_focus') else ''
-            prompt_bar = ' Comment ({} {}{}): {}█  [Enter:Save  Esc:Cancel]'.format(
-                meta.get('side', 'staged'), rng, focus_tag, self.input_buffer
-            )
-            frame.append(fit(prompt_bar, width))
-        elif self.show_help:
-            frame.append(fit(' [?] Command Reference: Press [?] or [q] or [Esc] to return to diff view.', width))
-        else:
-            frame.append(fit(' ' + self.status_message, width))
+            label = ' Comment ({} {}{}): '.format(
+                meta.get('side', 'staged'), format_line_range(meta.get('start_line', 1), meta.get('end_line', 1)),
+                ' [{}]'.format(meta['snippet_focus']) if meta.get('snippet_focus') else '')
+            line = StyledLine(label, 'prompt').add(self.input_buffer + '█', 'input')
+            return line.add('   Enter save · Esc cancel', 'footer_dim').fit(width, 'footer')
+        if self.pending_confirm is not None:
+            return StyledLine(' ' + self.pending_confirm['question'] + ' [y/N]', 'prompt').fit(width, 'footer')
+        line = StyledLine(' ' + self.status_message, 'error' if self.status_is_error else 'footer')
+        if self.panel is None:
+            hints = '  '.join('{} {}'.format(k, d) for k, d in TUI_HINTS[self.focus_pane])
+            room = width - len(line.text) - 2
+            if room > 20:
+                hints = hints if len(hints) <= room else hints[:room - 1] + '…'
+                line.add(' ' * (width - len(line.text) - len(hints) - 1)).add(hints, 'footer_dim')
+        return line.fit(width, 'footer')
 
-        return frame
+    def render_frame(self, width=120, height=32):
+        """Return `height` lines of exactly `width` characters; styles land in `frame_styles`."""
+        width = max(60, int(width))
+        height = max(12, int(height))
+        body_height = height - 2
+        sidebar_w = min(40, max(24, width // 4)) if self.show_sidebar else 0
+        main_w = width - sidebar_w - (1 if sidebar_w else 0)
+
+        left = self._sidebar_lines(sidebar_w, body_height) if sidebar_w else []
+        right = self._panel_lines(main_w, body_height) if self.panel else self._diff_lines(main_w, body_height)
+        blank_left = StyledLine().fit(sidebar_w)
+        blank_right = StyledLine().fit(main_w)
+
+        styled = [self._header_line(width)]
+        for i in range(body_height):
+            row = StyledLine()
+            if sidebar_w:
+                row.extend(left[i] if i < len(left) else blank_left).add('│', 'border')
+            row.extend(right[i] if i < len(right) else blank_right)
+            styled.append(row.fit(width))
+        styled.append(self._footer_line(width))
+        self.frame_styles = [line.spans for line in styled]
+        return [line.text for line in styled]
+
+
+def _cached_syntax_spans(text, filename, _cache={}):
+    key = (text, Path(filename or '').suffix)
+    if key not in _cache:
+        if len(_cache) > 4096:
+            _cache.clear()
+        _cache[key] = highlight_syntax(text, filename)
+    return _cache[key]
 
 
 class TuiApp:
     """Interactive curses wrapper around `TuiState`."""
 
+    STYLE_COLORS = {
+        # style: (foreground, background, extra attribute names)
+        'header': ('BLACK', 'CYAN', ()), 'header_title': ('BLACK', 'CYAN', ('A_BOLD',)),
+        'header_dim': ('BLACK', 'CYAN', ()),
+        'footer': (None, None, ('A_REVERSE',)), 'footer_dim': (None, None, ('A_REVERSE', 'A_DIM')),
+        'prompt': ('YELLOW', None, ('A_REVERSE', 'A_BOLD')), 'input': (None, None, ('A_REVERSE',)),
+        'error': ('RED', None, ('A_REVERSE', 'A_BOLD')),
+        'title': (None, None, ('A_BOLD',)), 'title_focus': ('CYAN', None, ('A_BOLD',)),
+        'col': (None, None, ('A_DIM',)), 'col_active': ('CYAN', None, ('A_BOLD',)),
+        'border': (None, None, ('A_DIM',)), 'gutter': (None, None, ('A_DIM',)), 'filler': (None, None, ('A_DIM',)),
+        'dim': (None, None, ('A_DIM',)), 'key': ('YELLOW', None, ('A_BOLD',)),
+        'add': ('GREEN', None, ()), 'add_em': ('GREEN', None, ('A_BOLD', 'A_REVERSE')),
+        'add_gutter': ('GREEN', None, ('A_DIM',)), 'del_gutter': ('RED', None, ('A_DIM',)),
+        'del': ('RED', None, ()), 'del_em': ('RED', None, ('A_BOLD', 'A_REVERSE')),
+        'fold': (None, None, ('A_DIM',)), 'fold_hint': (None, None, ('A_DIM',)), 'comment_bg': ('YELLOW', None, ()),
+        'cursor': ('CYAN', None, ('A_BOLD',)), 'selected': (None, None, ('A_REVERSE',)),
+        'comment': ('YELLOW', None, ('A_BOLD',)), 'summary': ('CYAN', None, ()),
+        'intent': ('MAGENTA', None, ()), 'ref': ('BLUE', None, ('A_UNDERLINE',)),
+        'syn_keyword': ('MAGENTA', None, ()), 'syn_string': ('YELLOW', None, ()), 'syn_comment': (None, None, ('A_DIM',)),
+        'syn_number': ('CYAN', None, ()), 'syn_name': (None, None, ()),
+        'status_MODIFIED': ('YELLOW', None, ('A_BOLD',)), 'status_NEW_FILE': ('CYAN', None, ('A_BOLD',)),
+        'status_RENAMED': ('MAGENTA', None, ('A_BOLD',)), 'status_RELOCATED': ('MAGENTA', None, ('A_BOLD',)),
+        'status_DELETED': ('RED', None, ('A_BOLD',)), 'status_APPLIED': ('GREEN', None, ('A_BOLD',)),
+        'status_MISSING': ('RED', None, ('A_BOLD',)),
+    }
+
+    # Tinted backgrounds for terminals with 256 colours: (foreground, background, extra attributes).
+    STYLE_COLORS_256 = {
+        'header': (252, 236, ()), 'header_title': (16, 74, ('A_BOLD',)), 'header_dim': (245, 236, ()),
+        'add': (None, 22, ()), 'add_em': (231, 28, ('A_BOLD',)), 'add_gutter': (114, 22, ()),
+        'del': (None, 52, ()), 'del_em': (231, 88, ('A_BOLD',)), 'del_gutter': (174, 52, ()),
+        'gutter': (242, None, ()), 'filler': (None, 235, ()), 'border': (238, None, ()),
+        'fold': (244, 235, ()), 'fold_hint': (240, 235, ()),
+        'comment': (221, 236, ('A_BOLD',)), 'comment_bg': (221, 236, ()),
+        'selected': (None, 238, ()), 'cursor': (74, None, ('A_BOLD',)),
+        'col': (245, None, ()), 'col_active': (74, None, ('A_BOLD',)), 'title_focus': (74, None, ('A_BOLD',)),
+        'summary': (110, None, ()), 'intent': (176, None, ()), 'ref': (75, None, ('A_UNDERLINE',)),
+        'dim': (243, None, ()), 'key': (221, None, ('A_BOLD',)),
+        'syn_keyword': (176, None, ()), 'syn_string': (179, None, ()), 'syn_comment': (243, None, ()),
+        'syn_number': (110, None, ()), 'syn_name': (None, None, ()),
+    }
+
     def __init__(self, state):
         self.state = state
+        self.attrs = {}
 
     def run(self):
         if curses is None:
             raise StagedError('Python curses module is unavailable on this platform.')
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             raise StagedError('staged TUI requires an interactive terminal (TTY).')
+        os.environ.setdefault('ESCDELAY', '25')  # Esc should not lag for a second.
+        try:
+            import locale
+            locale.setlocale(locale.LC_ALL, '')
+        except Exception:
+            pass
         curses.wrapper(self._curses_main)
         return self.state
 
     def _init_colors(self):
-        if not curses.has_colors():
-            return
-        curses.start_color()
-        try:
-            curses.use_default_colors()
-        except curses.error:
-            pass
-        curses.init_pair(1, curses.COLOR_GREEN, -1)
-        curses.init_pair(2, curses.COLOR_RED, -1)
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)
-        curses.init_pair(4, curses.COLOR_CYAN, -1)
-        curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+        pairs = {}
+        has_colors = curses.has_colors()
+        if has_colors:
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+                default = -1
+            except curses.error:
+                default = curses.COLOR_BLACK
+        palette = dict(self.STYLE_COLORS)
+        if has_colors and getattr(curses, 'COLORS', 8) >= 256:
+            palette.update(self.STYLE_COLORS_256)
+
+        def colour(value):
+            if value is None:
+                return default
+            return value if isinstance(value, int) else getattr(curses, 'COLOR_' + value)
+
+        for style, (fg, bg, extras) in palette.items():
+            attr = 0
+            for name in extras:
+                attr |= getattr(curses, name, 0)
+            if has_colors and (fg is not None or bg is not None):
+                key = (fg, bg)
+                if key not in pairs and len(pairs) + 1 < curses.COLOR_PAIRS:
+                    pair = len(pairs) + 1
+                    try:
+                        curses.init_pair(pair, colour(fg), colour(bg))
+                        pairs[key] = pair
+                    except curses.error:
+                        pass
+                if key in pairs:
+                    attr |= curses.color_pair(pairs[key])
+            elif not has_colors and style in ('add', 'del', 'header', 'header_title'):
+                attr |= curses.A_BOLD
+            self.attrs[style] = attr
+
+    def _draw(self, stdscr, frame, styles, width, height):
+        stdscr.erase()
+        for y, line in enumerate(frame[:height]):
+            limit = width - 1 if y == height - 1 else width  # the bottom-right cell cannot be written
+            try:
+                stdscr.addnstr(y, 0, line, limit)
+            except curses.error:
+                pass
+            for start, length, style in styles[y] if y < len(styles) else ():
+                attr = self.attrs.get(style)
+                if attr is None or start >= limit:
+                    continue
+                try:
+                    stdscr.chgat(y, start, min(length, limit - start), attr)
+                except curses.error:
+                    pass
+        stdscr.refresh()
 
     def _curses_main(self, stdscr):
         try:
@@ -4659,51 +5291,33 @@ class TuiApp:
             pass
         stdscr.keypad(True)
         self._init_colors()
-
         while not self.state.should_quit:
             height, width = stdscr.getmaxyx()
             frame = self.state.render_frame(width=width, height=height)
-            stdscr.erase()
-            for idx, line in enumerate(frame):
-                if idx >= height:
-                    break
-                attr = curses.A_NORMAL
-                if idx == 0 or idx == height - 1:
-                    attr = curses.A_REVERSE
-                elif '💬 [' in line:
-                    attr = curses.color_pair(3) | curses.A_BOLD
-                elif line.lstrip().startswith('>'):
-                    attr = curses.A_BOLD | curses.color_pair(4)
-                elif ' + ' in line:
-                    attr = curses.color_pair(1)
-                elif ' - ' in line:
-                    attr = curses.color_pair(2)
-                try:
-                    stdscr.addnstr(idx, 0, line, max(0, width - 1), attr)
-                except curses.error:
-                    pass
-            stdscr.refresh()
-            ch = stdscr.getch()
-            self.state.handle_key(ch)
+            self._draw(stdscr, frame, self.state.frame_styles, width, height)
+            try:
+                key = stdscr.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                break
+            self.state.handle_key(key)
 
 
 def run_tui(ctx, session, target=None):
     """Entry point for `staged tui` and `staged diff --tui`."""
     state = TuiState(session, target_file=target, ctx=ctx)
-    app = TuiApp(state)
-    app.run()
+    TuiApp(state).run()
     if state.comments_added_count > 0:
-        print(
-            'Saved {} feedback comment(s). Tell your agent: "Check staged feedback"'.format(
-                state.comments_added_count
-            )
-        )
+        print('Saved {} feedback comment(s). Tell your agent: "Check staged feedback"'.format(
+            state.comments_added_count))
     return state
 
 
-
 def clean_session(ctx, session):
-    if getattr(ctx.args, 'clean_session', None) is not None:
+    whole_session = (getattr(ctx.args, 'clean_session', None) is not None and ctx.args.file is None
+                     and not getattr(ctx.args, 'all', False))
+    if whole_session:
         target_session = session
         paths = target_session.paths(fresh=True)
         if any(target_session.status(rel) != 'APPLIED' for rel in paths):
@@ -4736,8 +5350,9 @@ def clean_session(ctx, session):
             elif GLOBAL_STATE_FILE.exists():
                 GLOBAL_STATE_FILE.unlink()
         rmtree_ignoring_races(target_session.directory)
-        print('Cleaned session {}.'.format(target_session.id))
-        return
+        if not getattr(ctx.args, 'json', False):
+            print('Cleaned session {}.'.format(target_session.id))
+        return {'deleted_session': target_session.id}
 
     target = ctx.args.file
     paths = selected(session, target)
@@ -4770,7 +5385,9 @@ def clean_session(ctx, session):
     if (session.directory / 'summaries.json').exists():
         session.save_summaries(summaries)
     session.refresh_index()
-    print('Cleaned {} staged change(s);'.format(len(paths)))
+    if not getattr(ctx.args, 'json', False):
+        print('Cleaned {} staged change(s).'.format(len(paths)))
+    return {'session': session.id, 'cleaned': paths}
 
 
 def cross_diff(ctx):
@@ -4889,12 +5506,19 @@ def migrate(ctx):
         dest_summaries['session'] = source_summaries['session']
     if any((s.directory / 'summaries.json').exists() for s in (source, dest)):
         dest.save_summaries(dest_summaries)
+    source_intent, dest_intent = source.intent(), dest.intent()
+    if (source_intent['text'] or source_intent['refs']) and not (dest_intent['text'] or dest_intent['refs']):
+        # Keep the reason behind migrated work; never replace an intent the target already records.
+        dest.save_intent(source_intent)
     if not dest.metadata.get('migrated_from'):
         dest.metadata['migrated_from'] = []
     dest.metadata['migrated_from'].append({'session': source.id, 'branch': source.metadata.get('branch'), 'paths': paths})
     save_json(dest.directory / 'session.json', dest.metadata)
     dest.refresh_index()
-    print('Migrated {} change(s) from {} to {}.'.format(len(paths), source.id, dest.id))
+    if getattr(ctx.args, 'json', False):
+        print(json.dumps({'from': source.id, 'to': dest.id, 'migrated': paths}))
+    else:
+        print('Migrated {} change(s) from {} to {}.'.format(len(paths), source.id, dest.id))
 def detect_jetbrains_binary():
     """Resolve PyCharm's documented launchers, without selecting another IDE."""
     names = ['pycharm']
@@ -5422,20 +6046,435 @@ def validate_file_range_args(parser, args):
             parser.error('--expect-sha256 requires a 64-character hexadecimal digest')
 
 
+# ===========================================================================
+# Manual-page help (BSD man(1) layout: NAME, SYNOPSIS, DESCRIPTION, ...)
+# ===========================================================================
+
+COMMON_DESTS = ('tool', 'session', 'root', 'shell', 'verbose')
+COMMAND_GROUPS = [
+    ('Sessions', ('init', 'use', 'migrate')),
+    ('Proposal files', ('read', 'write', 'create', 'copy', 'rename', 'delete', 'path', 'open')),
+    ('Notes for reviewers', ('summarize', 'intent', 'feedback')),
+    ('Review', ('diff', 'tui')),
+    ('Validation', ('fmt', 'check', 'exec', 'sandbox', 'link')),
+    ('Apply and discard', ('apply', 'undo', 'clean')),
+    ('Setup', ('set', 'set-tool', 'install-skill', 'install-completion', 'install-launcher', 'uninstall')),
+]
+
+# One-line NAME summaries plus any longer description, examples and cross-references per command.
+MANUAL = {
+    None: {
+        'name': 'keep agent-proposed changes outside the working tree until you apply them',
+        'more': [
+            'staged gives an agent its own staging area outside your Git working tree. Each session mirrors '
+            'the workspace layout under staging/, with metadata beside it. Nothing reaches the workspace until '
+            'you run an apply.',
+            'With no command, staged prints an overview of the selected session: repository, session, tool, '
+            'branch, staging path and every proposed file grouped by status.',
+        ],
+        'examples': [
+            ('staged', 'overview of the selected session'),
+            ('staged -v', 'include the intent, summaries, paths and line counts'),
+            ('staged --sessions', 'sessions for this repository'),
+            ('staged --intent --session 4f2a', 'why session 4f2a exists'),
+            ('staged tui', 'review side by side in the terminal'),
+            ('staged apply --all', 'apply everything in the selected session'),
+        ],
+        'see_also': [],
+    },
+    'read': {'name': 'read exact file ranges from staging, the workspace or session metadata',
+             'examples': [('staged read --workspace -f src/app.py --start-line 10 --end-line 20 --json', None)],
+             'see_also': ['write']},
+    'write': {'name': 'write or splice contents into a staged file or session metadata',
+              'more': ['Line ranges are one-based and inclusive; without --end-line the input is inserted before '
+                       '--start-line. Byte edits use zero-based --offset and --delete-count. Use --expect-sha256 '
+                       'with the hash from read --json to reject edits to a file that changed meanwhile.'],
+              'examples': [('staged write -f src/app.py --from-workspace --start-line 10 --end-line 20 --stdin < new.txt', None),
+                           ('staged write --meta -f staged_changes.md --text "# Review notes"', None)],
+              'see_also': ['read', 'create']},
+    'create': {'name': 'create a new staged file or session metadata file', 'see_also': ['write', 'copy']},
+    'copy': {'name': 'copy a staged, workspace or metadata file to a new staged destination',
+             'see_also': ['create', 'rename']},
+    'rename': {'name': 'rename a staged file, keeping its workspace origin and summary', 'see_also': ['copy', 'delete']},
+    'delete': {'name': 'discard a proposal, or record a workspace deletion for a later apply',
+               'more': ['Without --workspace, the staged proposal and its summary are discarded. With --workspace, '
+                        'the deletion of the real file is recorded and happens only when you apply it.']},
+    'summarize': {'name': 'write the session summary or a file summary',
+                  'more': ['Summaries describe the current proposal, usually in one sentence. Read them with '
+                           'staged --summary.'],
+                  'examples': [('staged summarize -f src/app.py -m "Handle empty input." --session-message "Tolerate empty input."', None)],
+                  'see_also': ['intent']},
+    'intent': {'name': 'record the original request behind a session',
+               'more': ['The intent says why the session exists: the request in the requester\'s words, plus '
+                        'the PR/MR, issue, ticket or feature it belongs to. Summaries say what the proposal does '
+                        'now. Read the intent with staged --intent.',
+                        'At least one of -m, --stdin, --clear, --ref or --remove-ref is required. --clear is '
+                        'applied first, then the text, then removals, then additions.'],
+               'examples': [('staged intent -m "Make the parser tolerate empty input." --ref https://github.com/acme/app/pull/42', None),
+                            ('staged intent --ref ACME-123', 'add another reference'),
+                            ('staged --intent --json', 'read it back')],
+               'see_also': ['summarize', 'init']},
+    'init': {'name': 'create a session for this workspace and select it',
+             'more': ['Records the workspace and the current Git branch, and binds the session to this shell. '
+                      'Running init with an existing ID reuses that session.'],
+             'examples': [('staged init "$CONVERSATION_ID" --json --intent "Fix empty input." --ref PR-42', None)],
+             'see_also': ['use', 'intent']},
+    'diff': {'name': 'review proposed files in your editor, or apply or clean them',
+             'more': ['Without -f or --all, diff prints the overview. -a applies the selection, -c discards it, '
+                      'and -ac applies then discards. --between and --compare-session compare two sessions.'],
+             'examples': [('staged diff -f src/app.py', 'open one diff in the configured editor'),
+                          ('staged diff -f src/app.py --tool cli', 'unified diff in the terminal'),
+                          ('staged diff -v --all', 'every remaining file, with summaries')],
+             'see_also': ['tui', 'apply', 'clean']},
+    'tui': {'name': 'review, comment on and apply changes in a terminal diff viewer',
+            'more': ['Side-by-side by default. Press ? inside for keys. Applies ask first, honour branch '
+                     'protection and record a backup for staged undo.']},
+    'feedback': {'name': 'view, add, resolve and export review comments for the agent',
+                 'more': ['With no action, prints every comment. The actions --add, --resolve, --resolve-all, '
+                          '--delete and --clear are exclusive. --prompt formats open comments as instructions '
+                          'for an agent; --copy puts that on the clipboard.'],
+                 'examples': [('staged feedback --add -f src/app.py --start-line 10 --end-line 14 -m "Explain this branch."', None),
+                              ('staged feedback --prompt', 'open comments as an agent prompt'),
+                              ('staged feedback --resolve fb-3', None)],
+                 'see_also': ['tui']},
+    'apply': {'name': 'apply proposed files, renames and deletions to the workspace',
+              'more': ['Workspace files that changed since staging are merged with a 3-way merge when possible. '
+                       'Every apply records a backup that staged undo can restore.'],
+              'see_also': ['undo', 'diff']},
+    'undo': {'name': 'restore the workspace from the most recent apply backup', 'see_also': ['apply']},
+    'fmt': {'name': 'format staged files in place without touching the workspace', 'see_also': ['check']},
+    'check': {'name': 'lint, typecheck and verify imports of staged files', 'see_also': ['fmt', 'exec']},
+    'exec': {'name': 'run a command against the staged proposal in a disposable sandbox',
+             'examples': [('staged exec --staging --cwd apps/web -- tsc -p tsconfig.json', None),
+                          ('staged exec -- npm test', 'full workspace copy with the proposal overlaid')],
+             'see_also': ['sandbox', 'check']},
+    'sandbox': {'name': 'list or set up support entries that let tools resolve staged files',
+                'see_also': ['link', 'exec']},
+    'link': {'name': 'link a workspace path into staging as a sandbox entry', 'see_also': ['sandbox']},
+    'clean': {'name': 'discard proposals or a whole session without changing the workspace',
+              'see_also': ['apply', 'delete']},
+    'path': {'name': 'print the absolute path of a staged, workspace, metadata or sandbox file'},
+    'open': {'name': 'open a staged file or session metadata file in your editor'},
+    'use': {'name': 'bind a session or editor to the current shell',
+            'examples': [('staged use 4f2a', None), ('staged use --clear', None)]},
+    'set': {'name': 'set persistent preferences'},
+    'set-tool': {'name': 'register a custom editor by command templates',
+                 'examples': [('staged set-tool meld --name Meld --diff-cmd "meld {orig} {staged}" --open-cmd "meld {staged}"', None)]},
+    'migrate': {'name': 'copy proposals between sessions, refusing stale conflicts'},
+    'install-skill': {'name': 'install the /stage skill for an agent harness'},
+    'install-completion': {'name': 'install shell completions for bash, zsh or PowerShell'},
+    'install-launcher': {'name': 'install the standalone Windows command launcher'},
+    'uninstall': {'name': 'remove installed integrations and, optionally, all sessions'},
+}
+
+MANUAL_ENVIRONMENT = [
+    ('STAGED_SESSION', 'Session to use when --session is not given.'),
+    ('STAGED_SHELL_ID', 'Stable ID for the shell binding when each command runs in a new shell.'),
+    ('STAGED_ROOT', 'Staging root, overriding the configured one.'),
+    ('STAGED_TOOL', 'Editor adapter, overriding the shell binding and default.'),
+    ('NO_COLOR', 'Disable color.'),
+    ('FORCE_COLOR', 'Enable color even when output is not a terminal.'),
+    ('PAGER', 'Pager for long help output (default: less -R).'),
+]
+
+
+def _manual_width():
+    return max(60, min(88, shutil.get_terminal_size((80, 24)).columns))
+
+
+def _arg_name(action):
+    if action.choices and not action.metavar:
+        return '|'.join(str(choice) for choice in action.choices)
+    plain = {'start_line': 'line', 'end_line': 'line', 'snippet_focus': 'text', 'message': 'text',
+             'session_message': 'text', 'compare_session': 'id', 'offset': 'n', 'length': 'n',
+             'delete_count': 'n', 'expect_sha256': 'hash', 'default_session': 'id', 'source': 'id',
+             'protected_branch': 'pattern', 'session_root': 'dir', 'target_dir': 'dir', 'cmd': 'template',
+             'diff_cmd': 'template', 'open_cmd': 'template', 'resolve': 'id', 'delete': 'id', 'to': 'path',
+             'file': 'file', 'target': 'path', 'cwd': 'dir', 'clean_session': 'id', 'id': 'id', 'name': 'name'}
+    name = action.metavar or plain.get(action.dest, action.dest)
+    if isinstance(name, tuple):
+        return ' '.join(part.lower() for part in name)
+    return name.lower().replace('_', '-')
+
+
+def _action_token(action, short=True):
+    """The synopsis spelling of one option or operand, e.g. `-m text` or `[id]`."""
+    if not action.option_strings:
+        if action.nargs == argparse.REMAINDER:
+            return _arg_name(action) + ' ...'
+        return '[{}]'.format(_arg_name(action)) if action.nargs == '?' else _arg_name(action)
+    flags = sorted(action.option_strings, key=len)
+    flag = flags[0] if short else flags[-1]
+    if action.nargs == 0:
+        return flag
+    value = _arg_name(action)
+    if action.nargs == '?':
+        value = '[' + value + ']'
+    return '{} {}{}'.format(flag, value, ' ...' if isinstance(action, argparse._AppendAction) else '')
+
+
+def _visible_actions(parser, common=None):
+    """Public actions of a parser; common=True/False selects only/omits the common options."""
+    result = []
+    for action in parser._actions:
+        if isinstance(action, (argparse._HelpAction, argparse._SubParsersAction)) or action.help == argparse.SUPPRESS:
+            continue
+        is_common = action.dest in COMMON_DESTS and parser.prog != 'staged'
+        if common is None or common == is_common:
+            result.append(action)
+    return result
+
+
+def synopsis_lines(parser):
+    if parser.prog == 'staged':
+        return ['staged [-v] [--json] [-s id] [-t tool] [--root dir]',
+                'staged --sessions | -R | --list [--json]',
+                'staged --summary [-f file] [--json]',
+                'staged --intent [--json]',
+                'staged command [options]',
+                'staged help [command]']
+    actions = _visible_actions(parser, common=False)
+    groups = {}
+    for group in parser._mutually_exclusive_groups:
+        members = [a for a in group._group_actions if a in actions]
+        if members:
+            for action in members:
+                groups[action] = (group, members)
+    tokens, seen = [], set()
+    for action in actions:
+        if action in groups:
+            group, members = groups[action]
+            if id(group) in seen:
+                continue
+            seen.add(id(group))
+            text = ' | '.join(_action_token(a) for a in members)
+            tokens.append(('({})' if group.required and len(members) > 1 else '{}' if group.required else '[{}]').format(text))
+        elif action.option_strings:
+            token = _action_token(action)
+            tokens.append(token if action.required else '[' + token + ']')
+        else:
+            tokens.append(_action_token(action))
+    if _visible_actions(parser, common=True):
+        tokens.append('[common options]')
+    width = _manual_width() - 12
+    lines, current = [], parser.prog
+    indent = ' ' * (len(parser.prog) + 1)
+    for token in tokens:
+        if len(current) + 1 + len(token) > width and current.strip() != parser.prog:
+            lines.append(current)
+            current = indent + token
+        else:
+            current += ' ' + token
+    lines.append(current)
+    return lines
+
+
+def _paint(text, code):
+    return color(text, code) if code else text
+
+
+def _option_heading(action):
+    """`-m text, --message text` with flags bold and arguments underlined, plus its plain length."""
+    parts_plain, parts_color = [], []
+    if not action.option_strings:
+        name = _action_token(action)
+        return name, _paint(name, '4;33')
+    for flag in sorted(action.option_strings, key=len):
+        if action.nargs == 0:
+            plain, painted = flag, _paint(flag, '1;36')
+        else:
+            value = _arg_name(action)
+            if action.nargs == '?':
+                value = '[' + value + ']'
+            plain = flag + ' ' + value
+            painted = _paint(flag, '1;36') + ' ' + _paint(value, '4;33')
+        parts_plain.append(plain)
+        parts_color.append(painted)
+    return ', '.join(parts_plain), ', '.join(parts_color)
+
+
+def _wrap(text, indent, width):
+    return textwrap.fill(' '.join(text.split()), width, initial_indent=indent, subsequent_indent=indent)
+
+
+def _option_entries(actions, width):
+    out = []
+    for action in actions:
+        plain, painted = _option_heading(action)
+        help_text = (action.help or '').replace('%(default)s', str(action.default))
+        body = _wrap(help_text[:1].upper() + help_text[1:] + ('' if help_text.endswith('.') else '.'),
+                     ' ' * 13, width)
+        if len(plain) <= 6:
+            out.append('     ' + painted + ' ' * (8 - len(plain)) + body.lstrip())
+        else:
+            out.append('     ' + painted)
+            out.append(body)
+        out.append('')
+    return out
+
+
+def render_manual(parser):
+    """Render a parser as a BSD-style manual page."""
+    width = _manual_width()
+    command = None if parser.prog == 'staged' else parser.prog.split(' ', 1)[1]
+    info = MANUAL.get(command, {})
+    title = ('STAGED' if command is None else 'STAGED-' + command.upper()) + '(1)'
+    middle = 'staged manual'
+    gap = max(1, (width - 2 * len(title) - len(middle)) // 2)
+    lines = [title + ' ' * gap + middle + ' ' * max(1, width - 2 * len(title) - len(middle) - gap) + title, '']
+
+    def heading(text):
+        lines.append(_paint(text, '1'))
+
+    heading('NAME')
+    name_line = _wrap('{} – {}'.format(parser.prog, info.get('name', parser.description or '')), '     ', width)
+    lines.append(name_line.replace(parser.prog, _paint(parser.prog, '1'), 1))
+    lines.append('')
+    heading('SYNOPSIS')
+    for line in synopsis_lines(parser):
+        lines.append('     ' + line)
+    lines.append('')
+    heading('DESCRIPTION')
+    paragraphs = list(info.get('more', [])) or ([parser.description] if command else [])
+    for paragraph in paragraphs:
+        if paragraph:
+            lines.append(_wrap(paragraph, '     ', width))
+            lines.append('')
+    if command is None:
+        heading('COMMANDS')
+        names = {a.dest: a for a in parser._actions if isinstance(a, argparse._SubParsersAction)}
+        choices = next(iter(names.values())).choices if names else {}
+        for title_text, members in COMMAND_GROUPS:
+            lines.append('     ' + _paint(title_text, '1'))
+            for name in members:
+                summary = MANUAL.get(name, {}).get('name', choices[name].description if name in choices else '')
+                body = _wrap(summary, ' ' * 26, width)
+                lines.append('       ' + _paint(name, '1;36') + ' ' * (19 - len(name)) + body.lstrip())
+            lines.append('')
+        lines.append(_wrap('Run staged help <command> or staged <command> --help for a command\'s manual, '
+                           'and staged --help-all for every manual.', '     ', width))
+        lines.append('')
+    options = _visible_actions(parser, common=False)
+    if options:
+        lines.append('     The options are as follows:' if command else '')
+        lines.append('')
+        if command is None:
+            lines.pop()
+            lines.pop()
+            heading('OPTIONS')
+        lines.extend(_option_entries(options, width))
+    common = _visible_actions(parser, common=True)
+    if common:
+        heading('COMMON OPTIONS')
+        lines.extend(_option_entries(common, width))
+    if command is None:
+        heading('ENVIRONMENT')
+        for name, text in MANUAL_ENVIRONMENT:
+            lines.append('     ' + _paint(name, '1'))
+            lines.append(_wrap(text, ' ' * 13, width))
+            lines.append('')
+        heading('EXIT STATUS')
+        lines.append(_wrap('staged exits 0 on success, 1 when a command fails, 2 for invalid usage and 130 when '
+                           'interrupted. check, fmt --check and exec pass through failure codes.', '     ', width))
+        lines.append('')
+    if info.get('examples'):
+        heading('EXAMPLES')
+        for example, note in info['examples']:
+            if note:
+                lines.append('     ' + _paint('# ' + note, '2'))
+            lines.append('     ' + _paint('$ ' + example, '32'))
+            lines.append('')
+    see_also = ['staged(1)'] if command else []
+    see_also += ['staged-{}(1)'.format(name) for name in info.get('see_also', [])]
+    if command is None:
+        see_also += ['staged-diff(1)', 'staged-tui(1)', 'staged-intent(1)', 'staged-apply(1)']
+    if see_also:
+        heading('SEE ALSO')
+        lines.append(_wrap(', '.join(see_also), '     ', width))
+        lines.append('')
+    return '\n'.join(lines).rstrip() + '\n'
+
+
+def emit_manual(text, file=None):
+    """Print help, through a pager when it is longer than an interactive terminal."""
+    stream = file or sys.stdout
+    if file is None and sys.stdout.isatty() and sys.stdin.isatty():
+        rows = shutil.get_terminal_size((80, 24)).lines
+        if text.count('\n') >= rows:
+            pager = os.environ.get('PAGER') or 'less -R'
+            env = dict(os.environ)
+            env.setdefault('LESS', 'FRX')
+            try:
+                process = subprocess.Popen(shlex.split(pager), stdin=subprocess.PIPE, env=env)
+                process.communicate(text.encode('utf-8'))
+                return
+            except (OSError, ValueError):
+                pass
+    stream.write(text)
+    stream.flush()
+
+
+# Common options every command accepts, and the commands whose help lists them. Elsewhere they are
+# still accepted (scripts keep working) but hidden, because they change nothing there.
+COMMON_OPTION_COMMANDS = {
+    'session': None,  # every command except those below
+    'tool': ('diff', 'open', 'use', 'set', 'install-skill'),
+    'root': None,
+    'shell': ('init', 'install-completion'),
+    'verbose': ('diff',),
+}
+NO_SESSION_COMMANDS = ('init', 'clean', 'set', 'set-tool', 'install-skill', 'install-completion',
+                       'install-launcher', 'uninstall')
+NO_ROOT_COMMANDS = ('set-tool', 'install-completion', 'install-launcher', 'uninstall', 'set')
+# Proposal-only commands accept --meta with -f so agents can use one syntax everywhere; it changes nothing.
+META_NOOP_COMMANDS = ('summarize', 'diff', 'apply', 'clean', 'migrate', 'tui', 'feedback', 'fmt', 'check')
+
+
+class StagedArgumentParser(argparse.ArgumentParser):
+    """argparse with BSD-style usage lines and manual-page help (see render_manual)."""
+
+    def format_usage(self):
+        return 'usage: ' + '\n       '.join(synopsis_lines(self)) + '\n'
+
+    def print_help(self, file=None):
+        emit_manual(render_manual(self), file)
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, '{}: {}\nRun {} --help for details.\n'.format(self.prog, message, self.prog))
+
+
 def make_parser():
-    def globals_on(parser, path_command=False, clean_command=False):
-        parser.add_argument('-t', '--tool', default=argparse.SUPPRESS, help='editor adapter ID')
-        if not clean_command:
-            flags = ['--session'] if path_command else ['-s', '--session']
-            parser.add_argument(*flags, default=argparse.SUPPRESS, help='session ID or unique prefix')
-        parser.add_argument('--root', default=argparse.SUPPRESS, help='staging root (outside the workspace)')
+    def globals_on(parser, name=None):
+        def shown(key, text):
+            if name is None:
+                return text
+            listed = COMMON_OPTION_COMMANDS[key]
+            if key == 'session':
+                return argparse.SUPPRESS if name in NO_SESSION_COMMANDS else text
+            if key == 'root':
+                return argparse.SUPPRESS if name in NO_ROOT_COMMANDS else text
+            return text if name in listed else argparse.SUPPRESS
+        parser.add_argument('-t', '--tool', default=argparse.SUPPRESS, metavar='TOOL',
+                            help=shown('tool', 'editor adapter to use (see staged set-tool); also selects that '
+                                       'editor\'s staging root'))
+        if name != 'clean':
+            parser.add_argument('-s', '--session', default=argparse.SUPPRESS, metavar='ID',
+                                help=shown('session', 'session ID or unique prefix (default: the shell binding, '
+                                           'then the most recently changed session)'))
+        parser.add_argument('--root', default=argparse.SUPPRESS, metavar='DIR',
+                            help=shown('root', 'staging root to use; must be outside the workspace'))
         parser.add_argument('--shell', choices=['bash', 'zsh', 'powershell'], default=argparse.SUPPRESS,
-                            help='shell for setup; powershell offers an optional Windows launcher')
-        parser.add_argument('-v', '--verbose', action='store_true', default=argparse.SUPPRESS, help='include session/file summaries in diff and overview, plus overview paths, sizes and timestamps')
-    parser = argparse.ArgumentParser(
+                            help=shown('shell', 'shell to set up completions for; powershell also offers the '
+                                       'Windows launcher'))
+        parser.add_argument('-v', '--verbose', action='store_true', default=argparse.SUPPRESS,
+                            help=shown('verbose', 'include the intent and summaries; the overview also shows '
+                                       'paths, line counts, sizes and times'))
+    parser = StagedArgumentParser(
         prog='staged', description=__doc__,
         epilog='Run staged <command> --help for command options, or staged --help-all for the full reference. '
-               'Use --sessions to list sessions, --summary to read summaries, and --session <id> to select one.')
+               'Use --sessions to list sessions, --summary to read summaries, --intent to read the original request, '
+               'and --session <id> to select one.')
     parser.set_defaults(tool=None, session=None, root=None, verbose=False, clean_session=None, shell=None, meta=False)
     globals_on(parser)
     parser.add_argument('-R', '--all-repos', action='store_true', help='list sessions across repositories')
@@ -5444,11 +6483,13 @@ def make_parser():
     parser.add_argument('--list', action='store_true', help='print proposed file paths, one per line')
     parser.add_argument('--summary', action='store_true',
                         help='show the session summary and file summaries; use -f to select one file')
+    parser.add_argument('--intent', dest='show_intent', action='store_true',
+                        help='show the original request behind the session and its related PR/MR/issue references')
     parser.add_argument('-f', '--file', dest='summary_file', metavar='FILE',
                         help='with --summary, show the summary for one proposed file')
-    parser.add_argument('--meta', action='store_true', default=argparse.SUPPRESS,
-                        help='accepted with -f for consistent syntax; summary selection remains proposal-based')
-    parser.add_argument('--json', dest='summary_json', action='store_true', help='with --summary, print structured summaries')
+    parser.add_argument('--meta', action='store_true', default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument('--json', dest='summary_json', action='store_true',
+                        help='print structured output for the overview, --sessions, --list, --summary or --intent')
     for helper in ('--complete', '--complete-sessions', '--complete-tools', '--complete-open', '--complete-meta', '--complete-options'):
         parser.add_argument(helper, action='store_true', help=argparse.SUPPRESS)
     subs = parser.add_subparsers(dest='command')
@@ -5461,6 +6502,7 @@ def make_parser():
         'rename': 'Rename a staged file, or a session metadata file with --meta.',
         'delete': 'Discard a staged proposal, record a workspace deletion, or delete metadata with --meta.',
         'summarize': 'Write concise session and file change summaries (view them with staged --summary).',
+        'intent': 'Record the original request and related PR/MR/issue references (view with staged --intent).',
         'init': 'Create an isolated session and record its workspace and branch.',
         'diff': 'Review proposed files, apply with -a, clean with -c, or apply then clean with -ac.',
         'tui': 'Launch the built-in 2-pane interactive terminal diff viewer and inline comment reviewer.',
@@ -5486,16 +6528,20 @@ def make_parser():
     }
     for name in COMMANDS:
         command = subs.add_parser(name, description=descriptions[name], help=descriptions[name])
-        globals_on(command, name == 'path', name == 'clean')
+        globals_on(command, name)
         command_parsers[name] = command
     for name in ('diff', 'apply', 'clean', 'migrate', 'path', 'open'):
-        selection = command_parsers[name].add_mutually_exclusive_group(required=name != 'diff')
-        selection.add_argument('-f', '--file', help='select one file (migration also accepts a quoted glob)')
+        selection = command_parsers[name].add_mutually_exclusive_group(required=name not in ('diff', 'clean'))
+        selection.add_argument('-f', '--file', help=(
+            'file to locate; partial names match the same way for staged, --workspace, --meta and --sandbox'
+            if name in ('path', 'open') else 'select one file (migration also accepts a quoted glob)'))
         if name in ('diff', 'apply', 'clean', 'migrate'):
             selection.add_argument('--all', action='store_true', help='select all proposed changes')
         if name == 'clean':
-            selection.add_argument('-s', '--session', nargs='?', const=True, dest='clean_session', default=argparse.SUPPRESS,
-                                   metavar='id', help='discard the entire session directory (active session when omitted)')
+            command_parsers[name].add_argument(
+                '-s', '--session', nargs='?', const=True, dest='clean_session', default=argparse.SUPPRESS, metavar='id',
+                help='session to clean; without -f or --all, discard that entire session directory '
+                     '(the active session when no ID is given)')
     for name in ('read', 'write'):
         p = command_parsers[name]
         p.add_argument('-f', '--file', required=True, help='exact relative file path (no fuzzy matching)')
@@ -5537,8 +6583,21 @@ def make_parser():
     payload.add_argument('--clear', action='store_true', help='clear the selected session or file summary')
     p.add_argument('--session-message', help='also update the session summary alongside a file summary')
     p.add_argument('--json', action='store_true', help='print the complete structured summaries object after writing')
+    p = command_parsers['intent']
+    payload = p.add_mutually_exclusive_group()
+    payload.add_argument('-m', '--message', metavar='TEXT',
+                         help='the original request, in the requester\'s words where possible')
+    payload.add_argument('--stdin', action='store_true', help='read intent text from standard input')
+    payload.add_argument('--clear', action='store_true', help='remove the recorded intent and references')
+    p.add_argument('--ref', action='append', metavar='REF',
+                   help='related PR/MR/issue URL, ticket ID or feature name; repeat for each reference')
+    p.add_argument('--remove-ref', action='append', metavar='REF', help='remove a recorded reference; repeatable')
+    p.add_argument('--json', action='store_true', help='print the stored intent after writing')
     p = command_parsers['init']
     p.add_argument('id', nargs='?', help='conversation ID; generates a UUID when omitted')
+    p.add_argument('--intent', dest='intent_text', metavar='TEXT',
+                   help='record the original request when creating or reusing the session')
+    p.add_argument('--ref', action='append', metavar='REF', help='with --intent, a related PR/MR/issue reference; repeatable')
     p.add_argument('--json', action='store_true', help='print machine-readable session paths')
     p = command_parsers['diff']
     p.add_argument('-a', '--apply', action='store_true', help='apply proposed changes before any requested clean')
@@ -5589,26 +6648,35 @@ def make_parser():
     p.add_argument('--json', action='store_true', help='print structured operation results')
     p = command_parsers['clean']
     p.add_argument('-y', '--yes', action='store_true', help='confirm discarding proposed changes')
-    p = command_parsers['path']
-    group = p.add_mutually_exclusive_group()
-    group.add_argument('-s', '--staged', action='store_true', help='print proposed-file path (default)')
-    group.add_argument('-w', '--workspace', action='store_true', help='print the original workspace path')
-    group.add_argument('--meta', action='store_true', default=argparse.SUPPRESS,
-                       help='print a session metadata file path (it need not exist yet)')
-    group.add_argument('--sandbox', action='store_true', help='print a sandbox entry path')
+    for name, verb in (('path', 'print'), ('open', 'open')):
+        group = command_parsers[name].add_mutually_exclusive_group()
+        # The staged copy is the default; --staged survives only so old scripts keep working.
+        group.add_argument('--staged', action='store_true', help=argparse.SUPPRESS)
+        group.add_argument('-w', '--workspace', action='store_true',
+                           help='{} the workspace original (for a rename, the original path)'.format(verb))
+        group.add_argument('--meta', action='store_true', default=argparse.SUPPRESS,
+                           help='{} a session file beside staging/, such as staged_changes.md{}'.format(
+                               verb, ' (it need not exist yet)' if name == 'path' else ''))
+        group.add_argument('--sandbox', action='store_true', help='{} a sandbox entry inside staging/'.format(verb))
     for name in SANDBOX_FILE_COMMANDS:
-        if name != 'path':
+        if name not in ('path', 'open'):
             command_parsers[name].add_argument(
                 '--sandbox', action='store_true',
                 help='use a sandbox entry inside staging/ that is never a proposal (see staged sandbox)')
-    for name in ('read', 'write', 'create', 'copy', 'rename', 'delete', 'open'):
+    for name in ('read', 'write', 'create', 'copy', 'rename', 'delete'):
         command_parsers[name].add_argument(
             '--meta', action='store_true', default=argparse.SUPPRESS,
             help='use a top-level session metadata file (e.g. staged_changes.md) instead of a proposal')
-    for name in ('summarize', 'diff', 'apply', 'clean', 'migrate', 'tui', 'feedback', 'fmt', 'check'):
-        command_parsers[name].add_argument(
-            '--meta', action='store_true', default=argparse.SUPPRESS,
-            help='accepted with -f for consistent syntax; this command remains proposal-based')
+    for name in META_NOOP_COMMANDS:
+        command_parsers[name].add_argument('--meta', action='store_true', default=argparse.SUPPRESS,
+                                           help=argparse.SUPPRESS)
+    for name in ('diff', 'apply', 'clean', 'migrate'):
+        command_parsers[name].add_argument('--json', action='store_true', help={
+            'diff': 'print the overview, or the apply/clean result, as JSON',
+            'apply': 'print the applied paths, statuses and backup ID as JSON',
+            'clean': 'print the cleaned paths (or deleted session) as JSON',
+            'migrate': 'print the migrated paths as JSON',
+        }[name])
     p = command_parsers['use']
     p.add_argument('id', nargs='?', help='session ID or unique prefix to bind to this shell')
     p.add_argument('--clear', action='store_true', help='clear current shell session and tool bindings')
@@ -5644,10 +6712,12 @@ def completion_options(words, parser, commands):
     """Derive public candidates from the parser, skipping global option values."""
     selected = parser
     remaining = 0
+    pending = None
     for word in words:
         if remaining:
             remaining -= 1
             continue
+        pending = None
         if word == 'help':
             return list(commands)
         if word in commands and selected is parser:
@@ -5658,7 +6728,11 @@ def completion_options(words, parser, commands):
         if action is None and selected is not parser:
             action = parser._option_string_actions.get(word.split('=', 1)[0])
         if action and action.nargs != 0 and '=' not in word:
-            remaining = 1
+            remaining = 2 if action.nargs == 2 else 1
+            pending = action
+    if remaining and pending is not None:
+        # The cursor is on this option's value: offer values, never flags.
+        return completion_values(pending, selected)
     blocked = set()
     if '--meta' in words:
         blocked.update(('--workspace', '--from-workspace'))
@@ -5673,6 +6747,21 @@ def completion_options(words, parser, commands):
     return (list(commands) if selected is parser else []) + options
 
 
+def completion_values(action, command):
+    """Candidates for an option value: its choices, or live session data for IDs and references."""
+    if action.choices:
+        return [str(choice) for choice in action.choices]
+    dynamic = {'remove_ref': lambda session: session.intent()['refs'],
+               'resolve': lambda session: [c['id'] for c in load_feedback(session)['comments'] if c['status'] == 'open'],
+               'delete': lambda session: [c['id'] for c in load_feedback(session)['comments']]}
+    if action.dest in dynamic and (action.dest == 'remove_ref' or command.prog == 'staged feedback'):
+        try:
+            return dynamic[action.dest](Context(argparse.Namespace()).active(notify=False))
+        except (StagedError, OSError, ValueError):
+            return []
+    return []
+
+
 def completion_files(ctx, words):
     """Return -f/--to candidates, using metadata names whenever --meta is present."""
     command = next((word for word in words if word in COMMANDS), None)
@@ -5680,7 +6769,9 @@ def completion_files(ctx, words):
     if '--sandbox' in words and command in SANDBOX_FILE_COMMANDS:
         return sorted(session.sandbox_entries())
     if '--meta' not in words or command not in META_FILE_COMMANDS:
-        return session.openable_paths() if command == 'open' else session.paths()
+        if command == 'open' and not ({'-w', '--workspace'} & set(words)):
+            return session.openable_paths()
+        return session.paths()
     existing = set(session.session_files())
     managed = set(MANAGED_METADATA)
     suggestions = set(SUGGESTED_METADATA)
@@ -6114,7 +7205,9 @@ def main(argv=None):
     parser, commands = make_parser()
     # Completion must work with incomplete arguments and without loading user configuration.
     if argv[:1] == ['--complete-options']:
-        print('\n'.join(completion_options(argv[1:], parser, commands)))
+        candidates = completion_options(argv[1:], parser, commands)
+        if candidates:
+            print('\n'.join(candidates))
         return
     if argv[:1] == ['--complete-files']:
         try:
@@ -6124,15 +7217,12 @@ def main(argv=None):
                 raise
         return
     if '--help-all' in argv:
-        parser.print_help()
-        for command in commands.values():
-            print('\n' + '=' * 72)
-            command.print_help()
+        emit_manual('\n'.join(render_manual(p) for p in [parser] + list(commands.values())))
         return
     # Handle help before parsing required values or reading any configuration.
     if '--help' in argv or '-h' in argv or argv[:1] == ['help']:
         command = next((arg for arg in argv if arg in commands), None)
-        (commands.get(command) or parser).print_help()
+        emit_manual(render_manual(commands.get(command) or parser))
         return
     args = parser.parse_args(argv)
     if args.command in ('read', 'write'):
@@ -6141,15 +7231,29 @@ def main(argv=None):
         validate_meta_args(commands[args.command], args)
     if args.command == 'link' and not args.sandbox:
         commands['link'].error('link creates sandbox entries only; pass --sandbox (proposals cannot be symlinks)')
-    if args.summary_json and not args.summary:
-        parser.error('--json requires --summary: staged --summary --json')
+    if args.summary_json and args.command is not None:
+        commands[args.command].error('put --json after the command: staged {} --json'.format(args.command))
+    if args.summary_json and args.summary and args.show_intent:
+        parser.error('--json takes one view; use staged --summary --json or staged --intent --json')
     if args.summary_file is not None and not args.summary:
         parser.error('--file requires --summary: staged --summary -f <file>')
-    if args.summary and (args.command is not None or args.sessions or args.all_repos or args.list):
-        parser.error('--summary cannot be combined with a command or another listing')
+    for flag, enabled in (('--summary', args.summary), ('--intent', args.show_intent)):
+        if enabled and (args.command is not None or args.sessions or args.all_repos or args.list):
+            parser.error(flag + ' cannot be combined with a command or another listing')
+    if args.command == 'init' and args.ref and args.intent_text is None:
+        commands['init'].error('--ref requires --intent')
     if args.command == 'diff' and (args.apply or args.clean or args.between or args.compare_session):
         if args.file is None and not args.all:
             commands['diff'].error('choose --file <file> or --all')
+    if args.command == 'clean':
+        whole = getattr(args, 'clean_session', None)
+        if args.file is None and not args.all and whole is None:
+            commands['clean'].error('choose -f <file>, --all, or -s [id] to discard a whole session')
+        if whole is True and (args.file is not None or args.all):
+            commands['clean'].error('-s needs a session ID with -f or --all: staged clean --all -s <id>')
+    if args.command == 'diff' and args.json and not (args.apply or args.clean) and (
+            args.file is not None or args.all or args.between or args.compare_session or args.tui):
+        commands['diff'].error('--json applies to the overview, --apply and --clean')
     if args.command == 'install-launcher':
         install_launcher()
         return
@@ -6168,21 +7272,7 @@ def main(argv=None):
             for session in sessions:
                 print(session.id)
             return
-        rows = []
-        for session in sessions:
-            count = len(session.paths())
-            rows.append((session, '{} {}'.format(count, 'change' if count == 1 else 'changes')))
-        id_width = max((len(session.id) for session, _ in rows), default=0)
-        count_width = max((len(count) for _, count in rows), default=0)
-        for session, count in rows:
-            workspace = str(session.workspace)
-            if not session.workspace.is_dir():
-                workspace += ' (workspace not found)'
-            print('{}\t{}\t{}\n\t{}'.format(
-                color(session.id.ljust(id_width), '36'), color(count.ljust(count_width), '33'),
-                color(workspace, '1'), color(session.staging, '2')))
-            print('\t{}'.format(color('Summary', '1')))
-            show_summary_text(session.summaries()['session'], indent='\t')
+        list_sessions(sessions, args.summary_json)
         return
     if args.complete_open or args.complete_meta:
         try:
@@ -6197,7 +7287,8 @@ def main(argv=None):
         return
     if args.complete or args.list:
         try:
-            print('\n'.join(ctx.active(notify=False).paths()))
+            paths = ctx.active(notify=False).paths()
+            print(json.dumps(paths) if args.list and args.summary_json else '\n'.join(paths))
         except StagedError as exc:
             if not str(exc).startswith('No staging session'):
                 raise
@@ -6217,8 +7308,14 @@ def main(argv=None):
     if args.command == 'summarize':
         update_summary(ctx.active(notify=False), args)
         return
+    if args.command == 'intent':
+        update_intent(ctx.active(notify=False), args)
+        return
     if args.summary:
         show_summaries(ctx.active(notify=False), args.summary_file, args.summary_json)
+        return
+    if args.show_intent:
+        show_intent(ctx.active(notify=False), args.summary_json)
         return
     if args.command in ('read', 'write'):
         session = ctx.active(notify=False)
@@ -6228,15 +7325,21 @@ def main(argv=None):
         offer_launcher_install()
     if args.command == 'init':
         session = init_session(ctx, args.id or args.session or str(uuid.uuid4()))
+        if args.intent_text is not None:
+            update_intent(session, argparse.Namespace(message=args.intent_text, stdin=False, clear=False,
+                                                      ref=args.ref, remove_ref=None, json=None, quiet=True))
         ctx.shell['session'] = session.id
         ctx.shell.pop('deleted_session', None)
         save_json(ctx.shell_path, ctx.shell)
         result = {'session': session.id, 'workspace': str(session.workspace), 'staging': str(session.staging),
-                  'branch': session.metadata.get('branch'), 'directory': str(session.directory)}
+                  'branch': session.metadata.get('branch'), 'directory': str(session.directory),
+                  'intent': session.intent()}
         if args.json:
             print(json.dumps(result))
         else:
-            print('Session: {}\nStaging: {}\nReview: staged --session {}'.format(session.id, session.staging, session.id))
+            for line in label_lines([('Session', session.id, '36'), ('Staging', str(session.staging)),
+                                     ('Review', 'staged --session ' + session.id)]):
+                print(line)
         return
     if args.command == 'use':
         if args.id and args.session:
@@ -6257,7 +7360,10 @@ def main(argv=None):
         if args.tool:
             ctx.shell['tool'] = ctx.tool().id
         save_json(ctx.shell_path, ctx.shell)
-        print('Shell binding: ' + json.dumps(ctx.shell))
+        print('Bound to this shell:')
+        for line in label_lines([(key.capitalize(), value, '36') for key, value in sorted(ctx.shell.items())
+                                 if key in ('session', 'tool')], NESTED):
+            print(line)
         return
     if args.command == 'set':
         set_preferences(ctx)
@@ -6308,22 +7414,8 @@ def main(argv=None):
         session = ctx.find_session(args.clean_session, require_workspace=False)
     else:
         session = ctx.active()
-    if args.command == 'path' and args.sandbox:
-        if args.file not in session.sandbox_entries():
-            raise StagedError('No sandbox entry at exact path: ' + args.file)
-        print(session.staging / args.file)
-    elif args.command == 'path' and args.meta:
-        paths = session.openable_paths(meta=True)
-        rel = resolve_meta_alias(args.file, paths)
-        print(range_path(session, rel if rel in paths else args.file, meta=True))
-    elif args.command == 'path':
-        rel = match_file(args.file, session.paths())
-        if args.workspace:
-            print(session.original(rel))
-        elif rel in session.deletions:
-            raise StagedError('Deletion has no staged file; use --workspace.')
-        else:
-            print(safe_path(session.staging, rel))
+    if args.command == 'path':
+        print(resolve_location(session, args.file, location_kind(args))[1])
     elif args.command == 'open':
         open_file(ctx, session, args.file)
     elif args.command == 'tui' or (args.command == 'diff' and getattr(args, 'tui', False)):
@@ -6347,20 +7439,29 @@ def main(argv=None):
     elif args.command == 'sandbox':
         handle_sandbox(session, args)
     elif args.command == 'apply' or (args.command == 'diff' and args.apply):
-        apply_changes(ctx, session, args.file)
+        result = apply_changes(ctx, session, args.file)
         if args.command == 'diff' and args.clean:
-            clean_session(ctx, session)
+            result.update(clean_session(ctx, session))
+        if args.json:
+            print(json.dumps(result))
     elif args.command == 'clean' or (args.command == 'diff' and getattr(args, 'clean', False)):
-        clean_session(ctx, session)
+        result = clean_session(ctx, session)
+        if args.json:
+            print(json.dumps(result))
     elif args.command == 'diff' and (args.file is not None or args.all):
         review(ctx, session, args.file)
     else:
-        overview(ctx, session)
+        overview(ctx, session, args.summary_json or getattr(args, 'json', False))
 
 
 if __name__ == '__main__':
     try:
         main()
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # The reader (for example `head`) closed the pipe: stop quietly, like other CLI tools.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(141)
     except (StagedError, OSError, ValueError, subprocess.SubprocessError) as exc:
         print('Error: {}'.format(exc), file=sys.stderr)
         sys.exit(1)

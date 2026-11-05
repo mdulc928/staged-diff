@@ -264,7 +264,7 @@ staged write -f notes.txt --append --text ' — revised'
 - **Output**: Reads emit raw bytes. `--json` adds range information and the full-file SHA-256; non-UTF-8 slices use Base64 with `encoding: "base64"`.
 - **Preservation**: Edits preserve bytes outside the selected range, including CRLF. Line boundaries use LF; byte ranges can split UTF-8 characters.
 - **Session metadata**: Add `--meta` to read or write a top-level session file such as `staged_changes.md`. `write --meta` creates the file when it is absent. `--meta` cannot be combined with `--workspace` or `--from-workspace`, and it cannot modify `session.json`, `renames.json`, or `summaries.json`.
-- **Consistent selection**: Any command that accepts `-f` also accepts `--meta`. On metadata-capable commands it switches completion and file access to session metadata. On proposal-only commands (`--summary`, `summarize`, `diff`, `apply`, `clean`, and `migrate`) it is accepted as a no-op and `-f` continues to complete proposal paths.
+- **Consistent selection**: Any command that accepts `-f` also accepts `--meta`. On metadata-capable commands it switches completion and file access to session metadata. On proposal-only commands (`--summary`, `summarize`, `diff`, `apply`, `clean`, `migrate`, `tui`, `feedback`, `fmt` and `check`) it is accepted as a no-op, left out of their help, and `-f` continues to complete proposal paths.
 
 ```bash
 staged write --meta -f staged_changes.md --text '# Session notes'
@@ -321,7 +321,23 @@ staged --summary --json                  # Read the stored summaries object
 
 `summarize` writes. `staged --summary` reads. `-m` is short for `--message`. Omit `-f` to update the session summary; use an exact relative path to update or read a file summary. For a rename, use the destination; for a deletion, use the original path. Pair a file update with `--session-message` to update both atomically. `--message`, `--stdin`, and `--clear` are mutually exclusive, and one of them is required. `--stdin` expects UTF-8 text on every platform; invalid bytes leave the summaries unchanged. Empty text clears the selected summary. Reading with `--summary` does not create metadata. `--json` after a write returns the complete object. `staged --summary --json` returns that same object; add `-f <path>` to return `session`, `path`, and `summary` for that file. File and path arguments consistently use `-f` / `--file` and support completion. Session metadata file access additionally requires `--meta`.
 
-`staged --summary` prints the session id, then the session summary, then each file with its status. Files are grouped by status (`MISSING`, `NEW FILE`, `MODIFIED`, `RENAMED`, `RELOCATED`, `DELETED`, `APPLIED`), with a blank line between groups. Each summary is indented and wrapped, with a blank line after it, so several summaries do not run together. Status tokens and paths are colored when the terminal supports color. The overview uses the same status groups, with a blank line between them.
+`staged --summary` prints the intent (when recorded), the session summary, then each file with its status. Files are grouped by status (`MISSING`, `NEW FILE`, `MODIFIED`, `RENAMED`, `RELOCATED`, `DELETED`, `APPLIED`), with a blank line between groups. Each summary is indented and wrapped, with a blank line after it, so several summaries do not run together. Status tokens and paths are colored when the terminal supports color. The overview uses the same status groups, with a blank line between them.
+
+All human-readable views share one layout:
+
+```text
+Repository:  /path/to/repo          labels end in a colon and line up within a block
+Session:     4f2a
+
+Intent 4f2a                         headings at column 0
+    Make the parser tolerate...     text under a heading: 4 columns in
+    Refs:      https://.../pull/42
+
+  [NEW FILE]  notes.md              file rows: 2 columns in, status padded after the bracket
+      Add release notes.            text under a row: 4 columns deeper (6)
+```
+
+Paths are never wrapped, so they stay copyable. Listings (`apply`, `undo`) use the same `[STATUS]  path` rows. When stdout is closed early (for example `staged --help-all | head`), staged exits quietly.
 
 The CLI stores agent-authored summaries in `summaries.json` beside `staging/`, preserving unrelated entries:
 
@@ -438,14 +454,42 @@ Ambiguous queries display all candidate matches and exit without making changes.
 
 ---
 
-### Extracting Raw Paths
+### Extracting Raw Paths and Opening Files
+
+`path` prints an absolute path and `open` opens the same file in your editor. Both take one location flag; with none, they use the staged copy:
 
 ```bash
-staged path -s -f src/example.py   # Staged file absolute path
-staged path -w -f src/example.py   # Workspace file absolute path
+staged path -f example              # Staged copy in staging/ (the default)
+staged path -w -f example           # Workspace original (for a rename, the original path)
+staged path --meta -f changes       # Session file beside staging/, e.g. staged_changes.md
+staged path --sandbox -f vite       # Sandbox entry inside staging/
+staged path -s 4f2a -f example      # Same, in session 4f2a
+staged open -w -f example           # open takes the same flags
 ```
 
-_(Deletions have only a workspace path. Inside `path`, `-s` means `--staged`; use `--session <id>` to specify a session.)_
+`-f` matches the same way for every location: exact path, case-insensitive path, file name, letters in order (`chg` finds `staged_changes.md`), then a close misspelling. Ambiguous names list the candidates. `--meta` also accepts the aliases `staging.md` and `diff.md`. With `path --meta`, a name that matches nothing prints the path a new session file would have; `open` needs an existing file. Deletions have only a workspace path. `-s` selects the session, as on every command; `--staged` is still accepted for old scripts but does nothing.
+
+### Recording the Original Intent
+
+Summaries describe what the proposal does now. The intent records why the session exists: the original request, plus any PR/MR, issue, ticket or feature it belongs to. It is what you read weeks later to remember what you were doing.
+
+```bash
+staged init <id> --intent 'Make the parser tolerate empty input (review feedback).' --ref https://github.com/acme/app/pull/42
+staged intent -m 'Make the parser tolerate empty input (review feedback).'   # Set or replace the text
+staged intent --ref ACME-123                                                # Add a reference (repeatable)
+staged intent --remove-ref ACME-123                                         # Remove one reference
+staged intent --stdin < request.txt                                         # Multi-line request
+staged intent --clear                                                       # Remove text and references
+staged --intent                                     # Read it (colorized)
+staged --intent --session <id>                      # ...for another session
+staged --intent --json                              # Structured: text, refs, timestamps, session, branch
+```
+
+`intent` writes and `staged --intent` reads, the same way `summarize` and `--summary` pair up. `--message`, `--stdin`, and `--clear` are mutually exclusive. `--ref` and `--remove-ref` can be repeated and can be used alone or with them. References keep their order and duplicates are dropped. The intent is stored in `intent.json` beside `staging/`. Like `summaries.json`, `--meta` writes cannot change it.
+
+The intent also appears at the top of `staged --summary`, in `staged -v`, in `staged --sessions` (truncated), and in the TUI header and info panel (`i`). Cleaning proposals keeps it. Migrating into a session that has no intent copies it across.
+
+Agents record the intent once, at the start of a session, in the requester's words where possible. If the work clearly belongs to a PR/MR or issue (for example the current branch has an open PR), they add it with `--ref`. If they can't tell what feature or change prompted the request, they ask instead of guessing.
 
 ---
 
@@ -459,32 +503,52 @@ staged tui -f src/example.py  # Open TUI focused on a specific file
 staged diff --tui             # Alias via diff command
 ```
 
-### 2-Pane Architecture
+### Layout
 
-- **Left Rail (Files)**: Toggle with `b`. Lists proposed files with status badges, line delta stats (`+X -Y`), and open feedback counts (`💬2`). Press `Tab` to switch focus between the file rail and the diff viewport. Press `j`/`k` to navigate files and `Enter` to open the diff for that file.
-- **Right Viewport (Diff)**:
-  - Defaults to a **Side-by-Side 2-Pane Diff** (`Workspace Original` on the left, `Staged Proposal` on the right) with aligned hunk opcodes and intraline character/word-level highlight spans.
-  - Press `u` to toggle between **Side-by-Side** and **Unified Diff**.
-  - Press `H` to toggle optional syntax highlighting via Pygments (clean standard diff highlighting is used by default).
+- **Header**: session, branch, file count, open comments, diff mode, and the recorded intent.
+- **File list** (left, `b` hides it): files grouped by status, with `+added -removed` counts and open comment counts (`●2`). The list scrolls to keep the selected file visible.
+- **Diff** (right): a title line (status, path, counts, current hunk), the file summary, then the diff. By default it is side by side, with `Workspace Original` on the left and `Staged Proposal` on the right; `u` switches to unified.
+  - Changed lines get a tinted background, green for added and red for removed. The words that changed get a stronger tint. A line that was mostly rewritten keeps just the line tint.
+  - When a line exists on only one side, the other side shows a shaded blank.
+  - Unchanged runs fold into one `⋯ N unchanged lines` row, keeping 3 lines of context around each hunk; `z` (or Enter on the fold) expands them. Lines that have comments are never folded.
+  - Long lines wrap at word boundaries; `W` truncates them instead.
+  - Syntax highlighting applies to unchanged lines when `pygments` is installed (`H` toggles it).
+- **Footer**: status messages on the left and the keys for the focused pane on the right. Confirmation prompts and comment input also appear here.
+- **Info panel** (`i`): the intent with its references, the session summary, and the current file's summary, paths, and comment counts.
 
-### Navigation & Inline Commenting Shortcuts
+Terminals with 256 colors get the tinted palette. Others fall back to colored text.
 
-| Shortcut | Action |
+### Keys
+
+| Keys | Action |
 | --- | --- |
-| `j` / `k` (or Down/Up) | Move cursor down/up line by line |
-| `n` / `p` | Jump to next / previous diff hunk |
-| `[` / `]` | Switch active side (`workspace` vs `staged`) or cycle sub-line tokens |
-| `v` (or Space) | Toggle **Visual Multi-line Selection** mode |
-| `w` | Select individual sub-line token / expression (`snippet_focus`) on the line |
-| `c` (or Enter) | Open inline comment input box anchored to selection; saves to `feedback.json` |
-| `r` | Toggle `[OPEN]` / `[RESOLVED]` status on the comment at the cursor |
-| `x` | Delete the comment at the cursor |
-| `a` | **Selectively apply the current hunk** directly to the workspace |
-| `A` | Apply the entire current file to the workspace |
-| `y` | Format and copy all open feedback to clipboard as an agent prompt |
-| `H` | Toggle optional syntax highlighting (uses Pygments if installed) |
-| `?` or `h` | **Open built-in command reference & help screen** |
-| `q` | Quit TUI (or close help screen) |
+| `j` / `k` (Down / Up) | Move one line (in the file list: select a file) |
+| `Ctrl-d` / `Ctrl-u` (PgDn / PgUp) | Move half a page |
+| `g` / `G` | First / last line |
+| `n` / `p` | Next / previous hunk (wraps) |
+| `J` / `K` | Next / previous file from anywhere |
+| `Tab` | Switch focus between the file list and the diff |
+| `Enter` | Open the selected file (file list), expand a fold, or comment on a selection |
+| `u` | Side-by-side / unified |
+| `z` | Fold / expand unchanged lines |
+| `W` | Wrap / truncate long lines |
+| `[` / `]` (Left / Right) | Choose the side comments attach to; while a token is selected, cycle tokens |
+| `b` | Show / hide the file list |
+| `i` | Info panel: intent, summaries, paths |
+| `H` | Syntax highlighting (needs `pygments`) |
+| `R` | Reload files, summaries, intent and comments from disk (for example after the agent revises) |
+| `v` (Space) | Start / clear a multi-line selection |
+| `w` | Select a token or expression on the line (`snippet_focus`) |
+| `c` | Comment on the selection; saved to `feedback.json` |
+| `r` | Resolve / reopen the comment at the cursor |
+| `x` | Delete the comment at the cursor (asks first) |
+| `y` | Copy open comments to the clipboard as an agent prompt |
+| `a` | Apply the hunk at the cursor (in the file list: the whole file); asks first |
+| `A` | Apply the whole current file; asks first |
+| `?` | Key reference |
+| `q` / `Esc` | Close a panel or clear a selection; `q` quits |
+
+TUI applies use the same safeguards as `staged apply`. Protected branches are refused (use `staged apply --force` from the shell when you mean it). Branch drift is named in the confirmation prompt. File applies use the 3-way merge and conflict checks, and every apply, including a single hunk, records a backup so `staged undo` can roll back the latest one. Hunk applies work in place only: renames, deletions and non-UTF-8 files have to be applied as whole files. Errors appear in the footer instead of closing the TUI.
 
 ---
 
@@ -516,6 +580,8 @@ staged feedback --resolve-all             # Mark all comments resolved
 staged feedback --delete fb-1             # Remove comment fb-1
 staged feedback --clear                   # Delete all comments
 ```
+
+`feedback` uses action flags rather than subcommands: `--add`, `--resolve`, `--resolve-all`, `--delete` and `--clear` are exclusive, and with none of them it lists comments (`--prompt` and `--copy` format them for an agent). Line numbers are one-based like `read` and `write`, so 0 and negative values are rejected. Comment IDs complete after `--resolve` (open comments) and `--delete` (all comments).
 
 ---
 
@@ -714,13 +780,15 @@ staged migrate --from approach-a --to approach-b --all             # All files
 ```bash
 staged clean -f src/example.py     # Discard one staged file
 staged clean --all                 # Discard all staged files in this session
-staged clean --session             # Delete active session folder from disk
-staged clean --session <id>        # Delete specific session folder
+staged clean --all -s <id>         # Discard all staged files in session <id>
+staged clean -s                    # Delete the active session folder from disk
+staged clean -s <id>               # Delete session <id>
 staged clean -f src/example.py -y  # Confirm discard noninteractively
 ```
 
-- `clean --all`: Clears staged files and manifest, preserving session ID and origin branch.
-- `clean --session`: Removes the session folder from disk and clears shell bindings.
+- `clean -f` / `clean --all`: Clear staged files and their manifest entries, keeping the session, its intent and its origin branch. `-s <id>` / `--session <id>` picks the session, as on every other command.
+- `clean -s [<id>]` without `-f` or `--all`: Removes that whole session folder (the active one when no ID is given) and clears shell bindings and default-session settings that point at it.
+- A bare `-s` cannot be combined with `-f` or `--all`, because it doesn't name a session; `clean` with no selection is an error.
 - **Safety**: `clean` only removes files under the staging area; it **never** modifies workspace files.
 
 ---
@@ -818,23 +886,26 @@ staged install-completion --shell powershell
 Syntax: `<value>` is required, `[value]` is optional, `|` indicates alternatives. Quote paths containing spaces.
 
 ```text
-staged [global options] [command] [command options]
-staged <command> --help
+staged [common options] [command] [command options]
+staged help [command]          # same as staged [command] --help
 staged --help-all
 ```
 
-### Global Options
+Help is formatted like a BSD manual page (`man tr`): NAME, SYNOPSIS, DESCRIPTION with each option and an indented explanation, COMMON OPTIONS, EXAMPLES and SEE ALSO. The top-level page adds the grouped command list, ENVIRONMENT and EXIT STATUS. Section headings are bold, flags are bold cyan and arguments are underlined when the terminal supports color. Help longer than the terminal opens in `$PAGER` (default `less -R`). Usage errors print the synopsis and point to `--help`.
 
-| Option                      | Meaning                                                         |
-| --------------------------- | --------------------------------------------------------------- |
-| `-t <id>`, `--tool <id>`    | Select editor adapter; with `use` or `set`, saves in that scope |
-| `-s <id>`, `--session <id>` | Select session by ID or prefix; with `use`, binds to shell      |
-| `--root <path>`             | Override staging root; with `set`, saves as default             |
-| `--shell <name>`            | Select Bash, Zsh, or PowerShell for setup                       |
-| `-v`, `--verbose`           | Include session/file summaries and overview paths, sizes, timestamps              |
-| `-h`, `--help`              | Show help without running an operation                          |
+### Common Options
 
-_(After `path`, `-s` means `--staged`; use `--session <id>` for session selection.)_
+Every command accepts these, but a command's help lists only the ones that change what it does. The others are still accepted, so existing scripts keep working.
+
+| Option                      | Meaning                                                         | Listed for |
+| --------------------------- | --------------------------------------------------------------- | ---------- |
+| `-s <id>`, `--session <id>` | Select session by ID or prefix; with `use`, binds to shell      | Commands that act on a session |
+| `--root <dir>`              | Override staging root; with `set`, saves as default             | Commands that find sessions |
+| `-t <id>`, `--tool <id>`    | Select editor adapter (also selects that editor's staging root) | `diff`, `open`, `use`, `set`, `install-skill` |
+| `--shell <name>`            | Select Bash, Zsh, or PowerShell for setup                       | `init`, `install-completion` |
+| `-v`, `--verbose`           | Include the intent and summaries; the overview also shows paths, line counts, sizes and times | top level, `diff` |
+| `-h`, `--help`              | Show the command's manual without running an operation          | all |
+
 
 ### Top-Level Options
 
@@ -844,7 +915,8 @@ _(After `path`, `-s` means `--staged`; use `--session <id>` for session selectio
 | `-R`, `--all-repos` | List sessions across repositories          |
 | `--list`            | Print proposed file paths, one per line    |
 | `--summary`         | Print session and file summaries; use `-f` for one file |
-| `--json`            | With `--summary`, print structured summaries |
+| `--intent`          | Print the original request and its PR/MR/issue references |
+| `--json`            | Structured output for the overview, `--sessions`/`-R`, `--list`, `--summary` or `--intent` |
 | `--help-all`        | Show the full command and option reference |
 
 ---
@@ -861,14 +933,15 @@ _(After `path`, `-s` means `--staged`; use `--session <id>` for session selectio
 | `rename` | `-f <source>`, `--to <destination>`, `[--meta]`, `[--json]` | Move a staged proposal or a metadata file |
 | `delete` | `-f <path>`, `[--workspace\|--meta]`, `[--json]` | Discard a staged proposal, propose a workspace deletion, or delete metadata |
 | `summarize` | `[-f <path>]`, `(-m <message>\|--stdin\|--clear)`, `[--session-message <message>]`, `[--json]` | Write session and file summaries |
+| `intent` | `[-m <text>\|--stdin\|--clear]`, `[--ref <ref>]...`, `[--remove-ref <ref>]...`, `[--json]` | Record the original request and related references |
 | `init`               | `[id]`, `[--json]`, `[--root <p>]`                                   | Initialize or reuse a staging session                             |
 | `use`                | `--session <id>`, `--tool <id>`, `--clear`                           | Bind session or tool to current shell                             |
-| `diff`               | `-f <f>`, `--all`, `-a`, `-c`, `-ac`, `--between <a> <b>`            | Review or apply visual diffs in editor                            |
-| `apply`              | `-f <f>`, `--all`, `[--force]`, `[-y]`                               | Apply complete staged files to workspace                          |
-| `path`               | `[-s\|-w\|--meta]`, `-f <f>`, `[--session <id>]`                     | Print raw absolute path without headers                           |
-| `open`               | `[--meta]`, `-f <f>`                                                 | Open staged file or session metadata in editor                    |
-| `clean`              | `-f <f>`, `--all`, `--session [<id>]`, `[-y]`                        | Discard staged files or delete session folder                     |
-| `migrate`            | `--from <id>`, `[--to <id>]`, `(-f <q>\|--all)`, `[--force]`         | Copy staged files and metadata between sessions                   |
+| `diff`               | `-f <f>`, `--all`, `-a`, `-c`, `-ac`, `--between <a> <b>`, `[--json]` | Review or apply visual diffs in editor; `--json` with the overview, `-a` or `-c` |
+| `apply`              | `-f <f>`, `--all`, `[--force]`, `[-y]`, `[--json]`                   | Apply complete staged files to workspace                          |
+| `path`               | `-f <f>`, `[-w\|--meta\|--sandbox]`, `[-s <id>]`                      | Print the absolute path of the staged copy, workspace original, session file or sandbox entry |
+| `open`               | `-f <f>`, `[-w\|--meta\|--sandbox]`, `[-s <id>]`                      | Open the same files in your editor                                |
+| `clean`              | `(-f <f>\|--all) [-s <id>]`, or `-s [<id>]` alone, `[-y]`, `[--json]` | Discard staged files, or delete a whole session folder           |
+| `migrate`            | `--from <id>`, `[--to <id>]`, `(-f <q>\|--all)`, `[--force]`, `[--json]` | Copy staged files and metadata between sessions               |
 | `set`                | `[--repo]`, `--tool`, `--default-session`, `--root`                  | Save persistent preferences                                       |
 | `set-tool`           | `<id>`, `--name`, `--diff-cmd`, `--open-cmd`                         | Register custom editor adapter                                    |
 | `install-skill`      | `[--tool]`, `[--default]`, `[--target-dir]`, `[--configure-sandbox]` | Install `/stage` skill for agent harness                          |

@@ -3,7 +3,7 @@ _staged() {
   local -a candidates
   case "${words[CURRENT-1]}" in
     --tool|-t) candidates=("${(@f)$(command staged --complete-tools 2>/dev/null)}") ;;
-    --session|--from|--between|--compare-session|--default-session)
+    --session|-s|--from|--between|--compare-session|--default-session)
       candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}") ;;
     --to)
       if (( ${words[(Ie)copy]} || ${words[(Ie)rename]} )); then
@@ -18,12 +18,6 @@ _staged() {
     use)
       candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}"
                   "${(@f)$(command staged --complete-options "${(@)words[2,CURRENT-1]}" 2>/dev/null)}") ;;
-    -s)
-      if (( ${words[(Ie)path]} )); then
-        candidates=("${(@f)$(command staged --complete-options "${(@)words[2,CURRENT-1]}" 2>/dev/null)}")
-      else
-        candidates=("${(@f)$(command staged --complete-sessions 2>/dev/null)}")
-      fi ;;
     --branch-protection) candidates=(true false) ;;
     --file|-f)
       candidates=("${(@f)$(command staged --complete-files "${(@)words[2,CURRENT-1]}" 2>/dev/null)}")

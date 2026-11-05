@@ -3,7 +3,7 @@ _staged() {
   local -a choices=()
   case "$prev" in
     --tool|-t) while IFS= read -r item; do choices+=("$item"); done < <(command staged --complete-tools 2>/dev/null) ;;
-    --session|--from|--between|--compare-session|--default-session)
+    --session|-s|--from|--between|--compare-session|--default-session)
       while IFS= read -r item; do choices+=("$item"); done < <(command staged --complete-sessions 2>/dev/null) ;;
     --to)
       if [[ " ${COMP_WORDS[*]} " == *" copy "* || " ${COMP_WORDS[*]} " == *" rename "* ]]; then
@@ -16,12 +16,6 @@ _staged() {
     use)
       while IFS= read -r item; do choices+=("$item"); done < <(command staged --complete-sessions 2>/dev/null)
       while IFS= read -r item; do choices+=("$item"); done < <(command staged --complete-options "${COMP_WORDS[@]:1:COMP_CWORD-1}" 2>/dev/null) ;;
-    -s)
-      if [[ " ${COMP_WORDS[*]} " != *" path "* ]]; then
-        while IFS= read -r item; do choices+=("$item"); done < <(command staged --complete-sessions 2>/dev/null)
-      else
-        while IFS= read -r item; do choices+=("$item"); done < <(command staged --complete-options "${COMP_WORDS[@]:1:COMP_CWORD-1}" 2>/dev/null)
-      fi ;;
     --branch-protection) choices=(true false) ;;
     --file|-f)
       while IFS= read -r item; do choices+=("$item"); done < <(command staged --complete-files "${COMP_WORDS[@]:1:COMP_CWORD-1}" 2>/dev/null) ;;
