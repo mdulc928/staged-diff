@@ -208,6 +208,103 @@ class CLI(unittest.TestCase):
         self.assertEqual(copied.read_bytes(), source.read_bytes())
         self.assertFalse((self.repo / 'nested').exists())
 
+    def test_intent_records_request_and_references(self):
+        result = json.loads(self.run_cli('init', 'session-a', '--json', '--intent', 'Fix empty input.',
+                                         '--ref', 'https://example.com/pr/42').stdout)
+        self.assertEqual(result['intent']['text'], 'Fix empty input.')
+        self.assertEqual(result['intent']['refs'], ['https://example.com/pr/42'])
+        self.run_cli('intent', '--ref', 'ACME-1', '--ref', 'ACME-1', '--ref', 'feature/parser')
+        data = json.loads(self.run_cli('--intent', '--json').stdout)
+        self.assertEqual(data['refs'], ['https://example.com/pr/42', 'ACME-1', 'feature/parser'])
+        self.assertEqual(data['session'], 'session-a')
+        self.assertIn('recorded_at', data)
+        self.run_cli('intent', '-m', '  Fix empty input and strip parts.  ', '--remove-ref', 'ACME-1')
+        data = json.loads(self.run_cli('--intent', '--json').stdout)
+        self.assertEqual(data['text'], 'Fix empty input and strip parts.')
+        self.assertEqual(data['refs'], ['https://example.com/pr/42', 'feature/parser'])
+        human = self.run_cli('--intent').stdout
+        self.assertIn('Intent session-a', human)
+        self.assertIn('Fix empty input and strip parts.', human)
+        self.assertIn('https://example.com/pr/42', human)
+        self.assertIn('Fix empty input and strip parts.', self.run_cli('--summary').stdout)
+        self.assertIn('Fix empty input and strip parts.', self.run_cli('--sessions').stdout)
+        # The summary JSON contract is unchanged by the intent.
+        self.assertEqual(json.loads(self.run_cli('--summary', '--json').stdout), {'session': '', 'files': {}})
+
+    def test_intent_session_selection_validation_and_clear(self):
+        self.init('session-a')
+        self.init('session-b')
+        self.run_cli('intent', '--session', 'session-a', '-m', 'Request A.')
+        self.assertIn('no intent recorded', self.run_cli('--intent', '--session', 'session-b').stdout)
+        self.assertEqual(json.loads(self.run_cli('--intent', '--session', 'session-a', '--json').stdout)['text'],
+                         'Request A.')
+        self.assertIn('Nothing to write', self.run_cli('intent', '--session', 'session-a', ok=False).stderr)
+        self.run_cli('intent', '--session', 'session-a', '--remove-ref', 'missing', ok=False)
+        self.run_cli('intent', '-m', 'x', '--clear', ok=False)
+        self.run_cli('--intent', 'diff', ok=False)
+        self.run_cli('--intent', '--summary', '--json', ok=False)
+        self.run_cli('init', 'session-c', '--ref', 'x', ok=False)
+        self.run_cli('write', '--meta', '-f', 'intent.json', '--text', '{}', '--session', 'session-a', ok=False)
+        self.run_cli('intent', '--session', 'session-a', '--clear')
+        self.assertFalse((self.root / 'session-a/intent.json').exists())
+
+    def test_intent_survives_clean_and_follows_migration(self):
+        self.propose('session-a')
+        self.run_cli('intent', '--session', 'session-a', '-m', 'Original ask.', '--ref', 'PR-7')
+        self.run_cli('migrate', '--from', 'session-a', '--to', 'session-b', '--all')
+        self.assertEqual(json.loads(self.run_cli('--intent', '--session', 'session-b', '--json').stdout)['refs'],
+                         ['PR-7'])
+        self.run_cli('clean', '--all', '--yes', '--session', 'session-a')
+        self.assertEqual(json.loads(self.run_cli('--intent', '--session', 'session-a', '--json').stdout)['text'],
+                         'Original ask.')
+
+    def test_json_results_for_listings_apply_clean_and_migrate(self):
+        self.propose()
+        self.propose(rel='other.txt')
+        sessions = json.loads(self.run_cli('--sessions', '--json').stdout)
+        self.assertEqual([row['session'] for row in sessions], ['session-a'])
+        self.assertEqual(sessions[0]['changes'], 2)
+        self.assertEqual(json.loads(self.run_cli('--list', '--json').stdout), ['existing.txt', 'other.txt'])
+        overview = json.loads(self.run_cli('diff', '--json').stdout)
+        self.assertEqual({f['path']: f['status'] for f in overview['files']},
+                         {'existing.txt': 'MODIFIED', 'other.txt': 'NEW FILE'})
+        moved = json.loads(self.run_cli('migrate', '--from', 'session-a', '--to', 'session-b', '-f', 'other.txt',
+                                        '--json').stdout)
+        self.assertEqual(moved, {'from': 'session-a', 'to': 'session-b', 'migrated': ['other.txt']})
+        env = dict(self.env, STAGED_SESSION='session-a')
+        applied = json.loads(self.run_cli('apply', '-f', 'existing.txt', '--json', env=env).stdout)
+        self.assertEqual(applied['applied'], [{'path': 'existing.txt', 'status': 'APPLIED'}])
+        self.assertTrue(applied['backup'])
+        cleaned = json.loads(self.run_cli('clean', '--all', '--yes', '--json', env=env).stdout)
+        self.assertEqual(cleaned['cleaned'], ['existing.txt', 'other.txt'])
+        self.assertEqual(json.loads(self.run_cli('clean', '-s', 'session-b', '--yes', '--json').stdout),
+                         {'deleted_session': 'session-b'})
+        self.run_cli('diff', '-f', 'existing.txt', '--json', ok=False)
+
+    def test_help_lists_only_options_that_apply(self):
+        manual = self.run_cli('read', '--help').stdout
+        self.assertNotIn('--shell', manual)
+        self.assertNotIn('--verbose', manual)
+        self.assertIn('COMMON OPTIONS', manual)
+        self.assertIn('--session', manual)
+        self.assertNotIn('--meta', self.run_cli('apply', '--help').stdout)
+        self.assertIn('--shell', self.run_cli('install-completion', '--help').stdout)
+        # Hidden options are still accepted so existing scripts keep working.
+        self.propose()
+        self.run_cli('read', '-f', 'existing.txt', '--shell', 'bash')
+        self.run_cli('diff', '--meta', '-f', 'existing.txt', '--tool', 'cli')
+        result = self.run_cli('feedback', '--add', '-f', 'existing.txt', '--start-line', '0', '-m', 'x', ok=False)
+        self.assertIn('usage: staged feedback', result.stderr)
+
+    def test_completion_offers_values_not_flags_for_option_arguments(self):
+        self.init()
+        self.run_cli('intent', '-m', 'Ask.', '--ref', 'PR-1')
+        self.assertEqual(self.run_cli('--complete-options', 'intent', '--remove-ref').stdout.split(), ['PR-1'])
+        self.assertEqual(self.run_cli('--complete-options', 'feedback', '--side').stdout.split(),
+                         ['staged', 'workspace'])
+        self.assertEqual(self.run_cli('--complete-options', 'intent', '-m').stdout, '')
+        self.assertIn('--ref', self.run_cli('--complete-options', 'intent', '-m', 'text').stdout.split())
+
     def test_managed_rename_tracks_origin_summary_and_can_move_back(self):
         path = self.propose()
         self.run_cli('summarize', '-f', 'existing.txt', '-m', 'Revise greeting.', '--session-message', 'Improve greetings.')
@@ -608,7 +705,8 @@ class CLI(unittest.TestCase):
         self.propose()
         self.propose(rel='other.txt')
         self.run_cli('summarize', ok=False)
-        self.run_cli('--json', ok=False)
+        self.assertEqual(json.loads(self.run_cli('--json').stdout)['session'], 'session-a')  # overview
+        self.run_cli('--json', 'apply', '--all', ok=False)  # --json belongs after the command
         self.run_cli('--summary', '--sessions', ok=False)
         self.assertFalse((self.root / 'session-a/summaries.json').exists())
         message = 'Handle empty input without raising an error. ' * 4
@@ -649,15 +747,16 @@ class CLI(unittest.TestCase):
         self.assertLess(plain.index('Group related proposals.'), plain.index('fresh.txt'))
         self.assertLess(plain.index('fresh.txt'), plain.index('existing.txt'))
         self.assertLess(plain.index('existing.txt'), plain.index('second.txt'))
-        self.assertIn('[NEW FILE ] fresh.txt\n    (no summary yet)\n\n\n[MODIFIED ] existing.txt', plain)
-        self.assertIn('[MODIFIED ] existing.txt\n    (no summary yet)\n\n[MODIFIED ] second.txt', plain)
-        self.assertNotIn('[MODIFIED ] existing.txt\n    (no summary yet)\n\n\n[MODIFIED ] second.txt', plain)
+        # Rows sit at column 2 with statuses padded after the bracket; nested text is 4 deeper.
+        self.assertIn('  [NEW FILE]  fresh.txt\n      (no summary yet)\n\n\n  [MODIFIED]  existing.txt', plain)
+        self.assertIn('  [MODIFIED]  existing.txt\n      (no summary yet)\n\n  [MODIFIED]  second.txt', plain)
+        self.assertNotIn('  [MODIFIED]  existing.txt\n      (no summary yet)\n\n\n  [MODIFIED]  second.txt', plain)
         overview = self.run_cli().stdout
-        self.assertIn('[NEW FILE ] fresh.txt\n\n  [MODIFIED ] existing.txt\n  [MODIFIED ] second.txt', overview)
+        self.assertIn('  [NEW FILE]  fresh.txt\n\n  [MODIFIED]  existing.txt\n  [MODIFIED]  second.txt', overview)
         verbose = self.run_cli('-v').stdout
-        self.assertIn('(no summary yet)\n    Staged:', verbose)
-        self.assertNotIn('(no summary yet)\n\n    Staged:', verbose)
-        self.assertRegex(verbose, r'Size: \d+ bytes; modified: .+\n\n\n  \[MODIFIED \]')
+        self.assertIn('(no summary yet)\n      Staged:', verbose)
+        self.assertNotIn('(no summary yet)\n\n      Staged:', verbose)
+        self.assertRegex(verbose, r'      Size: +\d+ bytes\n      Modified: +.+\n\n\n  \[MODIFIED\]')
 
     def test_meta_file_commands_edit_session_notes_only(self):
         import hashlib
@@ -891,8 +990,13 @@ class CLI(unittest.TestCase):
         self.propose()
         before = (self.root / 'session-a/staging/existing.txt').read_bytes()
         for cmd in staged.COMMANDS:
-            self.assertIn('usage:', self.run_cli(cmd, '--help').stdout)
-        self.assertIn('usage:', self.run_cli('clean', '-f', '--help').stdout)
+            manual = self.run_cli(cmd, '--help').stdout
+            for section in ('NAME', 'SYNOPSIS', 'DESCRIPTION', 'SEE ALSO'):
+                self.assertIn('\n' + section + '\n', manual)
+            self.assertIn('staged ' + cmd + ' –', manual)
+        self.assertIn('SYNOPSIS', self.run_cli('clean', '-f', '--help').stdout)
+        self.assertIn('staged-intent(1)', self.run_cli('help').stdout)
+        self.assertIn('STAGED-INTENT(1)', self.run_cli('help', 'intent').stdout)
         self.assertEqual((self.root / 'session-a/staging/existing.txt').read_bytes(), before)
 
     def test_unknown_and_missing_flags_fail_without_cleaning(self):
@@ -1128,13 +1232,57 @@ class CLI(unittest.TestCase):
         self.run_cli('clean', '-f', 'existing.txt', '-s', ok=False)
         self.run_cli('clean', '--all', '-s', ok=False)
 
+    def test_clean_session_option_selects_session_for_files(self):
+        self.propose('session-a')
+        self.propose('session-b')
+        self.propose('session-b', rel='other.txt')
+        self.run_cli('clean', ok=False)  # needs -f, --all or -s
+        self.run_cli('clean', '-f', 'other.txt', '-s', 'session-b', '-y')
+        self.assertFalse((self.root / 'session-b/staging/other.txt').exists())
+        self.assertTrue((self.root / 'session-b/staging/existing.txt').exists())
+        self.run_cli('clean', '--all', '--session', 'session-b', '-y')
+        self.assertTrue((self.root / 'session-b').is_dir())  # files only; the session stays
+        self.assertFalse((self.root / 'session-b/staging/existing.txt').exists())
+        self.assertTrue((self.root / 'session-a/staging/existing.txt').exists())
+        self.run_cli('clean', '-s', 'session-b', '-y')  # no -f/--all: the whole session
+        self.assertFalse((self.root / 'session-b').exists())
+
     def test_path_flags_and_subdirectory_workspace(self):
         path = self.propose()
         nested = self.repo / 'nested'
         nested.mkdir()
-        self.assertEqual(self.run_cli('path', '-s', '-f', 'existing.txt', cwd=nested).stdout.strip(), str(path))
+        self.assertEqual(self.run_cli('path', '-f', 'existing.txt', cwd=nested).stdout.strip(), str(path))
+        self.assertEqual(self.run_cli('path', '--staged', '-f', 'existing.txt', cwd=nested).stdout.strip(), str(path))
         self.assertEqual(self.run_cli('path', '-w', '-f', 'existing.txt', cwd=nested).stdout.strip(), str(self.repo / 'existing.txt'))
         self.assertEqual(self.run_cli('-s', 'session-a', 'path', '-f', 'existing.txt', cwd=nested).stdout.strip(), str(path))
+        # -s selects a session on path, like every other command.
+        other = self.propose('session-b')
+        self.assertEqual(self.run_cli('path', '-s', 'session-b', '-f', 'existing.txt').stdout.strip(), str(other))
+        self.assertEqual(self.run_cli('path', '-s', 'session-a', '-f', 'EXIST').stdout.strip(), str(path))
+
+    def test_path_and_open_fuzzy_match_every_location(self):
+        self.propose()
+        self.run_cli('write', '--meta', '-f', 'staged_changes.md', '--text', '# notes')
+        self.run_cli('create', '--sandbox', '-f', 'apps/web/vite.config.ts', '--text', 'x')
+        session = self.root / 'session-a'
+        self.assertEqual(self.run_cli('path', '--meta', '-f', 'changes').stdout.strip(), str(session / 'staged_changes.md'))
+        self.assertEqual(self.run_cli('path', '--meta', '-f', 'new_notes.md').stdout.strip(), str(session / 'new_notes.md'))
+        self.assertEqual(self.run_cli('path', '--sandbox', '-f', 'vite').stdout.strip(),
+                         str(session / 'staging/apps/web/vite.config.ts'))
+        self.assertEqual(self.run_cli('path', '-w', '-f', 'EXISTING').stdout.strip(), str(self.repo / 'existing.txt'))
+        self.assertIn('No sandbox entry matched', self.run_cli('path', '--sandbox', '-f', 'zzz', ok=False).stderr)
+        recorder = self.base / 'record_open.py'
+        log = self.base / 'open_args.json'
+        recorder.write_text('import json,sys\nfrom pathlib import Path\nPath(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))\n')
+        command = '{} {} {}'.format(sys.executable, recorder, log)
+        self.run_cli('set-tool', 'rec', '--name', 'Rec', '--diff-cmd', command + ' {orig} {staged}',
+                     '--open-cmd', command + ' {staged}')
+        for args, expected in ((['-w', '-f', 'exist'], self.repo / 'existing.txt'),
+                               (['--sandbox', '-f', 'vite'], session / 'staging/apps/web/vite.config.ts'),
+                               (['--meta', '-f', 'changes'], session / 'staged_changes.md')):
+            self.run_cli('open', *args, '--tool', 'rec')
+            self.assertEqual(json.loads(log.read_text()), [str(expected)])
+        self.run_cli('open', '--meta', '-f', 'not_there.md', '--tool', 'rec', ok=False)  # open needs an existing file
 
     def test_use_session_flag_persists_until_switched_or_cleared(self):
         self.propose('one', text='one')
@@ -1322,7 +1470,9 @@ source "$completion_file"
             (['use', ''], ['session-a', '--clear', '--session'], ['--apply']),
             (['set', ''], ['--default-session', '--branch-protection', '--session-root'], ['--apply']),
             (['install-completion', ''], ['--shell', '--help'], ['--apply']),
-            (['path', '-s', ''], ['--workspace', '--file'], ['session-a']),
+            (['path', '-s', ''], ['session-a', 'session-b'], ['--workspace']),
+            (['path', ''], ['--workspace', '--sandbox', '--session'], ['--staged']),
+            (['open', ''], ['--workspace', '--meta', '--sandbox'], ['--staged']),
             (['clean', '-s', ''], ['session-a', 'session-b'], ['--workspace']),
             (['diff', '--between', 'session-a', ''], ['session-b'], ['--all']),
             (['set', '--default-session', ''], ['session-a'], ['--all']),
@@ -1925,7 +2075,7 @@ source "$1"
 
         # Apply performs a clean 3-way merge automatically!
         out = self.run_cli('apply', '-f', 'shared.py').stdout
-        self.assertIn('[MERGED] shared.py', out)
+        self.assertRegex(out, r'\[MERGED\] +shared\.py')
         self.assertEqual(
             (self.repo / 'shared.py').read_text(),
             'line1_user\nline2\nline3\nline4\nline5_agent\n'
@@ -2590,6 +2740,12 @@ class FakeSession:
     def save_summaries(self, data):
         self._summaries = data
 
+    intent = staged.Session.intent
+    save_intent = staged.Session.save_intent
+
+    def refresh_index(self):
+        pass
+
     def files(self, fresh=False):
         import os
         res = {}
@@ -2920,7 +3076,12 @@ class TestTuiAndFeedback(unittest.TestCase):
         self.assertEqual(state.open_comments_count(), 0)
         state.handle_key('r')
         self.assertEqual(state.open_comments_count(), 1)
+        state.handle_key('x')  # asks first; any key but y cancels
+        self.assertIsNotNone(state.pending_confirm)
+        state.handle_key('n')
+        self.assertEqual(state.open_comments_count(), 1)
         state.handle_key('x')
+        state.handle_key('y')
         self.assertEqual(state.open_comments_count(), 0)
 
         # Toggle unified mode (`u`), sidebar (`b`), syntax (`H`), focus (`TAB`), and apply hunk (`a`)
@@ -2939,13 +3100,18 @@ class TestTuiAndFeedback(unittest.TestCase):
 
         # Jump to next hunk (hunk 2) with `n` and selectively apply it with `a`
         state.handle_key('n')
+        before = (self.workspace / 'src/example.py').read_text(encoding='utf-8')
         state.handle_key('a')
+        self.assertIn('Apply hunk', state.status_message)
+        self.assertEqual((self.workspace / 'src/example.py').read_text(encoding='utf-8'), before)
+        state.handle_key('y')
         ws_text = (self.workspace / 'src/example.py').read_text(encoding='utf-8')
         self.assertIn('return "new"', ws_text)
         self.assertIn('value = x + 1', ws_text)
 
         # Apply entire file with `A`
         state.handle_key('A')
+        state.handle_key('y')
         ws_full = (self.workspace / 'src/example.py').read_text(encoding='utf-8')
         self.assertIn('value = x + 42', ws_full)
         self.assertIn('return "new"', ws_full)
@@ -2969,6 +3135,66 @@ class TestTuiAndFeedback(unittest.TestCase):
         # Quit with `q`
         state.handle_key('q')
         self.assertTrue(state.should_quit)
+
+
+    def test_tui_errors_stay_in_footer_and_apply_is_undoable(self):
+        state = staged.TuiState(self.session, target_file='src/example.py')
+        frame = state.render_frame(width=100, height=20)
+        self.assertEqual(len(frame), 20)
+        self.assertTrue(all(len(line) == 100 for line in frame))
+        self.assertEqual(len(state.frame_styles), 20)
+        # A failing action reports in the footer instead of raising out of the curses loop.
+        original = staged.apply_hunk
+        staged.apply_hunk = lambda *a, **k: (_ for _ in ()).throw(staged.StagedError('boom'))
+        try:
+            state.handle_key('n')
+            state.handle_key('a')
+            self.assertEqual(state.handle_key('y'), 'error')
+        finally:
+            staged.apply_hunk = original
+        self.assertTrue(state.status_is_error)
+        self.assertIn('boom', state.render_frame(width=100, height=20)[-1])
+        # A real hunk apply records a backup for `staged undo`.
+        state.handle_key('a')
+        state.handle_key('y')
+        self.assertTrue(staged.list_backups(self.session))
+
+    def test_tui_folds_wraps_and_navigates_files(self):
+        long_orig = ['line {}'.format(i) for i in range(40)]
+        long_new = list(long_orig)
+        long_new[20] = 'line 20 changed ' + 'x' * 200
+        (self.workspace / 'long.txt').write_text('\n'.join(long_orig) + '\n', encoding='utf-8')
+        (self.session.staging / 'long.txt').write_text('\n'.join(long_new) + '\n', encoding='utf-8')
+        state = staged.TuiState(self.session, target_file='long.txt')
+        folds = [row for row in state.rows if row['kind'] == 'fold']
+        self.assertEqual(len(folds), 2)
+        self.assertEqual(state.rows[state.hunks[0]['first_row']]['kind'], 'replace')
+        joined = '\n'.join(state.render_frame(width=120, height=30))
+        self.assertIn('unchanged lines', joined)
+        self.assertIn('x' * 20, joined.split('line 20 changed')[1].split('\n')[1])  # wrapped continuation
+        state.handle_key('z')
+        self.assertFalse(any(row['kind'] == 'fold' for row in state.rows))
+        state.handle_key('W')
+        self.assertFalse(state.wrap_lines)
+        before = state.current_file
+        state.handle_key('J')
+        self.assertNotEqual(state.current_file, before)
+        state.handle_key('K')
+        self.assertEqual(state.current_file, before)
+        state.handle_key('i')
+        self.assertIn('Intent', '\n'.join(state.render_frame(width=120, height=30)))
+        state.handle_key('ESC')
+        self.assertIsNone(state.panel)
+
+    def test_hunk_apply_preserves_crlf_and_missing_final_newline(self):
+        (self.workspace / 'crlf.txt').write_bytes(b'a\r\nb\r\nc')
+        (self.session.staging / 'crlf.txt').write_bytes(b'a\r\nB\r\nc')
+        staged.apply_hunk(self.session, 'crlf.txt', 0)
+        self.assertEqual((self.workspace / 'crlf.txt').read_bytes(), b'a\r\nB\r\nc')
+        (self.workspace / 'tail.txt').write_bytes(b'a')
+        (self.session.staging / 'tail.txt').write_bytes(b'a\nb\n')
+        staged.apply_hunk(self.session, 'tail.txt', 0)
+        self.assertEqual((self.workspace / 'tail.txt').read_bytes(), b'a\nb\n')
 
 
 class SafetyDummyContext:
@@ -3091,7 +3317,7 @@ class TestSafetyAndUndo(unittest.TestCase):
         with redirect_stdout(buf):
             staged.apply_changes(ctx, self.session, None)
 
-        self.assertIn('[MERGED] mod.py', buf.getvalue())
+        self.assertRegex(buf.getvalue(), r'\[MERGED\] +mod\.py')
         expected_merged = 'def a():\n    return 100\n\ndef b():\n    return 2\n\ndef c():\n    return 300\n'
         self.assertEqual(ws_file.read_text(encoding='utf-8'), expected_merged)
         self.assertEqual(self.session.status('mod.py'), 'APPLIED')
