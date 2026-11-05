@@ -13,7 +13,7 @@ Preserve the user's existing explicit authorization: a request to apply is suffi
 
 ## Discover available commands
 
-First run `staged --help` to discover which commands and options are supported by the installed CLI. Every command can also be run with `--help` (e.g. `staged init --help`, `staged read --help`, `staged write --help`, `staged summarize --help`, `staged diff --help`, `staged apply --help`) or `staged --help-all` to output more helpful documentation, supported flags, and usage details. Never guess command names, arguments, or syntax when `--help` provides authoritative docs.
+First run `staged --help` (a manual page; `staged help <command>` shows one command's page) to discover which commands and options are supported by the installed CLI. Every command can also be run with `--help` (e.g. `staged init --help`, `staged read --help`, `staged write --help`, `staged summarize --help`, `staged diff --help`, `staged apply --help`) or `staged --help-all` to output more helpful documentation, supported flags, and usage details. Never guess command names, arguments, or syntax when `--help` provides authoritative docs.
 
 ## Establish the session
 
@@ -24,6 +24,23 @@ Use the returned paths; do not construct editor-specific storage paths. If the h
 Run `staged use --session <id>` to select the session for the current working period. Subsequent commands use that binding until you select another session or run `staged use --clear`; you do not need to repeat `--session` on every command.
 
 Keep subsequent commands in the same shell. For an agent harness that starts a fresh shell for each tool call, use the same `STAGED_SHELL_ID` environment value across calls, unique to this conversation. If that is unavailable, run `staged use --session <id>` at the start of each new shell before other staged commands. Explicit `STAGED_SESSION` or `--session` overrides the binding.
+
+## Record the original intent
+
+Right after creating a new session, record why it exists, once. Summaries say what the proposal does now; the intent says what was asked for, so the user can later remember what the session was for.
+
+1. Write the request in the user's own words where possible, condensed only enough to stand alone (one to three sentences). Do not describe your planned implementation.
+2. Find the larger piece of work it belongs to. If the request or conversation names a PR/MR, issue, ticket or feature, add each one with `--ref` (a URL when you have one). Otherwise check cheaply: the current branch name and, when the CLI is available and authenticated, `gh pr view --json url,title` or `glab mr view`. Add a reference only when it clearly matches the request.
+3. If it is still unclear what feature or change prompted the request (for example a bare "fix this" on a branch with no PR), ask the user whether this belongs to a particular feature, PR/MR or ticket before recording it. Do not invent one. If the user says there is none, record the request alone.
+
+```bash
+staged init <conversation-id> --json --intent 'Make the parser tolerate empty input; reviewer asked on the PR.' --ref https://github.com/acme/app/pull/42
+staged intent -m '<original request>' --ref <PR/MR/issue URL or ticket>   # Same thing for an existing session
+staged intent --ref <another reference>                                   # Add a reference later
+staged --intent                                                           # Read it back (--json for structured output)
+```
+
+When reusing a session that already has an intent, keep it. If the user widens the request, rewrite the intent with `-m` so it covers both the original ask and the addition. Never replace it with a summary of your changes. `intent.json` is managed by these commands; do not write it with `--meta`.
 
 ## Write the proposal
 
@@ -46,12 +63,13 @@ Keep metadata beside `staging/`, never inside it:
   session.json
   renames.json
   summaries.json
+  intent.json
   staged_changes.md
   staging/
     src/example.py
 ```
 
-Use these exact-path operations for proposal files. Add `--meta` to read, write, create, copy, rename, or delete a top-level session file such as `staged_changes.md` instead of writing it with a host file tool. `--meta` paths are basenames beside `staging/`; do not combine `--meta` with `--workspace` or `--from-workspace`. `session.json`, `renames.json`, and `summaries.json` stay managed by their own commands and cannot be written through `--meta`.
+Use these exact-path operations for proposal files. Add `--meta` to read, write, create, copy, rename, or delete a top-level session file such as `staged_changes.md` instead of writing it with a host file tool. `--meta` paths are basenames beside `staging/`; do not combine `--meta` with `--workspace` or `--from-workspace`. `session.json`, `renames.json`, `summaries.json`, `intent.json`, and `feedback.json` stay managed by their own commands and cannot be written through `--meta`.
 
 Immediately summarize each operation before running the next; the examples below are independent alternatives:
 
@@ -104,16 +122,18 @@ Summaries live in `<session>/summaries.json`, beside `staging/`:
 
 If the installed CLI lacks `summarize`, update this JSON file directly after each modification, preserving unrelated entries. Do not place it inside `staging/`.
 
-Run `staged` to inspect the selected session's staged changes. `staged diff -f <path>` opens review in the configured editor; pass `--tool cli` (e.g. `staged diff -f <path> --tool cli`) to output unified diffs directly in the terminal, which is ideal for programmatic inspection by agents. Never run `staged diff all` automatically, as that opens GUI editor tabs for all files at once. Use exact relative paths when filenames are ambiguous. `staged --sessions` includes each session summary. `staged diff -v` (or `--verbose`) shows the session and per-file summaries; add `-v` to `diff -f <path>` or `diff --all` to print summaries before opening diffs.
+Run `staged` to inspect the selected session's staged changes, or `staged --json` for a structured overview (status, summary and line counts per file). `apply`, `clean`, `migrate`, `--sessions` and `--list` also accept `--json`; put `--json` after the command. `staged diff -f <path>` opens review in the configured editor; pass `--tool cli` (e.g. `staged diff -f <path> --tool cli`) to output unified diffs directly in the terminal, which is ideal for programmatic inspection by agents. Never run `staged diff all` automatically, as that opens GUI editor tabs for all files at once. Use exact relative paths when filenames are ambiguous. `staged --sessions` includes each session summary. `staged diff -v` (or `--verbose`) shows the session and per-file summaries; add `-v` to `diff -f <path>` or `diff --all` to print summaries before opening diffs.
 
 ## Present and refine
 
-Create or update `<session>/staged_changes.md` with `staged write --meta -f staged_changes.md` (`--text` or `--stdin`). `write --meta` creates the file when it is missing; use `create --meta` only when the file must not already exist. Put the session ID prominently at the top, followed by the origin branch, staging path, changes and validation performed. Link the staged files and workspace originals using links supported by the host. Include deletions and renames in the review.
+Create or update `<session>/staged_changes.md` with `staged write --meta -f staged_changes.md` (`--text` or `--stdin`). `write --meta` creates the file when it is missing; use `create --meta` only when the file must not already exist. Put the session ID prominently at the top, followed by the original intent and its references, the origin branch, staging path, changes and validation performed. Link the staged files and workspace originals using links supported by the host. Include deletions and renames in the review.
 
 Include the session ID prominently in the response and offer the concrete review/apply commands:
 
 ```text
 staged use --session <id>
+staged --intent
+staged tui
 staged diff -v
 staged diff -v -f <relative-path>
 staged apply --all
@@ -154,4 +174,4 @@ Immediately before applying, recheck that the affected workspace files have not 
 
 With the intended session selected, run `staged apply -f <relative-path>` or `staged apply --all` for the authorized scope. Do not silently add `--force` or `--yes` when branch protection or a change from the staging session's original Git branch blocks application; explain the concrete branch condition. Existing explicit approval for that condition can be used without asking again.
 
-Run the checks appropriate to the project after applying. Report the outcome. Keep the staged changes until the user requests cleanup; `staged clean -f <path>` or `staged clean --all` discards staged changes and never reverts workspace files.
+Run the checks appropriate to the project after applying. Report the outcome. Keep the staged changes until the user requests cleanup; `staged clean -f <path>` or `staged clean --all` discards staged changes and never reverts workspace files (add `-s <id>` to target another session). `staged clean -s [<id>]` without `-f` or `--all` deletes the whole session, including its intent; do that only when the user asks for the session itself to be removed.

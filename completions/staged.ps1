@@ -6,7 +6,7 @@ Register-ArgumentCompleter -Native -CommandName staged -ScriptBlock {
   if ($wordToComplete) { $contextWords = @($contextWords | Select-Object -SkipLast 1) }
   $choices = switch ($previous) {
     { $_ -in '--tool','-t' } { & staged --complete-tools; break }
-    { $_ -in '--session','--from','--between','--compare-session','--default-session' } { & staged --complete-sessions; break }
+    { $_ -in '--session','-s','--from','--between','--compare-session','--default-session' } { & staged --complete-sessions; break }
     '--to' {
       if ($contextWords -contains 'copy' -or $contextWords -contains 'rename') {
         if ($contextWords -contains '--meta') { & staged --complete-files @contextWords }
@@ -14,7 +14,6 @@ Register-ArgumentCompleter -Native -CommandName staged -ScriptBlock {
       break
     }
     'use' { & staged --complete-sessions; & staged --complete-options @contextWords; break }
-    '-s' { if ($contextWords -contains 'path') { & staged --complete-options @contextWords } else { & staged --complete-sessions }; break }
     '--branch-protection' { 'true','false'; break }
     { $_ -in '--file','-f' } { & staged --complete-files @contextWords; break }
     '--shell' { 'bash','zsh','powershell'; break }
