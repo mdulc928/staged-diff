@@ -2090,6 +2090,101 @@ source "$1"
             'line1_user\nline2\nline3\nline4\nline5\n'
         )
 
+    def inverse_fixture(self):
+        """Modify, add (indexed and untracked), delete and rename relative to HEAD."""
+        (self.repo / 'gone.txt').write_text('gone\n')
+        (self.repo / 'old.txt').write_text('move me\nline2\nline3\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'more')
+        (self.repo / 'existing.txt').write_text('changed\n')
+        (self.repo / 'gone.txt').unlink()
+        self.git('mv', 'old.txt', 'new.txt')
+        (self.repo / 'indexed.txt').write_text('indexed\n')
+        self.git('add', 'indexed.txt')
+        (self.repo / 'deep/dir').mkdir(parents=True)
+        (self.repo / 'deep/dir/untracked.txt').write_text('untracked\n')
+        return {p.relative_to(self.repo).as_posix(): p.read_bytes() for p in self.repo.rglob('*')
+                if p.is_file() and '.git' not in p.relative_to(self.repo).parts}
+
+    def test_inverse_apply_moves_git_changes_and_apply_brings_them_back(self):
+        before = self.inverse_fixture()
+        self.init('session-a')
+        result = json.loads(self.run_cli('apply', '--inverse', '--all', '-y', '--json').stdout)
+        self.assertEqual(result['operation'], 'inverse')
+        self.assertEqual(result['base'], 'HEAD')
+        self.assertEqual(result['moved'], [
+            {'path': 'deep/dir/untracked.txt', 'status': 'NEW FILE'},
+            {'path': 'existing.txt', 'status': 'MODIFIED'},
+            {'path': 'gone.txt', 'status': 'DELETED'},
+            {'path': 'indexed.txt', 'status': 'NEW FILE'},
+            {'path': 'new.txt', 'status': 'RENAMED', 'from': 'old.txt'},
+        ])
+        # The workspace and index are back at HEAD and the empty untracked directory is gone.
+        self.assertEqual(self.git('status', '--porcelain').stdout, '')
+        self.assertFalse((self.repo / 'deep').exists())
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
+        session = self.root / 'session-a'
+        self.assertEqual((session / 'staging/existing.txt').read_text(), 'changed\n')
+        self.assertEqual(json.loads((session / 'renames.json').read_text()),
+                         {'new.txt': 'old.txt', '_deletions': ['gone.txt']})
+        self.assertIn('No workspace changes since HEAD.', self.run_cli('apply', '-i', '--all', '-y').stdout)
+
+        self.run_cli('apply', '--all')
+        after = {p.relative_to(self.repo).as_posix(): p.read_bytes() for p in self.repo.rglob('*')
+                 if p.is_file() and '.git' not in p.relative_to(self.repo).parts}
+        self.assertEqual(after, before)
+
+    def test_inverse_apply_is_undoable_and_selects_one_file(self):
+        self.inverse_fixture()
+        self.init('session-a')
+        out = self.run_cli('apply', '-i', 'git', '-f', 'existing.txt', '-y').stdout
+        self.assertRegex(out, r'\[MODIFIED\] +existing\.txt')
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
+        self.assertTrue((self.repo / 'new.txt').is_file())
+        # A path that already has a proposal is never overwritten.
+        (self.repo / 'existing.txt').write_text('again\n')
+        self.assertIn('already has proposals for: existing.txt',
+                      self.run_cli('apply', '-i', '--all', '-y', ok=False).stderr)
+        (self.repo / 'existing.txt').write_text('original\n')
+        self.run_cli('undo', '-y')
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'changed\n')
+
+    def test_inverse_apply_against_an_older_base(self):
+        first = self.git('rev-parse', 'HEAD').stdout.strip()
+        (self.repo / 'existing.txt').write_text('committed\n')
+        (self.repo / 'feature.txt').write_text('feature\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'feature')
+        self.init('session-a')
+        result = json.loads(self.run_cli('apply', '-i', '--base', first, '--all', '-y', '--json').stdout)
+        self.assertEqual([item['path'] for item in result['moved']], ['existing.txt', 'feature.txt'])
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'original\n')
+        self.assertFalse((self.repo / 'feature.txt').exists())
+
+    def test_inverse_apply_argument_errors(self):
+        self.init('session-a')
+        self.assertIn('--base requires --inverse', self.run_cli('apply', '--base', 'HEAD', '--all', ok=False).stderr)
+        self.assertIn("invalid choice: 'svn'", self.run_cli('apply', '-i', 'svn', '--all', ok=False).stderr)
+        self.assertIn('cannot be combined', self.run_cli('apply', '-i', '--force', '--all', ok=False).stderr)
+        self.assertIn('Unknown base revision', self.run_cli('apply', '-i', '--base', 'nope', '--all', '-y', ok=False).stderr)
+        (self.repo / 'existing.txt').write_text('changed\n')
+        self.assertIn('pass --yes', self.run_cli('apply', '-i', '--all', ok=False).stderr)
+        self.assertEqual((self.repo / 'existing.txt').read_text(), 'changed\n')
+
+    def test_inverse_apply_refuses_merge_conflicts(self):
+        self.git('checkout', '-qb', 'other')
+        (self.repo / 'existing.txt').write_text('other\n')
+        self.git('commit', '-qam', 'other')
+        self.git('checkout', '-q', TEMPLATE_BRANCH)
+        (self.repo / 'existing.txt').write_text('mine\n')
+        self.git('commit', '-qam', 'mine')
+        subprocess.run(['git', '-C', str(self.repo), 'merge', '-q', 'other'], env=self.env, capture_output=True)
+        conflicted = (self.repo / 'existing.txt').read_text()
+        self.init('session-a')
+        self.assertIn('Resolve merge conflicts before moving changes: existing.txt',
+                      self.run_cli('apply', '-i', '--all', '-y', ok=False).stderr)
+        self.assertEqual((self.repo / 'existing.txt').read_text(), conflicted)
+
     def test_cli_fmt_check_and_exec(self):
         self.init('session-a')
         (self.repo / 'helper_mod.py').write_text('MULT = 3\n')

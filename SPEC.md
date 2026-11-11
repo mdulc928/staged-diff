@@ -289,6 +289,13 @@ If a query matches multiple files at any step, resolution halts and outputs all 
 - **Ordered Rename Operations**: Renamed destinations are written before source files are deleted.
 - **No Multi-File Transaction**: Batch apply does not provide an all-or-nothing filesystem transaction. If an error occurs mid-batch, previously written files remain in the workspace.
 
+### Inverse Apply (`apply --inverse`)
+
+- `staged apply -i|--inverse [git] (-f <file> | --all) [--base <ref>] [-y] [--json]` moves the files that differ between `<ref>` (default `HEAD`) and the working tree (tracked changes plus untracked, non-ignored files) into the active session.
+- Contents are written to staging, and renames and deletions are recorded in `renames.json`, **before** any workspace file is restored. Workspace files are then restored to `<ref>` through git's checkout filters, with a backup that `staged undo` can roll back, and base snapshots are reset to the restored contents.
+- Moved paths are reset to `HEAD` in the git index. Undo does not restore the previous index state.
+- Refuses unmerged paths, paths that already have a proposal or are rename sources in the session, `--force`, and `--no-merge`. Symlinks, submodules, type changes, and `.staged.json` are skipped. Requires confirmation or `--yes`.
+
 ### Clean Guarantees
 
 - `clean` operations **never** modify or revert workspace files.
