@@ -1684,6 +1684,240 @@ def undo_apply(ctx, session):
         for rel in restored_paths:
             print(status_row('UNDONE', rel))
 
+
+# ===========================================================================
+# Inverse Apply: move version-control changes from the workspace into a session
+# ===========================================================================
+
+INVERSE_VCS = ('git',)
+# staged's own per-repository settings never move into a proposal.
+INVERSE_EXCLUDED = ('.staged.json',)
+GIT_REGULAR_MODES = ('100644', '100755')
+
+
+def git_bytes(workspace, *args, stdin=None, env=None):
+    try:
+        result = subprocess.run(['git', '-C', str(workspace)] + list(args), input=stdin,
+                                capture_output=True, env=env)
+    except OSError as exc:
+        raise StagedError('Cannot run git: {}'.format(exc))
+    if result.returncode != 0:
+        message = result.stderr.decode('utf-8', 'replace').strip() or 'exit status {}'.format(result.returncode)
+        raise StagedError('git {} failed: {}'.format(args[0], message))
+    return result.stdout
+
+
+def git_checkout_mode(raw_mode):
+    """Permissions git itself would give a checked-out regular file."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return (0o777 if raw_mode == '100755' else 0o666) & ~mask
+
+
+def collect_git_changes(workspace, base):
+    """Map each regular file that differs between `base` and the working tree (untracked files
+    included) to its base blob. Returns (changes, skipped, commit)."""
+    if not base or base.startswith('-'):
+        raise StagedError('Invalid base revision: {!r}'.format(base))
+    if get_git_root(workspace) != workspace:
+        raise StagedError('apply --inverse needs a session whose workspace is a git repository root: '
+                          + str(workspace))
+    commit = git_output(workspace, 'rev-parse', '--verify', '--quiet', base + '^{commit}')
+    if not commit:
+        raise StagedError('Unknown base revision: ' + base)
+    unmerged = git_bytes(workspace, '-c', 'core.quotePath=false', 'diff', '--name-only', '--diff-filter=U', '-z')
+    conflicted = sorted({os.fsdecode(p) for p in unmerged.split(b'\0') if p})
+    if conflicted:
+        raise StagedError('Resolve merge conflicts before moving changes: ' + ', '.join(conflicted))
+    raw = git_bytes(workspace, '-c', 'core.quotePath=false', 'diff', '--raw', '-z', '-M', '--no-abbrev',
+                    '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', commit, '--')
+    fields = raw.split(b'\0')
+    base_info = {}    # rel -> (blob sha, git mode) in base
+    renames = {}      # new rel -> old rel, as detected by git
+    skipped = {}
+    listed = set()    # every path git diff reported, including additions with no base blob
+    index = 0
+    while index < len(fields) and fields[index]:
+        src_mode, dst_mode, src_sha, _dst_sha, code = fields[index].decode('ascii').lstrip(':').split()
+        letter = code[0]
+        if letter in 'RC':
+            old, rel = os.fsdecode(fields[index + 1]), os.fsdecode(fields[index + 2])
+            index += 3
+        else:
+            old = rel = os.fsdecode(fields[index + 1])
+            index += 2
+        modes = [m for m in (src_mode, dst_mode) if m != '000000']
+        if letter == 'T' or any(m not in GIT_REGULAR_MODES for m in modes):
+            skipped[rel] = 'not a regular file (symlink, submodule or type change)'
+            continue
+        listed.add(rel)
+        if src_mode != '000000':
+            base_info[old] = (src_sha, src_mode)
+        if letter == 'R':
+            renames[rel] = old
+    untracked = git_bytes(workspace, '-c', 'core.quotePath=false', 'ls-files', '--others',
+                          '--exclude-standard', '-z')
+    paths = listed | set(base_info)
+    for item in untracked.split(b'\0'):
+        rel = os.fsdecode(item)
+        if rel and not rel.endswith('/'):    # a trailing slash marks a nested repository
+            paths.add(rel)
+
+    changes = []
+    for rel in sorted(paths - set(INVERSE_EXCLUDED) - set(skipped)):
+        if rel in renames.values():
+            continue    # reported with its rename destination
+        if (workspace / rel).is_symlink():
+            skipped[rel] = 'symlink'
+            continue
+        try:
+            ws_file = safe_path(workspace, rel)
+            old = renames.get(rel, rel)
+            old_file = safe_path(workspace, old)
+        except StagedError as exc:
+            skipped[rel] = str(exc)
+            continue
+        if ws_file.is_symlink() or ws_file.exists() and not ws_file.is_file():
+            skipped[rel] = 'not a regular file in the workspace'
+            continue
+        if old != rel and (not ws_file.is_file() or old_file.exists()):
+            # Treat a rename that no longer matches the working tree as a deletion plus a new file.
+            changes.extend(_inverse_entries(workspace, old, old, base_info.get(old)))
+            old = rel
+        changes.extend(_inverse_entries(workspace, rel, old, base_info.get(old)))
+    return changes, [{'path': p, 'reason': r} for p, r in sorted(skipped.items())], commit
+
+
+def _inverse_entries(workspace, rel, old, base):
+    ws_file = safe_path(workspace, rel)
+    sha, mode = base if base else (None, None)
+    base_bytes = git_bytes(workspace, 'cat-file', '--filters', '--path=' + old, sha) if sha else None
+    if ws_file.is_file():
+        status = 'NEW FILE' if base_bytes is None else 'MODIFIED' if old == rel else 'RENAMED'
+        if status == 'MODIFIED' and ws_file.read_bytes() == base_bytes and (
+                os.name == 'nt' or bool(file_mode(ws_file) & 0o100) == (mode == '100755')):
+            return []    # stat-only difference
+    elif base_bytes is not None:
+        status = 'DELETED'
+    else:
+        return []
+    return [{'rel': rel, 'old': old, 'status': status, 'base_bytes': base_bytes,
+             'base_mode': git_checkout_mode(mode) if mode else None}]
+
+
+def prune_empty_parents(path, stop):
+    parent = Path(path).parent
+    while parent != stop and parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
+        parent = parent.parent
+
+
+def unstage_git_paths(workspace, rels):
+    """Reset the git index for moved paths to HEAD so moved changes do not linger as staged hunks."""
+    if not rels or not git_output(workspace, 'rev-parse', '--verify', '--quiet', 'HEAD'):
+        return None
+    env = dict(os.environ, GIT_LITERAL_PATHSPECS='1')
+    try:
+        git_bytes(workspace, 'reset', '-q', '--pathspec-from-file=-', '--pathspec-file-nul',
+                  stdin=b'\0'.join(os.fsencode(r) for r in rels), env=env)
+    except StagedError as exc:
+        return str(exc)
+    return None
+
+
+def inverse_apply(ctx, session, target):
+    """Move changes between a VCS base and the workspace into the session, then restore the base.
+
+    The changes land in staging first; only then are the workspace files restored, behind a
+    backup that `staged undo` replays. `staged apply` brings the changes back."""
+    base = getattr(ctx.args, 'base', None) or 'HEAD'
+    as_json = bool(getattr(ctx.args, 'json', False))
+    changes, skipped, commit = collect_git_changes(session.workspace, base)
+    if target is not None:
+        if not changes:
+            raise StagedError('No workspace changes since {}.'.format(base))
+        chosen = match_file(target, [c['rel'] for c in changes], label='changed workspace file')
+        changes = [c for c in changes if c['rel'] == chosen]
+    for item in skipped:
+        if not as_json:
+            print('Skipped {}: {}'.format(item['path'], item['reason']), file=sys.stderr)
+
+    occupied = set(session.paths(fresh=True))
+    occupied.update(old for rel, old in session.manifest.items() if rel != '_deletions')
+    overlapping = sorted({p for c in changes for p in (c['rel'], c['old'])} & occupied)
+    if overlapping:
+        raise StagedError('Session {} already has proposals for: {}. Apply or clean them first, or use '
+                          'another session.'.format(session.id, ', '.join(overlapping)))
+    for change in changes:
+        staged_file = safe_path(session.staging, change['rel'])
+        if staged_file.exists() or staged_file.is_symlink():
+            raise StagedError('Staging already has an entry at {}; remove it first.'.format(change['rel']))
+        for parent in staged_file.parents:
+            if parent == session.staging:
+                break
+            if parent.exists() and not parent.is_dir():
+                raise StagedError('Staging parent is not a directory: ' + str(parent))
+
+    result = {'operation': 'inverse', 'session': session.id, 'base': base, 'base_commit': commit,
+              'backup': None, 'moved': [], 'skipped': skipped}
+    if not changes:
+        if not as_json:
+            print('No workspace changes since {}.'.format(base))
+        return result
+    if not ctx.args.yes and not as_json:
+        for change in changes:
+            print(status_row(change['status'], change['rel']), file=sys.stderr)
+    confirm('Move {} change(s) into session {} and restore those workspace files to {}?'.format(
+        len(changes), session.id, base), ctx.args.yes)
+
+    # 1. Preserve every change in staging before the workspace is touched.
+    for change in changes:
+        if change['status'] != 'DELETED':
+            copy_atomic(safe_path(session.workspace, change['rel']), safe_path(session.staging, change['rel']))
+    deletions = set(session.deletions)
+    for change in changes:
+        if change['status'] == 'DELETED':
+            deletions.add(change['rel'])
+        elif change['old'] != change['rel']:
+            session.manifest[change['rel']] = change['old']
+    session.deletions = sorted(deletions)
+    if deletions:
+        session.manifest['_deletions'] = session.deletions
+    session.save_manifest()
+
+    # 2. Restore the base versions behind a backup that `staged undo` can replay.
+    touched = list(dict.fromkeys(p for c in changes for p in (c['old'], c['rel'])))
+    backup_id, bdir, entries = begin_backup(session, touched)
+    for change in changes:
+        if change['base_bytes'] is not None:
+            write_bytes_atomic(safe_path(session.workspace, change['old']), change['base_bytes'],
+                               mode=change['base_mode'])
+        if change['status'] in ('NEW FILE', 'RENAMED'):
+            ws_file = safe_path(session.workspace, change['rel'])
+            if ws_file.is_file():
+                ws_file.unlink()
+                prune_empty_parents(ws_file, session.workspace)
+    finish_backup(session, backup_id, bdir, entries)
+
+    # 3. The restored workspace is the baseline later applies merge against.
+    for rel in touched:
+        record_base_snapshot(session, rel, reset=True)
+    warning = unstage_git_paths(session.workspace, touched)
+    session.refresh_index()
+
+    result['backup'] = backup_id
+    result['moved'] = [dict({'path': c['rel'], 'status': c['status']},
+                            **({'from': c['old']} if c['old'] != c['rel'] else {})) for c in changes]
+    if warning:
+        result['warning'] = 'Could not unstage moved paths in the git index: ' + warning
+        print('Warning: ' + result['warning'], file=sys.stderr)
+    if not as_json:
+        print('Moved into session {} (workspace restored to {}):'.format(session.id, base))
+        for change in changes:
+            print(status_row(change['status'], change['rel'], NESTED))
+        print('Bring them back with staged apply --all; staged undo restores the workspace instead.')
+    return result
+
 # ===========================================================================
 # Diff Line Stats, Virtual Buffer Formatter, Overlay Checker & Sandbox Exec
 # ===========================================================================
@@ -6139,7 +6373,10 @@ MANUAL = {
                  'see_also': ['tui']},
     'apply': {'name': 'apply proposed files, renames and deletions to the workspace',
               'more': ['Workspace files that changed since staging are merged with a 3-way merge when possible. '
-                       'Every apply records a backup that staged undo can restore.'],
+                       'Every apply records a backup that staged undo can restore. '
+                       'With --inverse, apply runs the other way: files that differ between --base (default HEAD) '
+                       'and the workspace, untracked files included, move into the session as proposals and those '
+                       'workspace files are restored to --base; staged apply --all brings them back.'],
               'see_also': ['undo', 'diff']},
     'undo': {'name': 'restore the workspace from the most recent apply backup', 'see_also': ['apply']},
     'fmt': {'name': 'format staged files in place without touching the workspace', 'see_also': ['check']},
@@ -6610,6 +6847,11 @@ def make_parser():
         command_parsers[name].add_argument('--force', action='store_true', help='allow protected-branch or conflicting workspace apply')
         command_parsers[name].add_argument('--no-merge', action='store_true', help='disable automatic 3-way merge when workspace files have drifted')
         command_parsers[name].add_argument('-y', '--yes', action='store_true', help='confirm branch drift or clean')
+    p = command_parsers['apply']
+    p.add_argument('-i', '--inverse', nargs='?', const='git', choices=INVERSE_VCS, metavar='VCS',
+                   help='move changes between --base and the workspace into the session, restoring those '
+                        'workspace files to --base (VCS: git, the default)')
+    p.add_argument('--base', metavar='REF', help='with --inverse, the revision to diff against and restore (default: HEAD)')
     configure_tui_parser(command_parsers['tui'])
     configure_feedback_parser(command_parsers['feedback'])
     p = command_parsers['undo']
@@ -7251,6 +7493,10 @@ def main(argv=None):
             commands['clean'].error('choose -f <file>, --all, or -s [id] to discard a whole session')
         if whole is True and (args.file is not None or args.all):
             commands['clean'].error('-s needs a session ID with -f or --all: staged clean --all -s <id>')
+    if args.command == 'apply' and args.base is not None and not args.inverse:
+        commands['apply'].error('--base requires --inverse')
+    if args.command == 'apply' and args.inverse and (args.force or args.no_merge):
+        commands['apply'].error('--inverse cannot be combined with --force or --no-merge')
     if args.command == 'diff' and args.json and not (args.apply or args.clean) and (
             args.file is not None or args.all or args.between or args.compare_session or args.tui):
         commands['diff'].error('--json applies to the overview, --apply and --clean')
@@ -7438,6 +7684,10 @@ def main(argv=None):
             sys.exit(res['returncode'] or 1)
     elif args.command == 'sandbox':
         handle_sandbox(session, args)
+    elif args.command == 'apply' and args.inverse:
+        result = inverse_apply(ctx, session, args.file)
+        if args.json:
+            print(json.dumps(result))
     elif args.command == 'apply' or (args.command == 'diff' and args.apply):
         result = apply_changes(ctx, session, args.file)
         if args.command == 'diff' and args.clean:
