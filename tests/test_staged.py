@@ -986,6 +986,43 @@ class CLI(unittest.TestCase):
         self.run_cli('init', '../escape', ok=False)
         self.run_cli('init', 'unsafe', '--root', str(self.repo / 'proposals'), ok=False)
 
+    def test_usage_names_every_visible_option(self):
+        import argparse
+        import re
+        parser, commands = staged.make_parser()
+        for name, sub in [('staged', parser)] + list(commands.items()):
+            usage = ' '.join(staged.synopsis_lines(sub))
+            flags = set(re.findall(r'(?<![\w-])(--?[A-Za-z][\w-]*)', usage))
+            for cluster in re.findall(r'\[-([A-Za-z]+)\]', usage):
+                flags.update('-' + letter for letter in cluster)
+            for action in sub._actions:
+                if action.help == argparse.SUPPRESS or not action.option_strings:
+                    continue
+                self.assertTrue(set(action.option_strings) & flags,
+                                '{} usage omits {}: {}'.format(name, action.option_strings, usage))
+        self.assertNotIn('[common options]', ' '.join(staged.synopsis_lines(commands['apply'])))
+        self.assertIn('[--shell bash|zsh|powershell]',
+                      ' '.join(staged.synopsis_lines(commands['install-completion'])))
+
+    def test_unknown_command_lists_commands_and_suggests_matches(self):
+        result = self.run_cli('install', 'completion', ok=False)
+        self.assertIn('\nCOMMANDS\n', result.stderr)
+        for name in staged.COMMANDS:
+            self.assertIn('       ' + name + ' ', result.stderr)
+        self.assertIn('install-completion install shell completions', result.stderr)
+        self.assertIn("staged: unknown command 'install'; did you mean install-skill, install-completion "
+                      'or install-launcher?', result.stderr)
+        self.assertNotIn('choose from', result.stderr)
+        self.assertIn("unknown command 'aply'; did you mean apply?", self.run_cli('aply', ok=False).stderr)
+        # Command usage stays short; only the top-level usage carries the list.
+        self.assertNotIn('COMMANDS', self.run_cli('apply', '--all', '--bogus', ok=False).stderr)
+
+    def test_unrecognized_option_shows_the_command_usage(self):
+        result = self.run_cli('install-completion', '--bogus', ok=False)
+        self.assertIn('usage: staged install-completion [-h] [--shell', result.stderr)
+        self.assertIn('staged install-completion: unrecognized arguments: --bogus', result.stderr)
+        self.assertNotIn('staged --sessions', result.stderr)
+
     def test_help_never_runs_or_requires_arguments(self):
         self.propose()
         before = (self.root / 'session-a/staging/existing.txt').read_bytes()
