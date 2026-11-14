@@ -512,7 +512,7 @@ staged diff --tui             # Alias via diff command
   - When a line exists on only one side, the other side shows a shaded blank.
   - Unchanged runs fold into one `⋯ N unchanged lines` row, keeping 3 lines of context around each hunk; `z` (or Enter on the fold) expands them. Lines that have comments are never folded.
   - Long lines wrap at word boundaries; `W` truncates them instead.
-  - Syntax highlighting applies to unchanged lines when `pygments` is installed (`H` toggles it). If `pygments` lives in a separate environment (a venv or uv environment), point the npm launcher at that interpreter with `STAGED_PYTHON`, e.g. `export STAGED_PYTHON=~/.venvs/staged/bin/python`.
+  - Syntax highlighting colours the text of every line when `pygments` is installed (`H` toggles it). On 256-colour terminals changes are shown by background alone: a tint for each changed line and a stronger tint behind the changed words, so the text keeps its syntax colour. On 8-colour terminals changed lines stay green or red and only unchanged lines get syntax colours. If `pygments` lives in a separate environment (a venv or uv environment), point the npm launcher at that interpreter with `STAGED_PYTHON`, e.g. `export STAGED_PYTHON=~/.venvs/staged/bin/python`.
 - **Footer**: status messages on the left and the keys for the focused pane on the right. Confirmation prompts and comment input also appear here.
 - **Info panel** (`i`): the intent with its references, the session summary, and the current file's summary, paths, and comment counts.
 
