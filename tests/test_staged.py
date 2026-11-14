@@ -2058,6 +2058,21 @@ source "$1"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['session'], 'npm-session')
 
+    def test_npm_launcher_honors_staged_python(self):
+        if not shutil.which('node'):
+            self.skipTest('Node is optional')
+        launcher = str(SCRIPT.parent / 'bin/staged.cjs')
+        env = dict(self.env, STAGED_PYTHON=sys.executable)
+        result = subprocess.run(['node', launcher, 'init', 'py-session', '--json'],
+                                env=env, cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['session'], 'py-session')
+
+        env['STAGED_PYTHON'] = str(self.base / 'no-such-python')
+        result = subprocess.run(['node', launcher, 'list'], env=env, cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('STAGED_PYTHON=', result.stderr)
+
     def test_non_git_workspace_and_spaces(self):
         workspace = self.base / 'workspace with spaces'
         workspace.mkdir()
