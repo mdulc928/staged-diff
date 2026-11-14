@@ -6462,22 +6462,63 @@ def _visible_actions(parser, common=None):
     return result
 
 
+# The top-level forms are fixed; tests check that together they name every visible top-level option.
+TOP_LEVEL_SYNOPSIS = (
+    ['-h', '-v', '[--json]', '[-s id]', '[-t tool]', '[--root dir]', '[--shell bash|zsh|powershell]'],
+    ['--sessions | -R | --list', '[--json]'],
+    ['--summary', '[-f file]', '[--json]'],
+    ['--intent', '[--json]'],
+    ['--help-all'],
+    ['command', '[options]'],
+    ['help', '[command]'],
+)
+
+
+def _flag_cluster(letters):
+    """BSD-style `[-achy]`: single-letter flags without values, uppercase before lowercase of each letter."""
+    return '[-{}]'.format(''.join(sorted(set(letters), key=lambda c: (c.lower(), c.islower()))))
+
+
+def _short_flag(action):
+    """The one-letter flag of a no-value option outside any group, if it can join a flag cluster."""
+    if action.nargs != 0 or action.required:
+        return None
+    short = [f for f in action.option_strings if len(f) == 2 and f[0] == '-' and f[1] != '-']
+    return short[0][1] if short else None
+
+
+def _wrap_synopsis(prog, tokens):
+    width = _manual_width() - 12
+    lines, current = [], prog
+    indent = ' ' * (len(prog) + 1)
+    for token in tokens:
+        if len(current) + 1 + len(token) > width and current.strip() != prog:
+            lines.append(current)
+            current = indent + token
+        else:
+            current += ' ' + token
+    lines.append(current)
+    return lines
+
+
 def synopsis_lines(parser):
+    """Man-page synopsis: a flag cluster, then options in definition order, common options, operands."""
     if parser.prog == 'staged':
-        return ['staged [-v] [--json] [-s id] [-t tool] [--root dir]',
-                'staged --sessions | -R | --list [--json]',
-                'staged --summary [-f file] [--json]',
-                'staged --intent [--json]',
-                'staged command [options]',
-                'staged help [command]']
-    actions = _visible_actions(parser, common=False)
+        lines = []
+        for form in TOP_LEVEL_SYNOPSIS:
+            letters = [t[1] for t in form if len(t) == 2 and t.startswith('-')]
+            rest = [t for t in form if not (len(t) == 2 and t.startswith('-'))]
+            lines.extend(_wrap_synopsis('staged', ([_flag_cluster(letters)] if letters else []) + rest))
+        return lines
+    actions = _visible_actions(parser, common=False) + _visible_actions(parser, common=True)
     groups = {}
     for group in parser._mutually_exclusive_groups:
         members = [a for a in group._group_actions if a in actions]
         if members:
             for action in members:
                 groups[action] = (group, members)
-    tokens, seen = [], set()
+    letters = ['h'] if parser.add_help else []
+    tokens, operands, seen = [], [], set()
     for action in actions:
         if action in groups:
             group, members = groups[action]
@@ -6486,24 +6527,15 @@ def synopsis_lines(parser):
             seen.add(id(group))
             text = ' | '.join(_action_token(a) for a in members)
             tokens.append(('({})' if group.required and len(members) > 1 else '{}' if group.required else '[{}]').format(text))
-        elif action.option_strings:
+        elif not action.option_strings:
+            operands.append(_action_token(action))
+        elif _short_flag(action):
+            letters.append(_short_flag(action))
+        else:
             token = _action_token(action)
             tokens.append(token if action.required else '[' + token + ']')
-        else:
-            tokens.append(_action_token(action))
-    if _visible_actions(parser, common=True):
-        tokens.append('[common options]')
-    width = _manual_width() - 12
-    lines, current = [], parser.prog
-    indent = ' ' * (len(parser.prog) + 1)
-    for token in tokens:
-        if len(current) + 1 + len(token) > width and current.strip() != parser.prog:
-            lines.append(current)
-            current = indent + token
-        else:
-            current += ' ' + token
-    lines.append(current)
-    return lines
+    cluster = [_flag_cluster(letters)] if letters else []
+    return _wrap_synopsis(parser.prog, cluster + tokens + operands)
 
 
 def _paint(text, code):
@@ -6579,15 +6611,7 @@ def render_manual(parser):
             lines.append('')
     if command is None:
         heading('COMMANDS')
-        names = {a.dest: a for a in parser._actions if isinstance(a, argparse._SubParsersAction)}
-        choices = next(iter(names.values())).choices if names else {}
-        for title_text, members in COMMAND_GROUPS:
-            lines.append('     ' + _paint(title_text, '1'))
-            for name in members:
-                summary = MANUAL.get(name, {}).get('name', choices[name].description if name in choices else '')
-                body = _wrap(summary, ' ' * 26, width)
-                lines.append('       ' + _paint(name, '1;36') + ' ' * (19 - len(name)) + body.lstrip())
-            lines.append('')
+        lines.extend(command_lines(parser, width))
         lines.append(_wrap('Run staged help <command> or staged <command> --help for a command\'s manual, '
                            'and staged --help-all for every manual.', '     ', width))
         lines.append('')
@@ -6632,6 +6656,39 @@ def render_manual(parser):
     return '\n'.join(lines).rstrip() + '\n'
 
 
+def command_lines(parser, width, paint=True):
+    """The grouped COMMANDS list: each command name with its one-line summary."""
+    style = _paint if paint else (lambda text, code: text)
+    names = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    choices = names[0].choices if names else {}
+    lines = []
+    for title_text, members in COMMAND_GROUPS:
+        lines.append('     ' + style(title_text, '1'))
+        for name in members:
+            summary = MANUAL.get(name, {}).get('name', choices[name].description if name in choices else '')
+            body = _wrap(summary, ' ' * 26, width)
+            lines.append('       ' + style(name, '1;36') + ' ' * (19 - len(name)) + body.lstrip())
+        lines.append('')
+    return lines
+
+
+def unknown_command_message(message):
+    """Replace argparse's dump of every command choice with a short message and close matches."""
+    match = re.match(r"argument command: invalid choice: (.+?) \(choose from ", message)
+    if not match:
+        return message
+    try:
+        word = str(ast.literal_eval(match.group(1)))
+    except (ValueError, SyntaxError):
+        word = match.group(1).strip('\'"')
+    similar = [c for c in COMMANDS if word and c.startswith(word)] or difflib.get_close_matches(word, COMMANDS, n=3)
+    text = 'unknown command {!r}'.format(word)
+    if similar:
+        text += '; did you mean {}?'.format(
+            similar[0] if len(similar) == 1 else ', '.join(similar[:-1]) + ' or ' + similar[-1])
+    return text
+
+
 def emit_manual(text, file=None):
     """Print help, through a pager when it is longer than an interactive terminal."""
     stream = file or sys.stdout
@@ -6671,12 +6728,27 @@ class StagedArgumentParser(argparse.ArgumentParser):
     """argparse with BSD-style usage lines and manual-page help (see render_manual)."""
 
     def format_usage(self):
-        return 'usage: ' + '\n       '.join(synopsis_lines(self)) + '\n'
+        usage = 'usage: ' + '\n       '.join(synopsis_lines(self)) + '\n'
+        if self.prog == 'staged':
+            usage += '\nCOMMANDS\n' + '\n'.join(command_lines(self, _manual_width(), paint=False))
+        return usage
 
     def print_help(self, file=None):
         emit_manual(render_manual(self), file)
 
+    def parse_args(self, args=None, namespace=None):
+        parsed, extras = self.parse_known_args(args, namespace)
+        if extras:
+            # argparse reports leftovers from the top-level parser; show the command's own usage instead.
+            target = self
+            for action in self._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    target = action.choices.get(getattr(parsed, action.dest, None), self)
+            target.error('unrecognized arguments: ' + ' '.join(extras))
+        return parsed
+
     def error(self, message):
+        message = unknown_command_message(message)
         self.print_usage(sys.stderr)
         self.exit(2, '{}: {}\nRun {} --help for details.\n'.format(self.prog, message, self.prog))
 
