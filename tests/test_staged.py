@@ -3128,6 +3128,38 @@ class TestTuiAndFeedback(unittest.TestCase):
         self.assertTrue(r_spans)
         self.assertEqual('    value = x + 42'[r_spans[0][0]:r_spans[0][1]], '42')
 
+    def test_syntax_colours_changed_lines_only_when_changes_are_tinted(self):
+        try:
+            import pygments  # noqa: F401
+        except ImportError:
+            self.skipTest('pygments is optional')
+        state = staged.TuiState(self.session, target_file='src/new_mod.py')  # every line is an addition
+
+        def syntax_spans():
+            state.render_frame(width=120, height=20)
+            return [s for spans in state.frame_styles for s in spans if s[2].startswith('syn_')]
+
+        self.assertIn('syn_number', [s[2] for s in syntax_spans()])
+        state.tinted_changes = False  # 8-colour terminals mark changes by text colour
+        self.assertEqual(syntax_spans(), [])
+
+    def test_curses_styles_layer_text_colour_over_background(self):
+        app = staged.TuiApp(None)
+        app.specs = {'add': (None, 22, 0), 'syn_string': (179, None, 0), 'add_em': (None, 28, 0),
+                     'selected': (None, 238, 0), 'cursor': (74, None, 1), 'gutter': (242, None, 2)}
+        app._attr = lambda fg, bg, extras: (fg, bg, extras)
+        spans = [(0, 10, 'add'), (2, 5, 'syn_string'), (3, 3, 'add_em'), (0, 1, 'gutter'), (0, 1, 'cursor')]
+        self.assertEqual(app._runs(spans, 12), [
+            (0, 1, (74, 22, 1)),     # cursor colour and attributes replace the gutter's, background kept
+            (1, 1, (None, 22, 0)),   # plain text on the added-line tint
+            (2, 1, (179, 22, 0)),    # syntax colour keeps the tint
+            (3, 3, (179, 28, 0)),    # changed words: stronger tint, syntax colour unchanged
+            (6, 1, (179, 22, 0)),
+            (7, 3, (None, 22, 0)),
+        ])
+        self.assertEqual(app._runs([(0, 4, 'add'), (0, 4, 'selected')], 4), [(0, 4, (None, 238, 0))])
+        self.assertEqual(app._runs([(0, 4, 'unknown')], 4), [])
+
     def test_selective_hunk_patching(self):
         # Verify src/example.py has 2 distinct diff hunks
         orig = staged.read_side_lines(self.session, 'src/example.py', 'workspace')

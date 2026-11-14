@@ -4520,6 +4520,9 @@ class TuiState:
         self.fold_context = True
         self.wrap_lines = True
         self.syntax_highlight = self.has_pygments
+        # Whether changed lines are marked by a background tint, which leaves the text colour free for
+        # syntax colours. TuiApp clears it on 8-colour terminals, where changes are marked by text colour.
+        self.tinted_changes = True
         self.panel = None  # None, 'help' or 'info'
         self.active_side = 'staged'
 
@@ -5130,7 +5133,7 @@ class TuiState:
         """Split code into cells of `width`, layering syntax colors and intraline change emphasis."""
         width = max(1, width)
         syntax = []
-        if self.syntax_highlight and base_style is None and text:
+        if self.syntax_highlight and text and (base_style is None or self.tinted_changes):
             syntax = [(start, end, 'syn_' + kind) for start, end, kind in _cached_syntax_spans(text, self.current_file)]
         emphasis = [(start, end, base_style + '_em') for start, end in change_spans] if base_style else []
         limit = len(text) if self.wrap_lines else min(len(text), width)
@@ -5431,8 +5434,9 @@ class TuiApp:
     # Tinted backgrounds for terminals with 256 colours: (foreground, background, extra attributes).
     STYLE_COLORS_256 = {
         'header': (252, 236, ()), 'header_title': (16, 74, ('A_BOLD',)), 'header_dim': (245, 236, ()),
-        'add': (None, 22, ()), 'add_em': (231, 28, ('A_BOLD',)), 'add_gutter': (114, 22, ()),
-        'del': (None, 52, ()), 'del_em': (231, 88, ('A_BOLD',)), 'del_gutter': (174, 52, ()),
+        # Changes are background only so syntax colours keep the text colour on changed lines.
+        'add': (None, 22, ()), 'add_em': (None, 28, ()), 'add_gutter': (114, 22, ()),
+        'del': (None, 52, ()), 'del_em': (None, 88, ()), 'del_gutter': (174, 52, ()),
         'gutter': (242, None, ()), 'filler': (None, 235, ()), 'border': (238, None, ()),
         'fold': (244, 235, ()), 'fold_hint': (240, 235, ()),
         'comment': (221, 236, ('A_BOLD',)), 'comment_bg': (221, 236, ()),
@@ -5446,7 +5450,10 @@ class TuiApp:
 
     def __init__(self, state):
         self.state = state
-        self.attrs = {}
+        self.specs = {}  # style -> (foreground, background, attributes) in curses terms
+        self.pairs = {}  # (foreground, background) -> colour pair number, or 0 when none is free
+        self.has_colors = False
+        self.default_colour = -1
 
     def run(self):
         if curses is None:
@@ -5463,42 +5470,74 @@ class TuiApp:
         return self.state
 
     def _init_colors(self):
-        pairs = {}
-        has_colors = curses.has_colors()
-        if has_colors:
+        self.has_colors = curses.has_colors()
+        if self.has_colors:
             curses.start_color()
             try:
                 curses.use_default_colors()
-                default = -1
+                self.default_colour = -1
             except curses.error:
-                default = curses.COLOR_BLACK
+                self.default_colour = curses.COLOR_BLACK
         palette = dict(self.STYLE_COLORS)
-        if has_colors and getattr(curses, 'COLORS', 8) >= 256:
+        if self.has_colors and getattr(curses, 'COLORS', 8) >= 256:
             palette.update(self.STYLE_COLORS_256)
+        else:
+            self.state.tinted_changes = False  # changes are coloured text here, so syntax colours would hide them
 
         def colour(value):
-            if value is None:
-                return default
+            if value is None or not self.has_colors:
+                return None
             return value if isinstance(value, int) else getattr(curses, 'COLOR_' + value)
 
         for style, (fg, bg, extras) in palette.items():
             attr = 0
             for name in extras:
                 attr |= getattr(curses, name, 0)
-            if has_colors and (fg is not None or bg is not None):
-                key = (fg, bg)
-                if key not in pairs and len(pairs) + 1 < curses.COLOR_PAIRS:
-                    pair = len(pairs) + 1
-                    try:
-                        curses.init_pair(pair, colour(fg), colour(bg))
-                        pairs[key] = pair
-                    except curses.error:
-                        pass
-                if key in pairs:
-                    attr |= curses.color_pair(pairs[key])
-            elif not has_colors and style in ('add', 'del', 'header', 'header_title'):
+            if not self.has_colors and style in ('add', 'del', 'header', 'header_title'):
                 attr |= curses.A_BOLD
-            self.attrs[style] = attr
+            self.specs[style] = (colour(fg), colour(bg), attr)
+
+    def _attr(self, fg, bg, extras):
+        if not self.has_colors or (fg is None and bg is None):
+            return extras
+        key = (fg, bg)
+        if key not in self.pairs:
+            pair = len(self.pairs) + 1
+            self.pairs[key] = 0
+            if pair < curses.COLOR_PAIRS:
+                try:
+                    curses.init_pair(pair, self.default_colour if fg is None else fg,
+                                     self.default_colour if bg is None else bg)
+                    self.pairs[key] = pair
+                except curses.error:
+                    pass
+        return extras | (curses.color_pair(self.pairs[key]) if self.pairs[key] else 0)
+
+    def _runs(self, spans, limit):
+        """Layer spans cell by cell into (start, length, attr) runs.
+
+        A later span overrides only what its style sets: syntax colours change the text colour and keep
+        a changed line's background tint, and word emphasis changes the background and keeps the syntax colour.
+        """
+        cells = [None] * limit
+        for start, length, style in spans:
+            spec = self.specs.get(style)
+            if spec is None:
+                continue
+            fg, bg, extras = spec
+            for i in range(max(0, start), min(start + length, limit)):
+                old_fg, old_bg, old_extras = cells[i] or (None, None, 0)
+                cells[i] = (old_fg if fg is None else fg, old_bg if bg is None else bg, extras or old_extras)
+        runs = []
+        i = 0
+        while i < limit:
+            j = i + 1
+            while j < limit and cells[j] == cells[i]:
+                j += 1
+            if cells[i] is not None:
+                runs.append((i, j - i, self._attr(*cells[i])))
+            i = j
+        return runs
 
     def _draw(self, stdscr, frame, styles, width, height):
         stdscr.erase()
@@ -5508,12 +5547,9 @@ class TuiApp:
                 stdscr.addnstr(y, 0, line, limit)
             except curses.error:
                 pass
-            for start, length, style in styles[y] if y < len(styles) else ():
-                attr = self.attrs.get(style)
-                if attr is None or start >= limit:
-                    continue
+            for start, length, attr in self._runs(styles[y] if y < len(styles) else (), limit):
                 try:
-                    stdscr.chgat(y, start, min(length, limit - start), attr)
+                    stdscr.chgat(y, start, length, attr)
                 except curses.error:
                     pass
         stdscr.refresh()
