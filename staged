@@ -4079,7 +4079,7 @@ def highlight_syntax(code_line, filename=None):
         return []
 
     try:
-        lexer = get_lexer_for_filename(filename, ensure_nl=False) if filename else TextLexer()
+        lexer = get_lexer_for_filename(filename, ensurenl=False) if filename else TextLexer()
     except Exception:
         lexer = TextLexer()
 
