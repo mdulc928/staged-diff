@@ -1255,6 +1255,23 @@ def record_base_snapshot(session, workspace_rel, reset=False):
     return entry
 
 
+def record_base_snapshot_bytes(session, workspace_rel, data, mode=None):
+    """Record `data` (None: the file did not exist) as the baseline for workspace_rel."""
+    base_file = safe_path(base_files_root(session), workspace_rel)
+    meta = load_base_metadata(session)
+    if data is None:
+        if base_file.is_file():
+            base_file.unlink()
+        entry = {'existed': False, 'recorded_at': time.time()}
+    else:
+        write_bytes_atomic(base_file, data, mode=mode)
+        entry = {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data),
+                 'mode': stat.S_IMODE(base_file.stat().st_mode), 'recorded_at': time.time(), 'existed': True}
+    meta['files'][workspace_rel] = entry
+    save_base_metadata(session, meta)
+    return entry
+
+
 def remove_base_snapshot(session, workspace_rel):
     """Remove a single path's base snapshot entry and stored file."""
     data = load_base_metadata(session)
@@ -1829,8 +1846,10 @@ def inverse_apply(ctx, session, target):
     """Move changes between a VCS base and the workspace into the session, then restore the base.
 
     The changes land in staging first; only then are the workspace files restored, behind a
-    backup that `staged undo` replays. `staged apply` brings the changes back."""
+    backup that `staged undo` replays. `staged apply` brings the changes back. With --keep the
+    workspace and git index are left as they are and only the session gains the proposals."""
     base = getattr(ctx.args, 'base', None) or 'HEAD'
+    keep = bool(getattr(ctx.args, 'keep', False))
     as_json = bool(getattr(ctx.args, 'json', False))
     changes, skipped, commit = collect_git_changes(session.workspace, base)
     if target is not None:
@@ -1859,7 +1878,7 @@ def inverse_apply(ctx, session, target):
                 raise StagedError('Staging parent is not a directory: ' + str(parent))
 
     result = {'operation': 'inverse', 'session': session.id, 'base': base, 'base_commit': commit,
-              'backup': None, 'moved': [], 'skipped': skipped}
+              'kept_workspace': keep, 'backup': None, 'moved': [], 'skipped': skipped}
     if not changes:
         if not as_json:
             print('No workspace changes since {}.'.format(base))
@@ -1867,8 +1886,12 @@ def inverse_apply(ctx, session, target):
     if not ctx.args.yes and not as_json:
         for change in changes:
             print(status_row(change['status'], change['rel']), file=sys.stderr)
-    confirm('Move {} change(s) into session {} and restore those workspace files to {}?'.format(
-        len(changes), session.id, base), ctx.args.yes)
+    if keep:
+        question = 'Copy {} change(s) into session {}, leaving the workspace as is?'.format(len(changes), session.id)
+    else:
+        question = 'Move {} change(s) into session {} and restore those workspace files to {}?'.format(
+            len(changes), session.id, base)
+    confirm(question, ctx.args.yes)
 
     # 1. Preserve every change in staging before the workspace is touched.
     for change in changes:
@@ -1885,8 +1908,29 @@ def inverse_apply(ctx, session, target):
         session.manifest['_deletions'] = session.deletions
     session.save_manifest()
 
-    # 2. Restore the base versions behind a backup that `staged undo` can replay.
     touched = list(dict.fromkeys(p for c in changes for p in (c['old'], c['rel'])))
+    result['moved'] = [dict({'path': c['rel'], 'status': c['status']},
+                            **({'from': c['old']} if c['old'] != c['rel'] else {})) for c in changes]
+    if keep:
+        # The base revision is the baseline later applies merge against, as if the workspace had
+        # been restored: applying onto the untouched workspace is then a no-op, and onto a reset one
+        # it reproduces the changes.
+        restored = {}
+        for change in changes:
+            if change['status'] in ('NEW FILE', 'RENAMED'):
+                restored[change['rel']] = (None, None)
+            if change['base_bytes'] is not None:
+                restored[change['old']] = (change['base_bytes'], change['base_mode'])
+        for rel in touched:
+            record_base_snapshot_bytes(session, rel, *restored.get(rel, (None, None)))
+        session.refresh_index()
+        if not as_json:
+            print('Copied into session {} (workspace left as is):'.format(session.id))
+            for change in changes:
+                print(status_row(change['status'], change['rel'], NESTED))
+        return result
+
+    # 2. Restore the base versions behind a backup that `staged undo` can replay.
     backup_id, bdir, entries = begin_backup(session, touched)
     for change in changes:
         if change['base_bytes'] is not None:
@@ -1906,8 +1950,6 @@ def inverse_apply(ctx, session, target):
     session.refresh_index()
 
     result['backup'] = backup_id
-    result['moved'] = [dict({'path': c['rel'], 'status': c['status']},
-                            **({'from': c['old']} if c['old'] != c['rel'] else {})) for c in changes]
     if warning:
         result['warning'] = 'Could not unstage moved paths in the git index: ' + warning
         print('Warning: ' + result['warning'], file=sys.stderr)
@@ -6412,7 +6454,8 @@ MANUAL = {
                        'Every apply records a backup that staged undo can restore. '
                        'With --inverse, apply runs the other way: files that differ between --base (default HEAD) '
                        'and the workspace, untracked files included, move into the session as proposals and those '
-                       'workspace files are restored to --base; staged apply --all brings them back.'],
+                       'workspace files are restored to --base; staged apply --all brings them back. '
+                       'Add --keep to copy them into the session and leave the workspace as is.'],
               'see_also': ['undo', 'diff']},
     'undo': {'name': 'restore the workspace from the most recent apply backup', 'see_also': ['apply']},
     'fmt': {'name': 'format staged files in place without touching the workspace', 'see_also': ['check']},
@@ -6960,6 +7003,8 @@ def make_parser():
                    help='move changes between --base and the workspace into the session, restoring those '
                         'workspace files to --base (VCS: git, the default)')
     p.add_argument('--base', metavar='REF', help='with --inverse, the revision to diff against and restore (default: HEAD)')
+    p.add_argument('-k', '--keep', action='store_true',
+                   help='with --inverse, copy the changes into the session and leave the workspace and git index as is')
     configure_tui_parser(command_parsers['tui'])
     configure_feedback_parser(command_parsers['feedback'])
     p = command_parsers['undo']
@@ -7603,6 +7648,8 @@ def main(argv=None):
             commands['clean'].error('-s needs a session ID with -f or --all: staged clean --all -s <id>')
     if args.command == 'apply' and args.base is not None and not args.inverse:
         commands['apply'].error('--base requires --inverse')
+    if args.command == 'apply' and args.keep and not args.inverse:
+        commands['apply'].error('--keep requires --inverse')
     if args.command == 'apply' and args.inverse and (args.force or args.no_merge):
         commands['apply'].error('--inverse cannot be combined with --force or --no-merge')
     if args.command == 'diff' and args.json and not (args.apply or args.clean) and (
