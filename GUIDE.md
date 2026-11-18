@@ -685,12 +685,14 @@ staged diff -f src/example.py -ac  # Apply file, then clean its staged copy
 staged apply -i --all                     # Move everything changed since HEAD (untracked files included)
 staged apply -i -f src/example.py         # Move one changed file
 staged apply -i --base main --all         # Move everything that differs from main, committed work included
+staged apply -i --keep --all              # Copy the changes into the session; the workspace stays as is
 staged apply --all                        # Later: bring the changes back
 ```
 
 - `-i` / `--inverse` takes an optional version-control system (`git`, the default). `--base REF` picks the revision to diff against and restore (default `HEAD`).
 - Modified files, new files (indexed or untracked, respecting `.gitignore`), deletions, and renames git detects become the matching `MODIFIED`, `NEW FILE`, `DELETED`, and `RENAMED` proposals. Symlinks, submodules, and type changes are skipped with a note; `.staged.json` never moves.
 - Your changes are copied into staging before any workspace file is restored, and the restore records a backup, so `staged undo` puts the workspace back the way it was.
+- `-k` / `--keep` copies the changes into the session without touching the workspace or the git index, and records no backup. Later applies merge against `--base`, so `staged apply` onto the untouched workspace changes nothing, and after you reset the workspace it brings the changes back.
 - Moved paths are unstaged in the git index (reset to `HEAD`), so with the default base `git status` comes back clean. `staged undo` restores file contents but not that index state.
 - It asks for confirmation (pass `-y` in scripts), refuses unmerged paths, and refuses paths that already have a proposal in the session. `--force` and `--no-merge` do not apply.
 

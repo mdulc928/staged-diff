@@ -2186,6 +2186,38 @@ source "$1"
                  if p.is_file() and '.git' not in p.relative_to(self.repo).parts}
         self.assertEqual(after, before)
 
+    def test_inverse_apply_keep_leaves_workspace_and_index_as_is(self):
+        before = self.inverse_fixture()
+        status = self.git('status', '--porcelain').stdout
+        self.init('session-a')
+        result = json.loads(self.run_cli('apply', '-i', '--keep', '--all', '-y', '--json').stdout)
+        self.assertTrue(result['kept_workspace'])
+        self.assertIsNone(result['backup'])
+        self.assertEqual([item['path'] for item in result['moved']],
+                         ['deep/dir/untracked.txt', 'existing.txt', 'gone.txt', 'indexed.txt', 'new.txt'])
+        current = lambda: {p.relative_to(self.repo).as_posix(): p.read_bytes() for p in self.repo.rglob('*')
+                           if p.is_file() and '.git' not in p.relative_to(self.repo).parts}
+        self.assertEqual(current(), before)
+        self.assertEqual(self.git('status', '--porcelain').stdout, status)
+        session = self.root / 'session-a'
+        self.assertEqual((session / 'staging/existing.txt').read_text(), 'changed\n')
+        self.assertEqual(json.loads((session / 'renames.json').read_text()),
+                         {'new.txt': 'old.txt', '_deletions': ['gone.txt']})
+
+        # Resetting the workspace with git and applying brings the changes back.
+        self.git('reset', '-q', '--hard')
+        self.git('clean', '-qfd')
+        self.run_cli('apply', '--all')
+        self.assertEqual(current(), before)
+
+    def test_inverse_apply_keep_then_apply_onto_untouched_workspace_is_a_noop(self):
+        before = self.inverse_fixture()
+        self.init('session-a')
+        out = self.run_cli('apply', '-i', '-k', '-f', 'existing.txt', '-y').stdout
+        self.assertIn('workspace left as is', out)
+        self.run_cli('apply', '--all')
+        self.assertEqual((self.repo / 'existing.txt').read_bytes(), before['existing.txt'])
+
     def test_inverse_apply_is_undoable_and_selects_one_file(self):
         self.inverse_fixture()
         self.init('session-a')
@@ -2216,6 +2248,7 @@ source "$1"
     def test_inverse_apply_argument_errors(self):
         self.init('session-a')
         self.assertIn('--base requires --inverse', self.run_cli('apply', '--base', 'HEAD', '--all', ok=False).stderr)
+        self.assertIn('--keep requires --inverse', self.run_cli('apply', '--keep', '--all', ok=False).stderr)
         self.assertIn("invalid choice: 'svn'", self.run_cli('apply', '-i', 'svn', '--all', ok=False).stderr)
         self.assertIn('cannot be combined', self.run_cli('apply', '-i', '--force', '--all', ok=False).stderr)
         self.assertIn('Unknown base revision', self.run_cli('apply', '-i', '--base', 'nope', '--all', '-y', ok=False).stderr)

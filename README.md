@@ -131,6 +131,7 @@ staged open --meta -f staged_changes.md   # edit review notes or dashboards
 staged diff --all -v                      # review remaining changes with summaries
 staged apply --all                        # apply all staged changes
 staged apply -i --all                     # move your git changes into the session (workspace back to HEAD)
+staged apply -i --keep --all              # copy them into the session, leaving the workspace as is
 staged clean --session                    # discard the active session directory
 
 # Prefer reviewing in the terminal?
