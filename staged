@@ -4612,7 +4612,7 @@ def _clip_path(path, width):
 class TuiState:
     """Pure state machine and frame renderer for the 2-pane interactive diff TUI."""
 
-    def __init__(self, session, target_file=None, ctx=None, clipboard_runner=None):
+    def __init__(self, session, target_file=None, ctx=None, clipboard_runner=None, prefs=None):
         self.session = session
         self.ctx = ctx
         self.clipboard_runner = clipboard_runner
@@ -4654,6 +4654,8 @@ class TuiState:
         self.pending_comment_meta = None
         self.pending_confirm = None
 
+        self.apply_view_prefs(prefs or {})
+
         self.status_message = 'Ready. Press ? for keys.'
         self.status_is_error = False
         self.comments_added_count = 0
@@ -4676,6 +4678,22 @@ class TuiState:
         except ImportError:
             return False
         return True
+
+    # View choices remembered between runs (see load_tui_prefs): pref name -> attribute.
+    VIEW_PREFS = {'tree': 'sidebar_tree', 'diff_mode': 'diff_mode', 'wrap': 'wrap_lines',
+                  'syntax': 'syntax_highlight', 'file_list': 'show_sidebar'}
+
+    def apply_view_prefs(self, prefs):
+        for name, attr in self.VIEW_PREFS.items():
+            if name in prefs:
+                setattr(self, attr, prefs[name])
+        self.syntax_highlight = self.syntax_highlight and self.has_pygments
+
+    def view_prefs(self):
+        prefs = {name: getattr(self, attr) for name, attr in self.VIEW_PREFS.items()}
+        if not self.has_pygments:
+            prefs.pop('syntax')  # keep the saved choice for when pygments is installed
+        return prefs
 
     @property
     def show_help(self):
@@ -6051,10 +6069,36 @@ class TuiApp:
             self.state.handle_key(key)
 
 
+def load_tui_prefs():
+    """The TUI view the user last left (tree, diff mode, wrap, syntax, file list); bad entries are ignored."""
+    try:
+        data = load_json(CONFIG_DIR / 'tui.json')
+    except StagedError:
+        return {}
+    prefs = {name: data[name] for name in ('tree', 'wrap', 'syntax', 'file_list') if isinstance(data.get(name), bool)}
+    if data.get('diff_mode') in ('side-by-side', 'unified'):
+        prefs['diff_mode'] = data['diff_mode']
+    return prefs
+
+
+def save_tui_prefs(prefs, previous, initial=None):
+    """Remember the view for the next run, writing only when it differs from how the TUI opened."""
+    if prefs == initial:
+        return
+    merged = dict(previous, **prefs)
+    try:
+        save_json(CONFIG_DIR / 'tui.json', merged)
+    except OSError as exc:
+        print('Note: could not save the TUI view: {}'.format(exc), file=sys.stderr)
+
+
 def run_tui(ctx, session, target=None):
     """Entry point for `staged tui` and `staged diff --tui`."""
-    state = TuiState(session, target_file=target, ctx=ctx)
+    prefs = load_tui_prefs()
+    state = TuiState(session, target_file=target, ctx=ctx, prefs=prefs)
+    initial = state.view_prefs()
     TuiApp(state).run()
+    save_tui_prefs(state.view_prefs(), prefs, initial)
     if state.comments_added_count > 0:
         print('Saved {} feedback comment(s). Tell your agent: "Check staged feedback"'.format(
             state.comments_added_count))
@@ -7991,7 +8035,7 @@ def uninstall(ctx):
         for directory in sessions:
             rmtree_ignoring_races(directory)
             print('Deleted session: ' + str(directory))
-    for name in ('state.json', 'completion-setup.json', 'launcher-setup.json', 'installations.json'):
+    for name in ('state.json', 'tui.json', 'completion-setup.json', 'launcher-setup.json', 'installations.json'):
         path = CONFIG_DIR / name
         if path.is_file() or path.is_symlink():
             path.unlink()

@@ -2876,6 +2876,7 @@ class UninstallPrompts(unittest.TestCase):
             config = home / 'config'
             config.mkdir()
             (config / 'state.json').write_text('{}')
+            (config / 'tui.json').write_text('{"tree": true}')
             parser, _ = staged.make_parser()
             ctx = unittest.mock.Mock()
             ctx.args = parser.parse_args(['uninstall', '-y', '--keep-sessions'])
@@ -2888,6 +2889,7 @@ class UninstallPrompts(unittest.TestCase):
                 staged.uninstall(ctx)
                 run.assert_called_once_with(['npm', 'uninstall'])
             self.assertFalse((config / 'state.json').exists())
+            self.assertFalse((config / 'tui.json').exists())
 
 
 
@@ -3642,6 +3644,47 @@ class TestTuiAndFeedback(unittest.TestCase):
         state.handle_key('z')
         self.assertEqual([r['count'] for r in state.rows if r['kind'] == 'fold'], [4, 8])
         self.assertIn('keep me', '\n'.join(state.render_frame(width=120, height=30)))
+
+    def test_tui_remembers_the_view_between_runs(self):
+        config = self.tmp / 'config'
+        keys = []
+
+        class FakeApp:  # stands in for curses: presses `keys`, then quits
+            def __init__(self, state):
+                self.state = state
+
+            def run(self):
+                for key in keys:
+                    self.state.handle_key(key)
+                return self.state
+
+        with patch.object(staged, 'CONFIG_DIR', config), patch.object(staged, 'TuiApp', FakeApp), \
+                redirect_stdout(io.StringIO()):
+            first = staged.run_tui(None, self.session)
+            self.assertFalse(first.sidebar_tree)
+            self.assertFalse((config / 'tui.json').exists())  # nothing changed, nothing written
+            keys[:] = ['t', 'u', 'W', 'b']
+            staged.run_tui(None, self.session)
+            saved = json.loads((config / 'tui.json').read_text())
+            self.assertEqual((saved['tree'], saved['diff_mode'], saved['wrap'], saved['file_list']),
+                             (True, 'unified', False, False))
+            keys[:] = []
+            second = staged.run_tui(None, self.session)
+            self.assertTrue(second.sidebar_tree)
+            self.assertEqual(second.diff_mode, 'unified')
+            self.assertFalse(second.wrap_lines)
+            self.assertFalse(second.show_sidebar)
+            self.assertIn('Unified Diff', '\n'.join(second.render_frame(width=120, height=24)))
+            keys[:] = ['t']  # switching back to status groups is remembered too
+            staged.run_tui(None, self.session)
+            self.assertFalse(json.loads((config / 'tui.json').read_text())['tree'])
+            # A bad file or bad values fall back to the defaults instead of stopping the TUI.
+            (config / 'tui.json').write_text('{"tree": "yes", "diff_mode": "sideways", "wrap": false}')
+            self.assertEqual(staged.load_tui_prefs(), {'wrap': False})
+            (config / 'tui.json').write_text('not json')
+            self.assertEqual(staged.load_tui_prefs(), {})
+            keys[:] = []
+            self.assertFalse(staged.run_tui(None, self.session).sidebar_tree)
 
     def test_tui_wraps_long_comments_and_comment_input(self):
         (self.workspace / 'a.txt').write_text('one\n', encoding='utf-8')
