@@ -2108,10 +2108,20 @@ source "$1"
         # Managed metadata protection: write --meta -f feedback.json is rejected
         self.file_api('write', '--meta', '-f', 'feedback.json', '--text', '{}', ok=False)
 
+        # Edit replaces the text only; --edit with --add is rejected
+        edited = json.loads(self.run_cli('feedback', '--edit', 'fb-1', '-m', 'Name the constant.', '--json').stdout)
+        self.assertEqual((edited['comment'], edited['start_line'], edited['snippet_focus']),
+                         ('Name the constant.', 1, 'x + 42'))
+        self.assertIn('Edited feedback fb-1', self.run_cli('feedback', '--edit', 'fb-1', '-m', 'Name it.').stdout)
+        self.run_cli('feedback', '--edit', 'fb-1', '--add', '-m', 'x', ok=False)
+        self.run_cli('feedback', '--edit', 'fb-9', '-m', 'x', ok=False)
+        self.run_cli('feedback', '--edit', 'fb-1', ok=False)  # no text
+
         # Resolve and clear
         self.run_cli('feedback', '--resolve', 'fb-1')
         data = json.loads(self.run_cli('feedback', '--json').stdout)
         self.assertEqual(data['comments'][0]['status'], 'resolved')
+        self.assertEqual(data['comments'][0]['comment'], 'Name it.')
         self.run_cli('feedback', '--clear')
         data_after = json.loads(self.run_cli('feedback', '--json').stdout)
         self.assertEqual(data_after['comments'], [])
@@ -3062,6 +3072,15 @@ class TestTuiAndFeedback(unittest.TestCase):
         self.assertIn('fb-1', prompt_all)
         self.assertIn('fb-2', prompt_all)
 
+        # Edit keeps the status and location of the comment
+        edited = staged.edit_feedback(self.session, 'fb-1', '  Reworded  ')
+        self.assertEqual((edited['comment'], edited['status']), ('Reworded', 'resolved'))
+        self.assertEqual(staged.load_feedback(self.session)['comments'][0]['comment'], 'Reworded')
+        with self.assertRaises(staged.StagedError):
+            staged.edit_feedback(self.session, 'fb-1', '   ')
+        with self.assertRaises(staged.StagedError):
+            staged.edit_feedback(self.session, 'fb-404', 'x')
+
         # Delete fb-1 and clear all
         deleted = staged.delete_feedback(self.session, comment_id='fb-1')
         self.assertEqual(len(deleted), 1)
@@ -3284,6 +3303,34 @@ class TestTuiAndFeedback(unittest.TestCase):
         state.handle_key('y')
         self.assertIn('Please refactor this return block', copied_payload['text'])
         self.assertIn(focus_tok, copied_payload['text'])
+
+        # The footer switches to comment keys while the cursor is on a comment
+        self.assertIn('e edit comment', '\n'.join(state.render_frame(width=120, height=28)))
+
+        # Edit with `e`: the input starts with the text; Esc cancels, Ctrl-U clears, Enter saves
+        state.handle_key('e')
+        self.assertTrue(state.input_mode)
+        self.assertEqual(state.input_buffer, 'Please refactor this return block')
+        self.assertIn('Edit fb-1 (staged L3-L4', '\n'.join(state.render_frame(width=120, height=28)))
+        state.handle_key('ESC')
+        self.assertEqual(state.file_comments()[0]['comment'], 'Please refactor this return block')
+        state.handle_key('e')
+        state.handle_key('ENTER')
+        self.assertIn('No change to fb-1', state.status_message)
+        state.handle_key('e')
+        state.handle_key('CTRL_U')
+        state.handle_key('ENTER')
+        self.assertIn('unchanged', state.status_message)
+        self.assertEqual(state.file_comments()[0]['comment'], 'Please refactor this return block')
+        state.handle_key('e')
+        state.handle_key('\x15')
+        for ch in 'Split this up':
+            state.handle_key(ch)
+        state.handle_key('ENTER')
+        self.assertFalse(state.input_mode)
+        self.assertEqual(state.file_comments()[0]['comment'], 'Split this up')
+        self.assertEqual(state.comments_added_count, 1)
+        self.assertIn('Split this up', '\n'.join(state.render_frame(width=120, height=28)))
 
         # Toggle resolve with `r`, then reopen with `r`, then delete with `x`
         state.handle_key('r')

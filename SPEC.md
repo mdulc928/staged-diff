@@ -260,7 +260,7 @@ Help follows the BSD manual layout of POSIX utilities such as `tr(1)`. Each page
 
 ### Completion
 
-Shell completions ask the CLI for candidates, so every public command and option completes. Options hidden from help do not complete. When the cursor is on an option's value, `--complete-options` returns values instead of flags: the option's choices (for example `--side`, `--shell`, `--branch-protection`), recorded references for `intent --remove-ref`, open comment IDs for `feedback --resolve`, and all comment IDs for `feedback --delete`. Free-text values (`-m`, `--ref`) get no candidates. Sessions, tools and files keep their dedicated lookups.
+Shell completions ask the CLI for candidates, so every public command and option completes. Options hidden from help do not complete. When the cursor is on an option's value, `--complete-options` returns values instead of flags: the option's choices (for example `--side`, `--shell`, `--branch-protection`), recorded references for `intent --remove-ref`, open comment IDs for `feedback --resolve`, and all comment IDs for `feedback --edit` and `feedback --delete`. Free-text values (`-m`, `--ref`) get no candidates. Sessions, tools and files keep their dedicated lookups.
 
 ---
 
