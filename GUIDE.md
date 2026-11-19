@@ -524,6 +524,8 @@ staged diff --tui             # Alias via diff command
 
 Terminals with 256 colors get the tinted palette. Others fall back to colored text.
 
+The TUI remembers your view between runs: the tree or status-grouped file list (`t`), side-by-side or unified (`u`), wrapping (`W`), syntax highlighting (`H`), and whether the file list is shown (`b`). It saves them to `tui.json` beside the global preferences when you quit, and only if you changed one. Full-width file list (`B`), folds, and focus always start fresh. `staged uninstall` removes the file.
+
 ### Keys
 
 | Keys | Action |
@@ -873,6 +875,7 @@ Both `{orig}` and `{staged}` are required for `--diff-cmd`; `{staged}` is requir
 | ---------------------- | ----------------------------- | ----------------------------- |
 | Sessions               | `~/.local/share/staged`       | `%LOCALAPPDATA%\staged`       |
 | Global preferences     | `~/.config/staged/state.json` | `%APPDATA%\staged\state.json` |
+| TUI view               | `~/.config/staged/tui.json`   | `%APPDATA%\staged\tui.json`   |
 | Repository preferences | `<workspace>/.staged.json`    | Same layout                   |
 
 POSIX systems respect `XDG_DATA_HOME` and `XDG_CONFIG_HOME`.

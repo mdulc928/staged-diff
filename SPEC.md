@@ -46,6 +46,7 @@ All built-in adapters share a single staging root on disk.
 | Sessions            | `$XDG_DATA_HOME/staged`, otherwise `~/.local/share/staged`                    | `%LOCALAPPDATA%\staged`       |
 | Global State        | `$XDG_CONFIG_HOME/staged/state.json`, otherwise `~/.config/staged/state.json` | `%APPDATA%\staged\state.json` |
 | Shell State         | `shell_sessions/<id>.json` beside global state                                | Same layout                   |
+| TUI View            | `tui.json` beside global state                                                | Same layout                   |
 | Repository Settings | `<workspace>/.staged.json`                                                    | Same layout                   |
 
 **Root Precedence**:
