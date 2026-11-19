@@ -527,7 +527,7 @@ Terminals with 256 colors get the tinted palette. Others fall back to colored te
 | `g` / `G` | First / last line |
 | `n` / `p` | Next / previous hunk (wraps) |
 | `J` / `K` | Next / previous file from anywhere |
-| `Tab` | Switch focus between the file list and the diff |
+| `Tab` / `Shift-Tab` | Move focus between the file list and the diff; the focused pane marks your place with `▶`, the other with `▷` |
 | `Enter` | Open the selected file (file list), expand a fold, or comment on a selection |
 | `u` | Side-by-side / unified |
 | `z` | Fold / expand unchanged lines |
@@ -539,7 +539,7 @@ Terminals with 256 colors get the tinted palette. Others fall back to colored te
 | `R` | Reload files, summaries, intent and comments from disk (for example after the agent revises) |
 | `v` (Space) | Start / clear a multi-line selection |
 | `w` | Select a token or expression on the line (`snippet_focus`) |
-| `c` | Comment on the selection; saved to `feedback.json` |
+| `c` | Comment on the selection; saved to `feedback.json`. Long comments wrap, both while typing and inline in the diff |
 | `r` | Resolve / reopen the comment at the cursor |
 | `x` | Delete the comment at the cursor (asks first) |
 | `y` | Copy open comments to the clipboard as an agent prompt |

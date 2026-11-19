@@ -4431,7 +4431,7 @@ TUI_KEYS = [
         ('g / G', 'Jump to the first / last line'),
         ('n / p', 'Jump to the next / previous hunk'),
         ('J / K', 'Open the next / previous file'),
-        ('Tab', 'Switch focus between the file list and the diff'),
+        ('Tab / Shift-Tab', 'Move focus between the file list and the diff (the focused pane shows ▶)'),
         ('Enter', 'Open the file (file list) or expand a fold (diff)'),
     ]),
     ('VIEW', [
@@ -4466,7 +4466,7 @@ TUI_KEYS = [
 TUI_HINTS = {
     'files': [('j/k', 'file'), ('Enter', 'open'), ('a', 'apply file'), ('Tab', 'diff'), ('i', 'info'), ('?', 'help'), ('q', 'quit')],
     'diff': [('j/k', 'line'), ('n/p', 'hunk'), ('J/K', 'file'), ('v', 'select'), ('c', 'comment'),
-             ('a', 'apply hunk'), ('z', 'fold'), ('i', 'info'), ('?', 'help'), ('q', 'quit')],
+             ('a', 'apply hunk'), ('Tab', 'files'), ('z', 'fold'), ('?', 'help'), ('q', 'quit')],
 }
 
 
@@ -4507,6 +4507,8 @@ class StyledLine:
 
 
 TUI_CONTEXT_LINES = 3
+TUI_CURSOR_MARK = '▶'  # current line or file in the focused pane
+TUI_CURSOR_MARK_IDLE = '▷'  # the same position in the pane without focus
 
 
 def fold_unchanged_rows(rows, hunks, keep=lambda row: False, context=TUI_CONTEXT_LINES):
@@ -4810,7 +4812,7 @@ class TuiState:
                 for attr, name in (('KEY_DOWN', 'DOWN'), ('KEY_UP', 'UP'), ('KEY_LEFT', 'LEFT'), ('KEY_RIGHT', 'RIGHT'),
                                    ('KEY_NPAGE', 'PGDN'), ('KEY_PPAGE', 'PGUP'), ('KEY_HOME', 'HOME'),
                                    ('KEY_END', 'END'), ('KEY_BACKSPACE', 'BACKSPACE'), ('KEY_ENTER', 'ENTER'),
-                                   ('KEY_RESIZE', 'RESIZE')):
+                                   ('KEY_RESIZE', 'RESIZE'), ('KEY_BTAB', 'BTAB')):
                     if hasattr(curses, attr):
                         named[getattr(curses, attr)] = name
             if key in named:
@@ -4823,7 +4825,7 @@ class TuiState:
                 key = chr(key)
             else:
                 return 'UNKNOWN'
-        return {'\t': 'TAB', '\n': 'ENTER', '\r': 'ENTER', '\x1b': 'ESC', 'Escape': 'ESC', '\x7f': 'BACKSPACE',
+        return {'\t': 'TAB', '\x1b[Z': 'BTAB', '\n': 'ENTER', '\r': 'ENTER', '\x1b': 'ESC', 'Escape': 'ESC', '\x7f': 'BACKSPACE',
                 '\x08': 'BACKSPACE', '\x04': 'CTRL_D', '\x15': 'CTRL_U'}.get(key, key)
 
     def set_status(self, message, error=False):
@@ -4888,13 +4890,21 @@ class TuiState:
         self.set_status('File list {}.'.format('shown' if self.show_sidebar else 'hidden'))
         return 'toggle_sidebar'
 
+    FOCUS_ORDER = ('files', 'diff')
+
     def _key_tab(self, key):
+        """Tab moves focus to the next pane and Shift-Tab to the previous one; a hidden file list is shown first."""
         if not self.show_sidebar:
             self.show_sidebar = True
             self.focus_pane = 'files'
         else:
-            self.focus_pane = 'files' if self.focus_pane == 'diff' else 'diff'
-        self.set_status('Focused {} pane.'.format('file list' if self.focus_pane == 'files' else 'diff'))
+            step = -1 if key == 'BTAB' else 1
+            order = self.FOCUS_ORDER
+            self.focus_pane = order[(order.index(self.focus_pane) + step) % len(order)]
+        if self.focus_pane == 'files':
+            self.set_status('File list focused: j/k pick a file, Enter opens it, Tab returns to the diff.')
+        else:
+            self.set_status('Diff focused: j/k move by line, n/p by hunk, Tab goes to the file list.')
         return 'switch_focus'
 
     def _key_mode(self, key):
@@ -5159,7 +5169,8 @@ class TuiState:
 
     KEY_HANDLERS = {
         '?': _key_help, 'h': _key_help, 'i': _key_info, 'q': _key_quit, 'ESC': _key_quit,
-        'b': _key_sidebar, 'TAB': _key_tab, 'u': _key_mode, 'z': _key_fold, 'W': _key_wrap, 'H': _key_syntax, 'R': _key_reload,
+        'b': _key_sidebar, 'TAB': _key_tab, 'BTAB': _key_tab, 'u': _key_mode, 'z': _key_fold, 'W': _key_wrap,
+        'H': _key_syntax, 'R': _key_reload,
         'j': _key_down, 'DOWN': _key_down, 'k': _key_up, 'UP': _key_up,
         'CTRL_D': _key_page, 'PGDN': _key_page, 'CTRL_U': _key_page, 'PGUP': _key_page,
         'g': _key_edge, 'HOME': _key_edge, 'G': _key_edge, 'END': _key_edge,
@@ -5235,6 +5246,24 @@ class TuiState:
         return [StyledLine(gutter if i == 0 else ' ' * len(gutter), gutter_style).extend(cell)
                 for i, cell in enumerate(cells)]
 
+    @staticmethod
+    def _comment_lines(comment, width):
+        """An inline comment, word-wrapped to `width` with continuation lines indented under the text."""
+        badge = 'OPEN' if comment['status'] == 'open' else 'RESOLVED'
+        focus_part = ' (focus: `{}`)'.format(comment['snippet_focus']) if comment.get('snippet_focus') else ''
+        head = '[{} {} {} {}]{}:'.format(comment['id'], badge, comment['side'],
+                                         format_line_range(comment['start_line'], comment['end_line']), focus_part)
+        style = 'comment' if comment['status'] == 'open' else 'dim'
+        # 💬 takes two terminal cells but one character, so wrap one cell short to keep the right edge.
+        wrap_w = max(12, width - 1)
+        indent = '      '
+        chunks = []
+        for index, paragraph in enumerate((comment['comment'] or '').splitlines() or ['']):
+            text = '{} {}'.format(head, paragraph) if index == 0 else paragraph
+            chunks.extend(textwrap.wrap(text, wrap_w, initial_indent='   💬 ' if index == 0 else indent,
+                                        subsequent_indent=indent) or [indent])
+        return [StyledLine(chunk, style).fit(width, 'comment_bg') for chunk in chunks]
+
     def _sidebar_lines(self, width, height):
         marker = '▸' if self.focus_pane == 'files' else ' '
         lines = [StyledLine(' {}FILES ({})'.format(marker, len(self.file_entries)),
@@ -5251,7 +5280,13 @@ class TuiState:
             badge = ' ●{}'.format(entry['open_comments']) if entry['open_comments'] else ''
             selected = idx == self.file_index
             path_w = max(4, width - 3 - len(delta) - len(badge))
-            line = StyledLine(' {} '.format('>' if selected else ' '))
+            line = StyledLine(' ')
+            if selected:
+                focused = self.focus_pane == 'files'
+                line.add(TUI_CURSOR_MARK if focused else TUI_CURSOR_MARK_IDLE, 'cursor' if focused else 'dim')
+            else:
+                line.add(' ')
+            line.add(' ')
             line.add(_clip_path(entry['path'], path_w).ljust(path_w), 'cursor' if selected else None)
             line.add(' +{}'.format(entry['added']), 'add' if entry['added'] else 'dim')
             line.add(' -{}'.format(entry['removed']), 'del' if entry['removed'] else 'dim')
@@ -5352,7 +5387,8 @@ class TuiState:
         for r_idx, row in enumerate(self.rows):
             is_cursor = r_idx == self.cursor_row
             is_selected = self.visual_anchor_row is not None and lo_sel <= r_idx <= hi_sel
-            row_lines = self._diff_row(row, width, '>' if is_cursor else ('*' if is_selected else ' '))
+            cursor_mark = TUI_CURSOR_MARK if self.focus_pane == 'diff' else TUI_CURSOR_MARK_IDLE
+            row_lines = self._diff_row(row, width, cursor_mark if is_cursor else ('*' if is_selected else ' '))
             if is_cursor:
                 cursor_pos, cursor_end = len(viewport), len(viewport) + len(row_lines) - 1
                 if self.token_index is not None and 0 <= self.token_index < len(self.token_candidates):
@@ -5363,14 +5399,10 @@ class TuiState:
                 if is_selected:
                     line.mark(0, width, 'selected')
                 if is_cursor:
-                    line.mark(0, 1, 'cursor')
+                    line.mark(0, 1, 'cursor' if self.focus_pane == 'diff' else 'dim')
                 viewport.append(line)
             for c in self.comments_at_row(r_idx):
-                badge = 'OPEN' if c['status'] == 'open' else 'RESOLVED'
-                focus_part = ' (focus: `{}`)'.format(c['snippet_focus']) if c.get('snippet_focus') else ''
-                viewport.append(StyledLine('   💬 [{} {} {} {}]{}: {}'.format(
-                    c['id'], badge, c['side'], format_line_range(c['start_line'], c['end_line']), focus_part,
-                    c['comment']), 'comment' if c['status'] == 'open' else 'dim').fit(width, 'comment_bg'))
+                viewport.extend(self._comment_lines(c, width))
 
         avail = max(1, height - len(lines))
         self.page_rows = avail
@@ -5391,14 +5423,35 @@ class TuiState:
             line.add('· intent: ' + intent, 'header_dim')
         return line.fit(width, 'header')
 
-    def _footer_line(self, width):
+    def _input_lines(self, width, max_lines):
+        """The comment being typed, wrapped onto as many footer lines as it needs (the latest `max_lines`)."""
+        meta = self.pending_comment_meta or {}
+        label = ' Comment ({} {}{}): '.format(
+            meta.get('side', 'staged'), format_line_range(meta.get('start_line', 1), meta.get('end_line', 1)),
+            ' [{}]'.format(meta['snippet_focus']) if meta.get('snippet_focus') else '')
+        hint = '   Enter save · Esc cancel'
+        text = label + self.input_buffer + '█'
+        wrap_w = max(10, width - 1)  # the bottom-right cell cannot be drawn
+        starts = wrap_points(text, wrap_w, len(text))
+        lines = []
+        for index, start in enumerate(starts):
+            stop = starts[index + 1] if index + 1 < len(starts) else len(text)
+            line = StyledLine()
+            label_end = min(stop, len(label))
+            if start < label_end:
+                line.add(text[start:label_end], 'prompt')
+            line.add(text[max(start, len(label)):stop], 'input')
+            lines.append(line)
+        if len(lines[-1].text) + len(hint) <= wrap_w:
+            lines[-1].add(hint, 'footer_dim')
+        return [line.fit(width, 'footer') for line in lines[-max(1, max_lines):]]
+
+    def _footer_lines(self, width, max_lines=1):
         if self.input_mode:
-            meta = self.pending_comment_meta or {}
-            label = ' Comment ({} {}{}): '.format(
-                meta.get('side', 'staged'), format_line_range(meta.get('start_line', 1), meta.get('end_line', 1)),
-                ' [{}]'.format(meta['snippet_focus']) if meta.get('snippet_focus') else '')
-            line = StyledLine(label, 'prompt').add(self.input_buffer + '█', 'input')
-            return line.add('   Enter save · Esc cancel', 'footer_dim').fit(width, 'footer')
+            return self._input_lines(width, max_lines)
+        return [self._footer_line(width)]
+
+    def _footer_line(self, width):
         if self.pending_confirm is not None:
             return StyledLine(' ' + self.pending_confirm['question'] + ' [y/N]', 'prompt').fit(width, 'footer')
         line = StyledLine(' ' + self.status_message, 'error' if self.status_is_error else 'footer')
@@ -5414,7 +5467,8 @@ class TuiState:
         """Return `height` lines of exactly `width` characters; styles land in `frame_styles`."""
         width = max(60, int(width))
         height = max(12, int(height))
-        body_height = height - 2
+        footer = self._footer_lines(width, max_lines=max(1, (height - 1) // 3))
+        body_height = height - 1 - len(footer)
         sidebar_w = min(40, max(24, width // 4)) if self.show_sidebar else 0
         main_w = width - sidebar_w - (1 if sidebar_w else 0)
 
@@ -5430,7 +5484,7 @@ class TuiState:
                 row.extend(left[i] if i < len(left) else blank_left).add('│', 'border')
             row.extend(right[i] if i < len(right) else blank_right)
             styled.append(row.fit(width))
-        styled.append(self._footer_line(width))
+        styled.extend(footer)
         self.frame_styles = [line.spans for line in styled]
         return [line.text for line in styled]
 
