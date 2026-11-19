@@ -507,14 +507,20 @@ staged diff --tui             # Alias via diff command
 
 - **Header**: session, branch, file count, open comments, diff mode, and the recorded intent.
 - **File list** (left, `b` hides it): files grouped by status, with `+added -removed` counts and open comment counts (`●2`). The list scrolls to keep the selected file visible.
+  - `t` shows the files as a folder tree instead, so you can see where each change lives. Folders come before files, a chain of folders that each hold only one folder shares a row (`src/staged/`), and each file starts with its status: `M` modified, `N` new, `D` deleted, `R` renamed or relocated, `✓` applied, `!` missing.
+  - Folders and status groups fold. In the file list, Enter on one folds or unfolds it, Left folds (on a file: its folder), and Right unfolds. A folded row shows its file count and the combined `+added -removed` and comment counts. `j`/`k` stop on folder and group rows; `J`/`K` skip them and unfold the folder of the file they open.
+  - `B` hides the diff so the file list fills the screen, with each file's summary beside it. Enter on a file, `Tab`, `B`, or a diff key such as `n` brings the diff back.
 - **Diff** (right): a title line (status, path, counts, current hunk), the file summary, then the diff. By default it is side by side, with `Workspace Original` on the left and `Staged Proposal` on the right; `u` switches to unified.
   - Changed lines get a tinted background, green for added and red for removed. The words that changed get a stronger tint. A line that was mostly rewritten keeps just the line tint.
   - When a line exists on only one side, the other side shows a shaded blank.
-  - Unchanged runs fold into one `⋯ N unchanged lines` row, keeping 3 lines of context around each hunk; `z` (or Enter on the fold) expands them. Lines that have comments are never folded.
+  - Unchanged runs fold into one `⋯ N unchanged lines` row, keeping 3 lines of context around each hunk. Enter or `z` on a fold opens that fold; `z` anywhere else expands every fold in the file, and pressed again folds the unchanged runs back.
+  - Fold any stretch yourself: select it with `v` and `j`/`k`, then press `z`. Only the unchanged lines in the selection fold, so changed lines between them stay in view. In a file with no unchanged lines (a new or deleted file), the whole selection folds and the row reads `⋯ N folded lines (N changed)`. Your folds last until you open them or expand the file, including across `u`.
+  - Lines that have comments are never folded.
   - Long lines wrap at word boundaries; `W` truncates them instead.
   - Syntax highlighting colours the text of every line when `pygments` is installed (`H` toggles it). On 256-colour terminals changes are shown by background alone: a tint for each changed line and a stronger tint behind the changed words, so the text keeps its syntax colour. On 8-colour terminals changed lines stay green or red and only unchanged lines get syntax colours. If `pygments` lives in a separate environment (a venv or uv environment), point the npm launcher at that interpreter with `STAGED_PYTHON`, e.g. `export STAGED_PYTHON=~/.venvs/staged/bin/python`.
-- **Footer**: status messages on the left and the keys for the focused pane on the right. Confirmation prompts and comment input also appear here.
-- **Info panel** (`i`): the intent with its references, the session summary, and the current file's summary, paths, and comment counts.
+- **Footer**: status messages on the left and the main keys for the focused pane on the right, starting with `? all keys`. When they don't fit on one line, the keys wrap onto lines above the status instead of being cut off. Confirmation prompts and comment input also appear here.
+- **Key reference** (`?`): every key, using the full width, with long descriptions wrapped. On a short terminal it scrolls with `j`/`k`, `Ctrl-d`/`Ctrl-u`, and `g`/`G`, and a marker line shows how much is above or below.
+- **Info panel** (`i`): the intent with its references, the session summary, and the current file's summary, paths, and comment counts. It scrolls like the key reference.
 
 Terminals with 256 colors get the tinted palette. Others fall back to colored text.
 
@@ -522,18 +528,22 @@ Terminals with 256 colors get the tinted palette. Others fall back to colored te
 
 | Keys | Action |
 | --- | --- |
-| `j` / `k` (Down / Up) | Move one line (in the file list: select a file) |
+| `j` / `k` (Down / Up) | Move one line (in the file list: move to the next file, folder or group) |
 | `Ctrl-d` / `Ctrl-u` (PgDn / PgUp) | Move half a page |
 | `g` / `G` | First / last line |
 | `n` / `p` | Next / previous hunk (wraps) |
 | `J` / `K` | Next / previous file from anywhere |
 | `Tab` / `Shift-Tab` | Move focus between the file list and the diff; the focused pane marks your place with `▶`, the other with `▷` |
-| `Enter` | Open the selected file (file list), expand a fold, or comment on a selection |
+| `Enter` | Open the selected file or fold / unfold the folder (file list), expand a fold, or comment on a selection |
+| Left / Right (file list) | Fold / unfold the folder or group; Left on a file folds its folder |
 | `u` | Side-by-side / unified |
-| `z` | Fold / expand unchanged lines |
+| `z` | Fold all unchanged lines / open every fold in the file; on a fold, open just that one |
+| `v` … `z` | Fold the selected unchanged lines (in a new or deleted file: any selected lines) |
 | `W` | Wrap / truncate long lines |
 | `[` / `]` (Left / Right) | Choose the side comments attach to; while a token is selected, cycle tokens |
 | `b` | Show / hide the file list |
+| `B` | File list alone at full width with summaries (hides the diff) |
+| `t` | File list as a folder tree / grouped by status |
 | `i` | Info panel: intent, summaries, paths |
 | `H` | Syntax highlighting (needs `pygments`) |
 | `R` | Reload files, summaries, intent and comments from disk (for example after the agent revises) |
@@ -545,7 +555,7 @@ Terminals with 256 colors get the tinted palette. Others fall back to colored te
 | `y` | Copy open comments to the clipboard as an agent prompt |
 | `a` | Apply the hunk at the cursor (in the file list: the whole file); asks first |
 | `A` | Apply the whole current file; asks first |
-| `?` | Key reference |
+| `?` | Key reference with every key (scroll it with `j`/`k`, `Ctrl-d`/`Ctrl-u`, `g`/`G`) |
 | `q` / `Esc` | Close a panel or clear a selection; `q` quits |
 
 TUI applies use the same safeguards as `staged apply`. Protected branches are refused (use `staged apply --force` from the shell when you mean it). Branch drift is named in the confirmation prompt. File applies use the 3-way merge and conflict checks, and every apply, including a single hunk, records a backup so `staged undo` can roll back the latest one. Hunk applies work in place only: renames, deletions and non-UTF-8 files have to be applied as whole files. Errors appear in the footer instead of closing the TUI.

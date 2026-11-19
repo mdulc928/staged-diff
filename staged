@@ -4432,14 +4432,19 @@ TUI_KEYS = [
         ('n / p', 'Jump to the next / previous hunk'),
         ('J / K', 'Open the next / previous file'),
         ('Tab / Shift-Tab', 'Move focus between the file list and the diff (the focused pane shows ▶)'),
-        ('Enter', 'Open the file (file list) or expand a fold (diff)'),
+        ('Enter', 'Open the file or fold / unfold the folder (file list), or expand a fold (diff)'),
+        ('Left / Right  (file list)', 'Collapse / expand the folder or group; Left on a file folds its folder'),
     ]),
     ('VIEW', [
         ('u', 'Toggle side-by-side / unified diff'),
-        ('z  (Enter on a fold)', 'Fold or expand unchanged lines'),
+        ('z', 'Fold all unchanged lines, or open every fold in the file'),
+        ('v ... z', 'Fold the selected unchanged lines (in a new or deleted file: any selected lines)'),
+        ('Enter or z on a fold', 'Open that fold'),
         ('W', 'Wrap or truncate long lines'),
         ('[ / ]  (Left / Right)', 'Comment on the workspace / staged side; cycles tokens while one is selected'),
         ('b', 'Show or hide the file list'),
+        ('B', 'Show the file list alone, full width with summaries (hide the diff)'),
+        ('t', 'Show the file list as a folder tree, or grouped by status'),
         ('i', 'Show intent, session summary and file details'),
         ('H', 'Toggle syntax highlighting (needs pygments)'),
         ('R', 'Reload files, summaries and comments from disk'),
@@ -4463,10 +4468,15 @@ TUI_KEYS = [
     ]),
 ]
 
+# Footer hints for the focused pane or open panel. They wrap onto extra footer lines rather than being cut,
+# and `?` comes first so the full key reference is always one key away.
 TUI_HINTS = {
-    'files': [('j/k', 'file'), ('Enter', 'open'), ('a', 'apply file'), ('Tab', 'diff'), ('i', 'info'), ('?', 'help'), ('q', 'quit')],
-    'diff': [('j/k', 'line'), ('n/p', 'hunk'), ('J/K', 'file'), ('v', 'select'), ('c', 'comment'),
-             ('a', 'apply hunk'), ('Tab', 'files'), ('z', 'fold'), ('?', 'help'), ('q', 'quit')],
+    'files': [('?', 'all keys'), ('j/k', 'move'), ('Enter', 'open/fold'), ('←/→', 'fold'), ('t', 'tree'),
+              ('B', 'full width'), ('a', 'apply file'), ('Tab', 'diff'), ('q', 'quit')],
+    'diff': [('?', 'all keys'), ('j/k', 'line'), ('n/p', 'hunk'), ('J/K', 'file'), ('v', 'select'),
+             ('c', 'comment'), ('a', 'apply hunk'), ('z', 'fold'), ('Tab', 'files'), ('q', 'quit')],
+    'help': [('j/k', 'scroll'), ('Ctrl-d/u', 'page'), ('g/G', 'top/bottom'), ('i', 'info'), ('?/Esc', 'close')],
+    'info': [('j/k', 'scroll'), ('Ctrl-d/u', 'page'), ('i/Esc', 'close')],
 }
 
 
@@ -4509,6 +4519,48 @@ class StyledLine:
 TUI_CONTEXT_LINES = 3
 TUI_CURSOR_MARK = '▶'  # current line or file in the focused pane
 TUI_CURSOR_MARK_IDLE = '▷'  # the same position in the pane without focus
+# One-cell status marks for files in the tree view, where files are not grouped under status headings.
+TUI_TREE_STATUS_MARKS = {'MODIFIED': 'M', 'NEW FILE': 'N', 'DELETED': 'D', 'RENAMED': 'R', 'RELOCATED': 'R',
+                         'APPLIED': '✓', 'MISSING': '!'}
+
+
+def row_line_keys(row):
+    """The (side, line number) pairs a diff row shows, or that a fold row hides."""
+    if row['kind'] == 'fold':
+        return list(row['lines'])
+    keys = []
+    if row.get('left_lineno') is not None:
+        keys.append(('workspace', row['left_lineno']))
+    if row.get('right_lineno') is not None:
+        keys.append(('staged', row['right_lineno']))
+    return keys
+
+
+def _fold_row(hidden):
+    """One row standing in for `hidden` rows, which may include earlier fold rows."""
+    lines = [key for row in hidden for key in row_line_keys(row)]
+    hunks = sorted({h for row in hidden
+                    for h in (row.get('hunks', ()) if row['kind'] == 'fold' else [row.get('hunk_index')])
+                    if h is not None})
+    return {'kind': 'fold', 'count': sum(row['count'] if row['kind'] == 'fold' else 1 for row in hidden),
+            'changed': sum(row['changed'] if row['kind'] == 'fold' else row['kind'] != 'equal' for row in hidden),
+            'lines': lines, 'hunks': hunks, 'hunk_index': None, 'prefix': ' ', 'text': '',
+            'left_lineno': None, 'right_lineno': None, 'left_text': None, 'right_text': None,
+            'left_spans': [], 'right_spans': [],
+            'first_left': next((n for side, n in lines if side == 'workspace'), None),
+            'first_right': next((n for side, n in lines if side == 'staged'), None)}
+
+
+def _index_hunks(rows, hunks):
+    """Point each hunk at its first row, or at the fold row that hides it."""
+    seen = set()
+    for index, row in enumerate(rows):
+        ids = row.get('hunks', ()) if row['kind'] == 'fold' else [row.get('hunk_index')]
+        for h in ids:
+            if h is not None and h not in seen:
+                seen.add(h)
+                hunks[h]['first_row'] = index
+    return rows, hunks
 
 
 def fold_unchanged_rows(rows, hunks, keep=lambda row: False, context=TUI_CONTEXT_LINES):
@@ -4529,19 +4581,28 @@ def fold_unchanged_rows(rows, hunks, keep=lambda row: False, context=TUI_CONTEXT
         hidden = run[lead:len(run) - trail]
         if len(hidden) > 1 and not any(keep(row) for row in hidden):
             out.extend(run[:lead])
-            out.append({'kind': 'fold', 'count': len(hidden), 'hunk_index': None, 'prefix': ' ', 'text': '',
-                        'left_lineno': None, 'right_lineno': None, 'left_text': None, 'right_text': None,
-                        'left_spans': [], 'right_spans': [], 'first_left': hidden[0]['left_lineno']})
+            out.append(_fold_row(hidden))
             out.extend(run[len(run) - trail:])
         else:
             out.extend(run)
         i = j
-    seen = set()
-    for index, row in enumerate(out):
-        if row.get('hunk_index') is not None and row['hunk_index'] not in seen:
-            seen.add(row['hunk_index'])
-            hunks[row['hunk_index']]['first_row'] = index
-    return out, hunks
+    return _index_hunks(out, hunks)
+
+
+def fold_chosen_rows(rows, hunks, hide):
+    """Collapse each run of consecutive rows for which `hide(row)` is true into one fold row."""
+    out = []
+    run = []
+    for row in rows + [None]:
+        if row is not None and hide(row):
+            run.append(row)
+            continue
+        if run:
+            out.append(_fold_row(run) if len(run) > 1 or run[0]['kind'] != 'fold' else run[0])
+            run = []
+        if row is not None:
+            out.append(row)
+    return _index_hunks(out, hunks)
 
 
 def _clip_path(path, width):
@@ -4559,15 +4620,24 @@ class TuiState:
         self.has_pygments = self._pygments_available()
 
         self.show_sidebar = True
+        self.show_diff = True  # False shows the file list alone, full width (B)
+        self.sidebar_tree = False  # the file list as a folder tree instead of status groups (t)
+        self.collapsed = set()  # keys of folded folders ('dir:src/') and status groups ('group:MODIFIED')
+        self.sidebar_cursor = None  # key of the folder or group under the file-list cursor; None: the open file
         self.focus_pane = 'diff'
         self.diff_mode = 'side-by-side'
         self.fold_context = True
+        self.user_folds = {}  # file -> (side, line) pairs folded with a selection and z
+        self.opened_folds = {}  # file -> (side, line) pairs whose automatic fold was opened with Enter or z
+        self.file_all_changed = False  # no unchanged lines (a new or deleted file): any selection folds
         self.wrap_lines = True
         self.syntax_highlight = self.has_pygments
         # Whether changed lines are marked by a background tint, which leaves the text colour free for
         # syntax colours. TuiApp clears it on 8-colour terminals, where changes are marked by text colour.
         self.tinted_changes = True
         self.panel = None  # None, 'help' or 'info'
+        self.panel_offset = 0  # first panel line shown; long panels scroll
+        self.panel_rows = 10
         self.active_side = 'staged'
 
         self.file_index = 0
@@ -4689,8 +4759,7 @@ class TuiState:
         rel = self.current_file
         anchor = None
         if preserve and self.rows and 0 <= self.cursor_row < len(self.rows):
-            row = self.rows[self.cursor_row]
-            anchor = (row.get('left_lineno'), row.get('right_lineno'), row.get('first_left'))
+            anchor = set(row_line_keys(self.rows[self.cursor_row]))
         if not rel:
             self.rows, self.hunks, self.cursor_row = [], [], 0
             return
@@ -4699,25 +4768,30 @@ class TuiState:
         staged_lines = [line.expandtabs(4) for line in read_side_lines(self.session, rel, side='staged')]
         build = build_side_by_side_rows if self.diff_mode == 'side-by-side' else build_unified_rows
         self.rows, self.hunks = build(orig_lines, staged_lines)
+        self.file_all_changed = not any(row['kind'] == 'equal' for row in self.rows)
+        # Lines with comments are never folded, so their comments stay in view.
+        commented = {(c['side'], line) for c in self.file_comments(rel)
+                     for line in range(c['start_line'], c['end_line'] + 1)}
         if self.fold_context:
-            commented = {(c['side'], line) for c in self.file_comments(rel)
-                         for line in range(c['start_line'], c['end_line'] + 1)}
+            opened = self.opened_folds.get(rel, set()) | commented
             self.rows, self.hunks = fold_unchanged_rows(
-                self.rows, self.hunks,
-                keep=lambda row: ('workspace', row['left_lineno']) in commented
-                or ('staged', row['right_lineno']) in commented)
-        if anchor is not None:
-            left, right, first_left = anchor
+                self.rows, self.hunks, keep=lambda row: any(key in opened for key in row_line_keys(row)))
+        chosen = self.user_folds.get(rel)
+        if chosen:
+            def hide(row):
+                keys = row_line_keys(row)
+                return bool(keys) and all(key in chosen and key not in commented for key in keys)
+            self.rows, self.hunks = fold_chosen_rows(self.rows, self.hunks, hide)
+        if anchor:
             for index, row in enumerate(self.rows):
-                if ((left is not None and row.get('left_lineno') == left)
-                        or (right is not None and row.get('right_lineno') == right)
-                        or (first_left is not None and row.get('left_lineno') == first_left)):
+                if anchor & set(row_line_keys(row)):
                     self.cursor_row = index
                     break
         self.cursor_row = max(0, min(self.cursor_row, len(self.rows) - 1)) if self.rows else 0
         self._clear_token_selection()
 
     def _select_file(self, index):
+        self.sidebar_cursor = None
         if not self.file_entries:
             return False
         index = max(0, min(len(self.file_entries) - 1, index))
@@ -4729,6 +4803,120 @@ class TuiState:
         self.visual_anchor_row = None
         self.rebuild_diff_rows()
         return True
+
+    # ----- file list ----------------------------------------------------
+
+    def _sidebar_items(self):
+        """Every node of the file list in display order, including those inside folded folders or groups.
+
+        Items are dicts with `kind` ('group', 'dir' or 'file'), a stable `key`, `depth`, `label`, the file
+        indices they cover (`files`), and the keys of the groups or folders that contain them (`ancestors`).
+        """
+        items = []
+        if not self.sidebar_tree:
+            groups = {}
+            for idx, entry in enumerate(self.file_entries):
+                key = 'group:' + (entry['status'] or 'UNKNOWN')
+                if key not in groups:
+                    groups[key] = {'kind': 'group', 'key': key, 'depth': 0, 'label': entry['status'] or 'UNKNOWN',
+                                   'status': entry['status'], 'files': [], 'ancestors': ()}
+                    items.append(groups[key])
+                groups[key]['files'].append(idx)
+                items.append({'kind': 'file', 'key': 'file:' + entry['path'], 'depth': 1, 'label': entry['path'],
+                              'index': idx, 'files': [idx], 'ancestors': (key,)})
+            return items
+
+        root = ({}, [])  # (folders by name, [(file name, index)])
+        for idx, entry in enumerate(self.file_entries):
+            *folders, name = entry['path'].split('/')
+            node = root
+            for part in folders:
+                node = node[0].setdefault(part, ({}, []))
+            node[1].append((name, idx))
+
+        def walk(node, prefix, depth, ancestors):
+            for name in sorted(node[0]):
+                child, label = node[0][name], name
+                while not child[1] and len(child[0]) == 1:  # show a chain of lone folders as one row: a/b/c/
+                    (sub, child), = child[0].items()
+                    label += '/' + sub
+                path = prefix + label + '/'
+                item = {'kind': 'dir', 'key': 'dir:' + path, 'depth': depth, 'label': label + '/', 'ancestors': ancestors}
+                items.append(item)
+                start = len(items)
+                walk(child, path, depth + 1, ancestors + (item['key'],))
+                item['files'] = [i['index'] for i in items[start:] if i['kind'] == 'file']
+            for name, idx in sorted(node[1]):
+                items.append({'kind': 'file', 'key': 'file:' + self.file_entries[idx]['path'], 'depth': depth,
+                              'label': name, 'index': idx, 'files': [idx], 'ancestors': ancestors})
+
+        walk(root, '', 0, ())
+        return items
+
+    def _sidebar_view(self):
+        """The file-list rows that are not folded away, and the position of the cursor among them."""
+        items = self._sidebar_items()
+        visible = [item for item in items if not any(key in self.collapsed for key in item['ancestors'])]
+        key = self.sidebar_cursor
+        if not any(item['key'] == key for item in visible):
+            key = None
+            node = next((i for i in items if i['kind'] == 'file' and i['index'] == self.file_index), None)
+            if node is not None:
+                # The open file inside a folded folder: the cursor rests on the outermost folded folder.
+                key = next((a for a in node['ancestors'] if a in self.collapsed), node['key'])
+        return visible, next((n for n, item in enumerate(visible) if item['key'] == key), 0)
+
+    def _sidebar_item_at_cursor(self):
+        visible, pos = self._sidebar_view()
+        return visible[pos] if visible else None
+
+    def _sidebar_move(self, step):
+        visible, pos = self._sidebar_view()
+        if not visible:
+            return
+        item = visible[max(0, min(len(visible) - 1, pos + step))]
+        if item['kind'] == 'file':
+            self._select_file(item['index'])
+        else:
+            self.sidebar_cursor = item['key']
+
+    def _reveal_current_file(self):
+        """Unfold the folders or group holding the open file."""
+        for item in self._sidebar_items():
+            if item['kind'] == 'file' and item['index'] == self.file_index:
+                self.collapsed.difference_update(item['ancestors'])
+                return
+
+    def _sidebar_fold(self, action):
+        """Fold ('collapse'), unfold ('expand') or 'toggle' the folder or group at the file-list cursor."""
+        item = self._sidebar_item_at_cursor()
+        if item is None:
+            return 'noop'
+        if item['kind'] == 'file':
+            if action != 'collapse' or not item['ancestors']:
+                return 'noop'
+            item = next(i for i in self._sidebar_items() if i['key'] == item['ancestors'][-1])
+            action = 'collapse'
+        folded = item['key'] in self.collapsed
+        if action == 'toggle':
+            action = 'expand' if folded else 'collapse'
+        if action == 'collapse' and folded:
+            # Left on a folded folder climbs to the folder that contains it.
+            if item['ancestors']:
+                self.sidebar_cursor = item['ancestors'][-1]
+            return 'noop'
+        if action == 'expand' and not folded:
+            # Right on an open folder steps onto its first entry.
+            self._sidebar_move(1)
+            return 'down'
+        if action == 'collapse':
+            self.collapsed.add(item['key'])
+        else:
+            self.collapsed.discard(item['key'])
+        self.sidebar_cursor = item['key']
+        self.set_status('{} {} ({} file(s)).'.format(
+            'Folded' if action == 'collapse' else 'Unfolded', item['label'], len(item['files'])))
+        return 'fold_' + item['kind']
 
     # ----- selection ----------------------------------------------------
 
@@ -4847,16 +5035,34 @@ class TuiState:
             return self._handle_input_key(key)
         if self.pending_confirm is not None:
             return self._handle_confirm_key(key)
+        result = self._dispatch_view_key(key)
+        if not self.show_diff:
+            self.focus_pane = 'files'
+        return result
+
+    # Keys that work on diff lines; pressed while the diff is hidden, they bring it back first.
+    DIFF_ONLY_KEYS = frozenset(('n', 'p', 'v', ' ', 'w', 'c', 'r', 'x', 'u', 'z', 'W'))
+
+    def _dispatch_view_key(self, key):
         if self.panel is not None:
             if key in ('?', 'h', 'i', 'q', 'ESC'):
                 if key == 'i' and self.panel == 'help':
-                    self.panel = 'info'
-                    return 'open_info'
+                    return self._key_info(key)
                 self.panel = None
                 self.set_status('Closed panel.')
                 return 'close_help'
+            step = {'j': 1, 'DOWN': 1, 'k': -1, 'UP': -1, 'g': -10 ** 6, 'HOME': -10 ** 6, 'G': 10 ** 6,
+                    'END': 10 ** 6}.get(key)
+            if key in ('CTRL_D', 'PGDN', ' ', 'CTRL_U', 'PGUP'):
+                step = max(1, self.panel_rows // 2) * (-1 if key in ('CTRL_U', 'PGUP') else 1)
+            if step is not None:
+                self.panel_offset = max(0, self.panel_offset + step)  # rendering clamps the far end
+                return 'scroll_panel'
             return 'help_open'
 
+        if not self.show_diff and key in self.DIFF_ONLY_KEYS:
+            self.show_diff = True
+            self.focus_pane = 'diff'
         handler = self.KEY_HANDLERS.get(key)
         if handler is None and key == 'ENTER':
             handler = TuiState._key_enter
@@ -4864,11 +5070,13 @@ class TuiState:
 
     def _key_help(self, key):
         self.panel = 'help'
+        self.panel_offset = 0
         self.set_status('Key reference. Press ? or Esc to close.')
         return 'open_help'
 
     def _key_info(self, key):
         self.panel = 'info'
+        self.panel_offset = 0
         self.set_status('Session info. Press i or Esc to close.')
         return 'open_info'
 
@@ -4884,19 +5092,44 @@ class TuiState:
         return 'quit'
 
     def _key_sidebar(self, key):
-        self.show_sidebar = not self.show_sidebar
+        if not self.show_diff:  # from the full-width list, b swaps to the diff alone
+            self.show_diff, self.show_sidebar = True, False
+        else:
+            self.show_sidebar = not self.show_sidebar
         if not self.show_sidebar and self.focus_pane == 'files':
             self.focus_pane = 'diff'
         self.set_status('File list {}.'.format('shown' if self.show_sidebar else 'hidden'))
         return 'toggle_sidebar'
 
+    def _key_files_only(self, key):
+        """B shows the file list alone at full width, and again restores the two panes."""
+        if self.show_diff:
+            self.show_diff, self.show_sidebar = False, True
+            self.focus_pane = 'files'
+            self.set_status('File list only. Enter opens a file, B or Tab brings back the diff.')
+        else:
+            self.show_diff = True
+            self.set_status('Diff shown.')
+        return 'toggle_files_only'
+
+    def _key_tree(self, key):
+        self.sidebar_tree = not self.sidebar_tree
+        self.sidebar_cursor = None
+        self.set_status('File list {}. Enter or Left/Right fold {}.'.format(
+            'as a folder tree' if self.sidebar_tree else 'grouped by status',
+            'folders' if self.sidebar_tree else 'groups'))
+        return 'toggle_tree'
+
     FOCUS_ORDER = ('files', 'diff')
 
     def _key_tab(self, key):
-        """Tab moves focus to the next pane and Shift-Tab to the previous one; a hidden file list is shown first."""
+        """Tab moves focus to the next pane and Shift-Tab to the previous one; a hidden pane is shown first."""
         if not self.show_sidebar:
             self.show_sidebar = True
             self.focus_pane = 'files'
+        elif not self.show_diff:
+            self.show_diff = True
+            self.focus_pane = 'diff'
         else:
             step = -1 if key == 'BTAB' else 1
             order = self.FOCUS_ORDER
@@ -4923,10 +5156,55 @@ class TuiState:
         return 'toggle_syntax'
 
     def _key_fold(self, key):
+        """z folds the selection, opens the fold at the cursor, or else folds / expands the whole file."""
+        if self.visual_anchor_row is not None and key == 'z':
+            return self._fold_selection()
+        if self._on_fold_row():
+            return self._open_fold()
+        rel = self.current_file
         self.fold_context = not self.fold_context
+        if rel:
+            self.opened_folds.pop(rel, None)
+            if not self.fold_context:
+                self.user_folds.pop(rel, None)
         self.rebuild_diff_rows(preserve=True)
-        self.set_status('Unchanged lines {}.'.format('folded' if self.fold_context else 'expanded'))
+        self.set_status('Unchanged lines {}.'.format(
+            'folded' if self.fold_context else 'expanded, and your folds in this file opened'))
         return 'toggle_fold'
+
+    def _fold_selection(self):
+        """Fold the unchanged lines in the selection; in a file with no unchanged lines, fold all of it."""
+        rel = self.current_file
+        lo, hi = self._selected_row_bounds()
+        keys = []
+        skipped = 0
+        for row in self.rows[lo:hi + 1]:
+            if row['kind'] in ('equal', 'fold') or self.file_all_changed:
+                keys.extend(row_line_keys(row))
+            else:
+                skipped += 1
+        self.visual_anchor_row = None
+        self._clear_token_selection()
+        if not keys:
+            self.set_status('Nothing to fold: the selection has only changed lines.')
+            return 'noop'
+        self.user_folds.setdefault(rel, set()).update(keys)
+        self.rebuild_diff_rows()
+        self.cursor_row = next((i for i, row in enumerate(self.rows) if keys[0] in row_line_keys(row)), self.cursor_row)
+        self.set_status('Folded the selection{}. Enter or z on the fold opens it.'.format(
+            ', keeping {} changed line(s) in view'.format(skipped) if skipped else ''))
+        return 'fold_selection'
+
+    def _open_fold(self):
+        rel = self.current_file
+        row = self.rows[self.cursor_row]
+        keys = set(row_line_keys(row))
+        self.user_folds.get(rel, set()).difference_update(keys)
+        self.opened_folds.setdefault(rel, set()).update(keys)
+        self.rebuild_diff_rows()
+        self.cursor_row = next((i for i, r in enumerate(self.rows) if keys & set(row_line_keys(r))), self.cursor_row)
+        self.set_status('Opened {} line(s).'.format(row['count']))
+        return 'open_fold'
 
     def _on_fold_row(self):
         return bool(self.rows) and self.rows[self.cursor_row]['kind'] == 'fold'
@@ -4948,14 +5226,14 @@ class TuiState:
 
     def _key_down(self, key):
         if self.focus_pane == 'files':
-            self._select_file(self.file_index + 1)
+            self._sidebar_move(1)
         else:
             self._move_cursor(1)
         return 'down'
 
     def _key_up(self, key):
         if self.focus_pane == 'files':
-            self._select_file(self.file_index - 1)
+            self._sidebar_move(-1)
         else:
             self._move_cursor(-1)
         return 'up'
@@ -4972,8 +5250,12 @@ class TuiState:
         return 'top' if key in ('g', 'HOME') else 'bottom'
 
     def _key_file(self, key):
+        """J / K open the next / previous file in file-list order, unfolding its folder."""
         step = 1 if key == 'J' else -1
-        if self._select_file(self.file_index + step):
+        order = [item['index'] for item in self._sidebar_items() if item['kind'] == 'file']
+        pos = order.index(self.file_index) + step if self.file_index in order else -1
+        if 0 <= pos < len(order) and self._select_file(order[pos]):
+            self._reveal_current_file()
             self.set_status('File {}/{}: {}'.format(self.file_index + 1, len(self.file_entries), self.current_file))
         else:
             self.set_status('No {} file.'.format('next' if step > 0 else 'previous'))
@@ -5004,6 +5286,8 @@ class TuiState:
             self.token_index + 1, len(self.token_candidates), self.token_candidates[self.token_index]['text']))
 
     def _key_side(self, key):
+        if self.focus_pane == 'files' and key in ('LEFT', 'RIGHT'):
+            return self._sidebar_fold('collapse' if key == 'LEFT' else 'expand')
         left = key in ('[', 'LEFT')
         if self.token_candidates and self.token_index is not None:
             self._cycle_token(-1 if left else 1)
@@ -5055,6 +5339,10 @@ class TuiState:
         if self.visual_anchor_row is not None or self.token_index is not None:
             return self._key_comment(key)
         if self.focus_pane == 'files':
+            item = self._sidebar_item_at_cursor()
+            if item is not None and item['kind'] != 'file':
+                return self._sidebar_fold('toggle')
+            self.show_diff = True
             self.focus_pane = 'diff'
             self.set_status('Viewing {}.'.format(self.current_file or ''))
             return 'enter_diff'
@@ -5087,6 +5375,11 @@ class TuiState:
         rel = self.current_file
         if not rel:
             return 'noop'
+        if self.focus_pane == 'files':
+            item = self._sidebar_item_at_cursor()
+            if item is not None and item['kind'] != 'file':
+                self.set_status('Move to a file to apply it.')
+                return 'noop'
         drift = branch_drift_note(self.session)
         if key == 'A' or self.focus_pane == 'files' or rel in self.session.deletions:
             verb = 'Delete' if rel in self.session.deletions else 'Apply'
@@ -5169,7 +5462,7 @@ class TuiState:
 
     KEY_HANDLERS = {
         '?': _key_help, 'h': _key_help, 'i': _key_info, 'q': _key_quit, 'ESC': _key_quit,
-        'b': _key_sidebar, 'TAB': _key_tab, 'BTAB': _key_tab, 'u': _key_mode, 'z': _key_fold, 'W': _key_wrap,
+        'b': _key_sidebar, 'B': _key_files_only, 't': _key_tree, 'TAB': _key_tab, 'BTAB': _key_tab, 'u': _key_mode, 'z': _key_fold, 'W': _key_wrap,
         'H': _key_syntax, 'R': _key_reload,
         'j': _key_down, 'DOWN': _key_down, 'k': _key_up, 'UP': _key_up,
         'CTRL_D': _key_page, 'PGDN': _key_page, 'CTRL_U': _key_page, 'PGUP': _key_page,
@@ -5205,8 +5498,11 @@ class TuiState:
     def _diff_row(self, row, width, flag):
         """Display lines for one diff row; long lines wrap onto continuation lines when wrapping is on."""
         if row['kind'] == 'fold':
-            label = '{} ⋯ {} unchanged lines'.format(flag, row['count'])
-            return [StyledLine(label, 'fold').add('   (Enter or z to expand)', 'fold_hint').fit(width, 'fold')]
+            if row.get('changed'):
+                label = '{} ⋯ {} folded lines ({} changed)'.format(flag, row['count'], row['changed'])
+            else:
+                label = '{} ⋯ {} unchanged lines'.format(flag, row['count'])
+            return [StyledLine(label, 'fold').add('   (Enter or z to open)', 'fold_hint').fit(width, 'fold')]
         if self.diff_mode == 'side-by-side':
             half_w = max(10, (width - 3) // 2)
             columns = []
@@ -5264,42 +5560,75 @@ class TuiState:
                                         subsequent_indent=indent) or [indent])
         return [StyledLine(chunk, style).fit(width, 'comment_bg') for chunk in chunks]
 
-    def _sidebar_lines(self, width, height):
-        marker = '▸' if self.focus_pane == 'files' else ' '
-        lines = [StyledLine(' {}FILES ({})'.format(marker, len(self.file_entries)),
-                            'title_focus' if self.focus_pane == 'files' else 'title').fit(width),
-                 StyledLine(' ' + '─' * (width - 2), 'border').fit(width)]
-        items = []
-        last_status = None
-        for idx, entry in enumerate(self.file_entries):
-            if entry['status'] != last_status:
-                items.append((None, StyledLine(' ' + (entry['status'] or 'UNKNOWN'),
-                                               'status_' + (entry['status'] or 'MISSING').replace(' ', '_'))))
-                last_status = entry['status']
-            delta = ' +{} -{}'.format(entry['added'], entry['removed'])
-            badge = ' ●{}'.format(entry['open_comments']) if entry['open_comments'] else ''
-            selected = idx == self.file_index
-            path_w = max(4, width - 3 - len(delta) - len(badge))
-            line = StyledLine(' ')
-            if selected:
-                focused = self.focus_pane == 'files'
-                line.add(TUI_CURSOR_MARK if focused else TUI_CURSOR_MARK_IDLE, 'cursor' if focused else 'dim')
+    def _sidebar_row(self, item, at_cursor):
+        """One file-list row as (lead, label, label style, counts, summary); the caller sizes the label."""
+        lead = StyledLine(' ')
+        if at_cursor:
+            focused = self.focus_pane == 'files'
+            lead.add(TUI_CURSOR_MARK if focused else TUI_CURSOR_MARK_IDLE, 'cursor' if focused else 'dim')
+        else:
+            lead.add(' ')
+        lead.add(' ' + '  ' * item['depth'])
+        entries = [self.file_entries[i] for i in item['files']]
+        counts = StyledLine()
+        summary = ''
+        if item['kind'] == 'file':
+            entry = entries[0]
+            if self.sidebar_tree:
+                status = entry['status']
+                lead.add(TUI_TREE_STATUS_MARKS.get(status, '?'), 'status_' + (status or 'MISSING').replace(' ', '_'))
+                lead.add(' ')
+            label = item['label']
+            label_style = 'cursor' if item['index'] == self.file_index else None
+            summary = summary_text(entry['summary']) if entry['summary'] else ''
+        else:
+            folded = item['key'] in self.collapsed
+            lead.add('▸ ' if folded else '▾ ', 'dim')
+            label = item['label'] + (' ({})'.format(len(entries)) if folded else '')
+            if item['kind'] == 'group':
+                label_style = 'status_' + (item['status'] or 'MISSING').replace(' ', '_')
             else:
-                line.add(' ')
-            line.add(' ')
-            line.add(_clip_path(entry['path'], path_w).ljust(path_w), 'cursor' if selected else None)
-            line.add(' +{}'.format(entry['added']), 'add' if entry['added'] else 'dim')
-            line.add(' -{}'.format(entry['removed']), 'del' if entry['removed'] else 'dim')
-            line.add(badge, 'comment')
-            items.append((idx, line))
+                label_style = 'dir'
+            if not folded:  # an open folder's files show their own counts
+                return lead, label, label_style, counts, summary
+        added = sum(e['added'] for e in entries)
+        removed = sum(e['removed'] for e in entries)
+        open_comments = sum(e['open_comments'] for e in entries)
+        counts.add(' +{}'.format(added), 'add' if added else 'dim')
+        counts.add(' -{}'.format(removed), 'del' if removed else 'dim')
+        if open_comments:
+            counts.add(' ●{}'.format(open_comments), 'comment')
+        return lead, label, label_style, counts, summary
+
+    def _sidebar_lines(self, width, height):
+        """The file list, grouped by status or as a folder tree; at full width (B) it adds file summaries."""
+        focused = self.focus_pane == 'files'
+        title = StyledLine(' {}FILES ({})'.format('▸' if focused else ' ', len(self.file_entries)),
+                           'title_focus' if focused else 'title')
+        title.add(' · tree' if self.sidebar_tree else '', 'dim')
+        lines = [title.fit(width), StyledLine(' ' + '─' * (width - 2), 'border').fit(width)]
+        visible, cursor_pos = self._sidebar_view()
+        rows = [self._sidebar_row(item, n == cursor_pos) for n, item in enumerate(visible)]
+        wide = not self.show_diff
+        if wide and rows:
+            # Line the counts up in one column after the longest label, leaving the rest for summaries.
+            longest = max(len(lead.text) + len(label) + len(counts.text) for lead, label, _, counts, _ in rows)
+            column = min(longest + 2, max(24, width // 2))
+        items = []
+        for lead, label, label_style, counts, summary in rows:
+            end = column if wide else width - 1
+            room = max(4, end - len(lead.text) - len(counts.text))
+            line = lead.add(_clip_path(label, room).ljust(room), label_style).extend(counts)
+            if wide and summary:
+                line.add('  ' + summary, 'summary')
+            items.append(line)
         avail = max(1, height - len(lines))
-        selected_pos = next((i for i, (idx, _) in enumerate(items) if idx == self.file_index), 0)
-        if selected_pos < self.sidebar_offset:
-            self.sidebar_offset = max(0, selected_pos - 1)
-        elif selected_pos >= self.sidebar_offset + avail:
-            self.sidebar_offset = selected_pos - avail + 1
+        if cursor_pos < self.sidebar_offset:
+            self.sidebar_offset = max(0, cursor_pos - 1)
+        elif cursor_pos >= self.sidebar_offset + avail:
+            self.sidebar_offset = cursor_pos - avail + 1
         self.sidebar_offset = max(0, min(self.sidebar_offset, max(0, len(items) - avail)))
-        for _, line in items[self.sidebar_offset:self.sidebar_offset + avail]:
+        for line in items[self.sidebar_offset:self.sidebar_offset + avail]:
             lines.append(line.fit(width))
         return lines
 
@@ -5317,14 +5646,21 @@ class TuiState:
         if self.panel == 'help':
             heading('staged TUI Command Reference')
             lines.append(StyledLine(' ' + '─' * max(10, width - 4), 'border').fit(width))
-            key_w = min(32, max(16, width // 3))
+            # Size the key column to the longest key (up to half the width); descriptions wrap under themselves.
+            key_w = min(max(len(combo) for _, items in TUI_KEYS for combo, _ in items) + 2, max(16, width * 2 // 5))
+            desc_w = max(10, width - 3 - key_w - 1)
             for section_title, items in TUI_KEYS:
                 heading(section_title + ':')
                 for combo, desc in items:
-                    lines.append(StyledLine('   ').add(combo.ljust(key_w), 'key').add(' ' + desc).fit(width))
+                    combos = textwrap.wrap(combo, key_w - 2) or ['']
+                    descs = textwrap.wrap(desc, desc_w) or ['']
+                    for index in range(max(len(combos), len(descs))):
+                        part = combos[index] if index < len(combos) else ''
+                        text = descs[index] if index < len(descs) else ''
+                        lines.append(StyledLine('   ').add(part.ljust(key_w), 'key').add(text).fit(width))
                 lines.append(StyledLine().fit(width))
             lines.append(StyledLine(' Press ? or Esc to return to the diff.', 'dim').fit(width))
-            return lines[:height]
+            return self._scroll_panel(lines, width, height)
 
         heading('Intent')
         if self.intent_data.get('text'):
@@ -5349,7 +5685,19 @@ class TuiState:
                 len(self.hunks), len(comments), sum(1 for c in comments if c['status'] == 'open')), 'dim')
         lines.append(StyledLine().fit(width))
         lines.append(StyledLine(' Press i or Esc to return to the diff.', 'dim').fit(width))
-        return lines[:height]
+        return self._scroll_panel(lines, width, height)
+
+    def _scroll_panel(self, lines, width, height):
+        """The visible part of a panel, with a marker line where more lines are hidden above or below."""
+        self.panel_rows = height
+        self.panel_offset = max(0, min(self.panel_offset, len(lines) - height))
+        shown = lines[self.panel_offset:self.panel_offset + height]
+        below = len(lines) - self.panel_offset - height
+        if below > 0:
+            shown[-1] = StyledLine(' ↓ {} more line(s) below: j/k or Ctrl-d to scroll'.format(below + 1), 'key').fit(width)
+        if self.panel_offset > 0:
+            shown[0] = StyledLine(' ↑ {} more line(s) above: k or g'.format(self.panel_offset + 1), 'key').fit(width)
+        return shown
 
     def _diff_lines(self, width, height):
         entry = self.current_file_entry
@@ -5447,21 +5795,42 @@ class TuiState:
         return [line.fit(width, 'footer') for line in lines[-max(1, max_lines):]]
 
     def _footer_lines(self, width, max_lines=1):
+        """The status message on the bottom line and the key hints, wrapped rather than cut off.
+
+        When both fit on one line the hints sit at its right end; otherwise they wrap onto lines above
+        the status. Only a terminal too short for every line drops the last hints, and `?` comes first.
+        """
         if self.input_mode:
             return self._input_lines(width, max_lines)
-        return [self._footer_line(width)]
-
-    def _footer_line(self, width):
         if self.pending_confirm is not None:
-            return StyledLine(' ' + self.pending_confirm['question'] + ' [y/N]', 'prompt').fit(width, 'footer')
-        line = StyledLine(' ' + self.status_message, 'error' if self.status_is_error else 'footer')
-        if self.panel is None:
-            hints = '  '.join('{} {}'.format(k, d) for k, d in TUI_HINTS[self.focus_pane])
-            room = width - len(line.text) - 2
-            if room > 20:
-                hints = hints if len(hints) <= room else hints[:room - 1] + '…'
-                line.add(' ' * (width - len(line.text) - len(hints) - 1)).add(hints, 'footer_dim')
-        return line.fit(width, 'footer')
+            return [StyledLine(' ' + self.pending_confirm['question'] + ' [y/N]', 'prompt').fit(width, 'footer')]
+        usable = width - 1  # the bottom-right cell cannot be drawn
+        status_style = 'error' if self.status_is_error else 'footer'
+        hints = TUI_HINTS[self.panel or self.focus_pane]
+        pieces = []
+        for combo, desc in hints:
+            piece = StyledLine(combo, 'footer_key').add(' ' + desc, 'footer_dim')
+            pieces.append(piece)
+        hints_len = sum(len(piece.text) for piece in pieces) + 2 * (len(pieces) - 1)
+        status_text = ' ' + self.status_message
+        if len(status_text) + 2 + hints_len <= usable:
+            line = StyledLine(status_text, status_style).add(' ' * (usable - len(status_text) - hints_len))
+            for index, piece in enumerate(pieces):
+                line.add('  ' if index else '').extend(piece)
+            return [line.fit(width, 'footer')]
+        status = [StyledLine(' ' + chunk, status_style).fit(width, 'footer')
+                  for chunk in textwrap.wrap(self.status_message, usable - 1) or ['']]
+        hint_lines = []
+        line = StyledLine(' ')
+        for piece in pieces:
+            if len(line.text) > 1 and len(line.text) + 2 + len(piece.text) > usable:
+                hint_lines.append(line)
+                line = StyledLine(' ')
+            line.add('  ' if len(line.text) > 1 else '').extend(piece)
+        hint_lines.append(line)
+        status = status[-max(1, max_lines - 1):]
+        hint_lines = hint_lines[:max(0, max_lines - len(status))]
+        return [hint.fit(width, 'footer') for hint in hint_lines] + status
 
     def render_frame(self, width=120, height=32):
         """Return `height` lines of exactly `width` characters; styles land in `frame_styles`."""
@@ -5469,11 +5838,19 @@ class TuiState:
         height = max(12, int(height))
         footer = self._footer_lines(width, max_lines=max(1, (height - 1) // 3))
         body_height = height - 1 - len(footer)
-        sidebar_w = min(40, max(24, width // 4)) if self.show_sidebar else 0
-        main_w = width - sidebar_w - (1 if sidebar_w else 0)
+        show_main = self.show_diff or self.panel is not None
+        if self.panel is not None:
+            sidebar_w = 0  # panels use the full width so the key reference has room
+        elif not show_main:
+            sidebar_w = width
+        else:
+            sidebar_w = min(40, max(24, width // 4)) if self.show_sidebar else 0
+        main_w = width - sidebar_w - (1 if sidebar_w and show_main else 0)
 
         left = self._sidebar_lines(sidebar_w, body_height) if sidebar_w else []
-        right = self._panel_lines(main_w, body_height) if self.panel else self._diff_lines(main_w, body_height)
+        right = []
+        if show_main:
+            right = self._panel_lines(main_w, body_height) if self.panel else self._diff_lines(main_w, body_height)
         blank_left = StyledLine().fit(sidebar_w)
         blank_right = StyledLine().fit(main_w)
 
@@ -5481,8 +5858,11 @@ class TuiState:
         for i in range(body_height):
             row = StyledLine()
             if sidebar_w:
-                row.extend(left[i] if i < len(left) else blank_left).add('│', 'border')
-            row.extend(right[i] if i < len(right) else blank_right)
+                row.extend(left[i] if i < len(left) else blank_left)
+                if show_main:
+                    row.add('│', 'border')
+            if show_main:
+                row.extend(right[i] if i < len(right) else blank_right)
             styled.append(row.fit(width))
         styled.extend(footer)
         self.frame_styles = [line.spans for line in styled]
@@ -5506,6 +5886,7 @@ class TuiApp:
         'header': ('BLACK', 'CYAN', ()), 'header_title': ('BLACK', 'CYAN', ('A_BOLD',)),
         'header_dim': ('BLACK', 'CYAN', ()),
         'footer': (None, None, ('A_REVERSE',)), 'footer_dim': (None, None, ('A_REVERSE', 'A_DIM')),
+        'footer_key': (None, None, ('A_REVERSE', 'A_BOLD')),
         'prompt': ('YELLOW', None, ('A_REVERSE', 'A_BOLD')), 'input': (None, None, ('A_REVERSE',)),
         'error': ('RED', None, ('A_REVERSE', 'A_BOLD')),
         'title': (None, None, ('A_BOLD',)), 'title_focus': ('CYAN', None, ('A_BOLD',)),
@@ -5516,7 +5897,7 @@ class TuiApp:
         'add_gutter': ('GREEN', None, ('A_DIM',)), 'del_gutter': ('RED', None, ('A_DIM',)),
         'del': ('RED', None, ()), 'del_em': ('RED', None, ('A_BOLD', 'A_REVERSE')),
         'fold': (None, None, ('A_DIM',)), 'fold_hint': (None, None, ('A_DIM',)), 'comment_bg': ('YELLOW', None, ()),
-        'cursor': ('CYAN', None, ('A_BOLD',)), 'selected': (None, None, ('A_REVERSE',)),
+        'cursor': ('CYAN', None, ('A_BOLD',)), 'selected': (None, None, ('A_REVERSE',)), 'dir': ('BLUE', None, ('A_BOLD',)),
         'comment': ('YELLOW', None, ('A_BOLD',)), 'summary': ('CYAN', None, ()),
         'intent': ('MAGENTA', None, ()), 'ref': ('BLUE', None, ('A_UNDERLINE',)),
         'syn_keyword': ('MAGENTA', None, ()), 'syn_string': ('YELLOW', None, ()), 'syn_comment': (None, None, ('A_DIM',)),
@@ -5536,7 +5917,7 @@ class TuiApp:
         'gutter': (242, None, ()), 'filler': (None, 235, ()), 'border': (238, None, ()),
         'fold': (244, 235, ()), 'fold_hint': (240, 235, ()),
         'comment': (221, 236, ('A_BOLD',)), 'comment_bg': (221, 236, ()),
-        'selected': (None, 238, ()), 'cursor': (74, None, ('A_BOLD',)),
+        'selected': (None, 238, ()), 'cursor': (74, None, ('A_BOLD',)), 'dir': (110, None, ('A_BOLD',)),
         'col': (245, None, ()), 'col_active': (74, None, ('A_BOLD',)), 'title_focus': (74, None, ('A_BOLD',)),
         'summary': (110, None, ()), 'intent': (176, None, ()), 'ref': (75, None, ('A_UNDERLINE',)),
         'dim': (243, None, ()), 'key': (221, None, ('A_BOLD',)),

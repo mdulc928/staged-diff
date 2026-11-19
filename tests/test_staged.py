@@ -3331,7 +3331,7 @@ class TestTuiAndFeedback(unittest.TestCase):
         # Test help modal (? and h)
         state.handle_key('?')
         self.assertTrue(state.show_help)
-        frame_help = '\n'.join(state.render_frame(width=120, height=28))
+        frame_help = '\n'.join(state.render_frame(width=120, height=60))
         self.assertIn('staged TUI Command Reference', frame_help)
         self.assertIn('NAVIGATION:', frame_help)
         self.assertIn('CODE REVIEW & INLINE FEEDBACK:', frame_help)
@@ -3384,6 +3384,7 @@ class TestTuiAndFeedback(unittest.TestCase):
         joined = '\n'.join(state.render_frame(width=120, height=30))
         self.assertIn('unchanged lines', joined)
         self.assertIn('x' * 20, joined.split('line 20 changed')[1].split('\n')[1])  # wrapped continuation
+        state.handle_key('n')  # off the fold rows: z expands every fold
         state.handle_key('z')
         self.assertFalse(any(row['kind'] == 'fold' for row in state.rows))
         state.handle_key('W')
@@ -3407,7 +3408,7 @@ class TestTuiAndFeedback(unittest.TestCase):
         self.assertEqual(state.focus_pane, 'files')
         self.assertIn('File list focused', state.status_message)
         frame = state.render_frame(width=120, height=20)
-        self.assertTrue(any(' ▶ a.txt' in line for line in frame))  # focused file list
+        self.assertTrue(any(' ▶   a.txt' in line for line in frame))  # focused file list, under its group
         self.assertTrue(any('▷' in line.split('│', 1)[1] for line in frame if '│' in line))  # idle diff cursor
         state.handle_key('BTAB')
         self.assertEqual(state.focus_pane, 'diff')
@@ -3417,6 +3418,230 @@ class TestTuiAndFeedback(unittest.TestCase):
         state.handle_key('BTAB')  # a hidden file list is shown and focused
         self.assertTrue(state.show_sidebar)
         self.assertEqual(state.focus_pane, 'files')
+
+    def _seed_tree_files(self):
+        for rel in ('README.md', 'src/pkg/cli/main.py', 'src/pkg/cli/args.py', 'src/pkg/tui.py'):
+            for root, text in ((self.workspace, 'a\n'), (self.session.staging, 'b\n')):
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(text, encoding='utf-8')
+
+    def test_tui_tree_view_folds_folders(self):
+        self._seed_tree_files()
+        state = staged.TuiState(self.session, target_file='src/pkg/cli/main.py')
+        state.handle_key('TAB')
+        self.assertEqual(state.handle_key('t'), 'toggle_tree')
+        frame = state.render_frame(width=120, height=24)
+        joined = '\n'.join(frame)
+        self.assertIn('FILES (6) · tree', joined)
+        self.assertIn('▾ src/', joined)
+        self.assertIn('▾ pkg/', joined)
+        self.assertIn('M main.py', joined)
+        self.assertIn('N new_mod.py', joined)
+        rows = [line.split('│')[0] for line in frame]
+        # Folders come before files, so README.md, at the root, is listed last.
+        self.assertLess(next(i for i, r in enumerate(rows) if 'cli/' in r), next(i for i, r in enumerate(rows) if 'README.md' in r))
+        # J / K follow the tree order: cli/args.py, cli/main.py, tui.py, example.py ...
+        state.handle_key('J')
+        self.assertEqual(state.current_file, 'src/pkg/tui.py')
+        state.handle_key('K')
+        self.assertEqual(state.current_file, 'src/pkg/cli/main.py')
+        # Left on a file folds its folder and puts the cursor on it.
+        self.assertEqual(state.handle_key('LEFT'), 'fold_dir')
+        self.assertIn('dir:src/pkg/cli/', state.collapsed)
+        file_list = '\n'.join(line.split('│')[0] for line in state.render_frame(width=120, height=24))
+        self.assertIn('▸ cli/ (2)', file_list)
+        self.assertNotIn('main.py', file_list)
+        # Apply refuses a folder; Enter unfolds it; Right on an open folder steps onto its first file.
+        self.assertEqual(state.handle_key('a'), 'noop')
+        self.assertIsNone(state.pending_confirm)
+        self.assertEqual(state.handle_key('ENTER'), 'fold_dir')
+        self.assertNotIn('dir:src/pkg/cli/', state.collapsed)
+        state.handle_key('RIGHT')
+        self.assertEqual(state.current_file, 'src/pkg/cli/args.py')
+        # J into a folded folder unfolds it.
+        state.handle_key('k')
+        state.handle_key('LEFT')
+        state.handle_key('k')  # onto pkg/, above the folded cli/
+        state.handle_key('LEFT')
+        self.assertIn('dir:src/pkg/', state.collapsed)
+        state.handle_key('K')
+        state.handle_key('J')
+        self.assertNotIn('dir:src/pkg/', state.collapsed)
+        self.assertNotIn('dir:src/pkg/cli/', state.collapsed)
+
+    def test_tui_status_groups_fold_and_j_k_visit_headers(self):
+        state = staged.TuiState(self.session, target_file='src/new_mod.py')
+        state.handle_key('TAB')
+        state.handle_key('k')  # onto the NEW FILE heading
+        self.assertEqual(state.sidebar_cursor, 'group:NEW FILE')
+        self.assertEqual(state.current_file, 'src/new_mod.py')
+        self.assertEqual(state.handle_key('ENTER'), 'fold_group')
+        joined = '\n'.join(state.render_frame(width=120, height=24))
+        self.assertIn('▸ NEW FILE (1)', joined)
+        state.handle_key('j')  # past the folded group to the MODIFIED heading, then its file
+        state.handle_key('j')
+        self.assertEqual(state.current_file, 'src/example.py')
+
+    def test_tui_file_list_full_width(self):
+        state = staged.TuiState(self.session, target_file='src/example.py')
+        self.assertEqual(state.handle_key('B'), 'toggle_files_only')
+        self.assertFalse(state.show_diff)
+        self.assertEqual(state.focus_pane, 'files')
+        frame = state.render_frame(width=120, height=20)
+        self.assertTrue(all(len(line) == 120 for line in frame))
+        joined = '\n'.join(frame)
+        self.assertNotIn('Workspace Original', joined)
+        self.assertIn('Update compute offset and helper string.', joined)  # summaries fill the room
+        # Diff keys bring the diff back; so do Enter on a file and Tab.
+        state.handle_key('n')
+        self.assertTrue(state.show_diff)
+        self.assertEqual(state.focus_pane, 'diff')
+        state.handle_key('B')
+        state.handle_key('ENTER')
+        self.assertTrue(state.show_diff)
+        self.assertEqual(state.focus_pane, 'diff')
+        state.handle_key('B')
+        state.handle_key('TAB')
+        self.assertTrue(state.show_diff)
+        # b from the full-width list swaps to the diff alone, and B from there back to the list alone.
+        state.handle_key('B')
+        state.handle_key('b')
+        self.assertTrue(state.show_diff)
+        self.assertFalse(state.show_sidebar)
+        state.handle_key('B')
+        self.assertTrue(state.show_sidebar)
+        self.assertFalse(state.show_diff)
+        # Panels still open while the diff is hidden.
+        state.handle_key('?')
+        self.assertIn('staged TUI Command Reference', '\n'.join(state.render_frame(width=120, height=40)))
+
+    def test_tui_footer_wraps_hints_instead_of_cutting_them(self):
+        state = staged.TuiState(self.session, target_file='src/example.py')
+        for focus in ('diff', 'files'):
+            state.focus_pane = focus
+            for width in (60, 80, 120, 200):
+                frame = state.render_frame(width=width, height=24)
+                self.assertTrue(all(len(line) == width for line in frame))
+                footer = ' '.join(line for line in frame[-4:])
+                self.assertNotIn('…', footer)
+                for combo, desc in staged.TUI_HINTS[focus]:
+                    self.assertIn('{} {}'.format(combo, desc), footer)
+                self.assertIn('Ready', frame[-1])  # the status message stays on the bottom line
+        state.set_status('error: ' + 'x ' * 60, error=True)
+        frame = state.render_frame(width=80, height=24)
+        self.assertIn('x x', frame[-1])
+        self.assertIn('error:', frame[-2])
+
+    def test_tui_help_panel_scrolls_and_wraps(self):
+        state = staged.TuiState(self.session, target_file='src/example.py')
+        state.handle_key('?')
+        frame = state.render_frame(width=80, height=16)
+        joined = '\n'.join(frame)
+        self.assertIn('more line(s) below', joined)
+        self.assertIn('j/k scroll', joined)
+        self.assertNotIn('FILES (', joined)  # panels use the full width
+        seen = joined
+        for _ in range(80):
+            self.assertEqual(state.handle_key('j'), 'scroll_panel')
+            seen += '\n'.join(state.render_frame(width=80, height=16))
+        self.assertNotIn('more line(s) below', '\n'.join(state.render_frame(width=80, height=16)))
+        self.assertIn('Press ? or Esc to return to the diff.', seen)
+        for _, items in staged.TUI_KEYS:  # every key and every word of its description shows up somewhere
+            for combo, desc in items:
+                for word in (combo + ' ' + desc).split():
+                    self.assertIn(word, seen)
+        state.handle_key('g')
+        self.assertEqual(state.panel_offset, 0)
+        state.handle_key('?')
+        self.assertIsNone(state.panel)
+
+    def test_tui_folds_selected_unchanged_lines_and_opens_one_fold(self):
+        orig = ['line {}'.format(i) for i in range(1, 31)]
+        new = list(orig)
+        new[4] = 'line 5 changed'
+        new[24] = 'line 25 changed'
+        (self.workspace / 'mixed.txt').write_text('\n'.join(orig) + '\n', encoding='utf-8')
+        (self.session.staging / 'mixed.txt').write_text('\n'.join(new) + '\n', encoding='utf-8')
+        state = staged.TuiState(self.session, target_file='mixed.txt')
+        state.handle_key('z')  # cursor starts on line 1, not a fold: expand everything
+        self.assertFalse(any(row['kind'] == 'fold' for row in state.rows))
+        # Select lines 3..10, which include the changed line 5, and fold: only unchanged lines fold.
+        state.cursor_row = 2
+        state.handle_key('v')
+        for _ in range(7):
+            state.handle_key('j')
+        self.assertEqual(state.handle_key('z'), 'fold_selection')
+        self.assertIsNone(state.visual_anchor_row)
+        self.assertIn('keeping 1 changed line(s)', state.status_message)
+        folds = [row for row in state.rows if row['kind'] == 'fold']
+        self.assertEqual([f['count'] for f in folds], [2, 5])  # lines 3-4 and 6-10 around changed line 5
+        self.assertTrue(all(f['changed'] == 0 for f in folds))
+        self.assertTrue(any(row['kind'] == 'replace' and row['right_lineno'] == 5 for row in state.rows))
+        self.assertEqual(state.rows[state.cursor_row]['kind'], 'fold')
+        joined = '\n'.join(state.render_frame(width=120, height=30))
+        self.assertIn('⋯ 5 unchanged lines', joined)
+        # Folds survive switching to unified and back.
+        state.handle_key('u')
+        self.assertEqual([r['count'] for r in state.rows if r['kind'] == 'fold'], [2, 5])
+        state.handle_key('u')
+        # Enter on a fold opens only that fold.
+        self.assertEqual(state.handle_key('ENTER'), 'open_fold')
+        self.assertEqual([r['count'] for r in state.rows if r['kind'] == 'fold'], [5])
+        # A selection of only changed lines folds nothing.
+        state.cursor_row = next(i for i, r in enumerate(state.rows) if r.get('right_lineno') == 5)
+        state.handle_key('v')
+        self.assertEqual(state.handle_key('z'), 'noop')
+        self.assertIn('only changed lines', state.status_message)
+        # z on a fold opens it; z off a fold with automatic folding on folds the file and keeps your folds.
+        state.cursor_row = next(i for i, r in enumerate(state.rows) if r['kind'] == 'fold')
+        self.assertEqual(state.handle_key('z'), 'open_fold')
+        self.assertFalse(any(r['kind'] == 'fold' for r in state.rows))
+        # Automatic folds open one at a time too.
+        state.handle_key('g')
+        state.handle_key('z')
+        self.assertTrue(state.fold_context)
+        auto = [r['count'] for r in state.rows if r['kind'] == 'fold']
+        state.cursor_row = next(i for i, r in enumerate(state.rows) if r['kind'] == 'fold')
+        state.handle_key('ENTER')
+        self.assertEqual(len([r for r in state.rows if r['kind'] == 'fold']), len(auto) - 1)
+
+    def test_tui_folds_any_lines_in_a_new_file(self):
+        (self.session.staging / 'brand_new.py').write_text(
+            ''.join('x{} = {}\n'.format(i, i) for i in range(20)), encoding='utf-8')
+        state = staged.TuiState(self.session, target_file='brand_new.py')
+        self.assertTrue(state.file_all_changed)
+        state.cursor_row = 3
+        state.handle_key('v')
+        for _ in range(9):
+            state.handle_key('j')
+        self.assertEqual(state.handle_key('z'), 'fold_selection')
+        fold = state.rows[state.cursor_row]
+        self.assertEqual((fold['kind'], fold['count'], fold['changed']), ('fold', 10, 10))
+        self.assertEqual(len(state.rows), 11)
+        self.assertIn('⋯ 10 folded lines (10 changed)', '\n'.join(state.render_frame(width=120, height=30)))
+        state.handle_key('n')  # the file's one hunk still starts at its first line, above the fold
+        self.assertEqual(state.cursor_row, 0)
+        state.cursor_row = 3
+        self.assertEqual(state.handle_key('ENTER'), 'open_fold')
+        self.assertEqual(len(state.rows), 20)
+
+    def test_tui_folds_never_hide_comments(self):
+        orig = ['line {}'.format(i) for i in range(1, 21)]
+        new = list(orig)
+        new[0] = 'line 1 changed'
+        (self.workspace / 'c.txt').write_text('\n'.join(orig) + '\n', encoding='utf-8')
+        (self.session.staging / 'c.txt').write_text('\n'.join(new) + '\n', encoding='utf-8')
+        staged.add_feedback_comment(self.session, file_path='c.txt', comment='keep me', start_line=8,
+                                    end_line=8, side='staged')
+        state = staged.TuiState(self.session, target_file='c.txt')
+        state.handle_key('n')
+        state.handle_key('z')  # expand all
+        state.cursor_row = 3
+        state.handle_key('v')
+        state.cursor_row = 15
+        state.handle_key('z')
+        self.assertEqual([r['count'] for r in state.rows if r['kind'] == 'fold'], [4, 8])
+        self.assertIn('keep me', '\n'.join(state.render_frame(width=120, height=30)))
 
     def test_tui_wraps_long_comments_and_comment_input(self):
         (self.workspace / 'a.txt').write_text('one\n', encoding='utf-8')
