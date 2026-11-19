@@ -558,10 +558,14 @@ The TUI remembers your view between runs: the tree or status-grouped file list (
 | `y` | Copy open comments to the clipboard as an agent prompt |
 | `a` | Apply the hunk at the cursor (in the file list: the whole file); asks first |
 | `A` | Apply the whole current file; asks first |
+| `o` | Pull the workspace side of the hunk at the cursor into the session (in the file list: the whole file); asks first |
+| `O` | Replace the whole current proposal with its workspace copy; asks first |
 | `?` | Key reference with every key (scroll it with `j`/`k`, `Ctrl-d`/`Ctrl-u`, `g`/`G`) |
 | `q` / `Esc` | Close a panel or clear a selection; `q` quits |
 
 TUI applies use the same safeguards as `staged apply`. Protected branches are refused (use `staged apply --force` from the shell when you mean it). Branch drift is named in the confirmation prompt. File applies use the 3-way merge and conflict checks, and every apply, including a single hunk, records a backup so `staged undo` can roll back the latest one. Hunk applies work in place only: renames, deletions and non-UTF-8 files have to be applied as whole files. Errors appear in the footer instead of closing the TUI.
+
+`o` and `O` run apply the other way, from the workspace into the session, much like vimdiff's `do`. Use them to drop part of a proposal, or to carry edits you made in the workspace into the session before the agent revises it. They change only the staged file. The workspace and the merge baseline stay as they are, so pulls skip the branch checks. Each pull records a backup, so `staged undo` puts the proposal back. Proposed deletions and new files have nothing to pull from; clean those instead. To move whole git changes into a session, use [`staged apply --inverse`](#moving-workspace-changes-into-a-session---inverse).
 
 ---
 
@@ -734,6 +738,7 @@ staged undo --json                        # Output machine-readable JSON result
 
 - Restores modified, merged, and deleted files to their exact pre-apply state and unlinks files that were newly created by the apply.
 - If files were modified in the workspace *after* the apply, `staged undo` guards against accidental data loss and prompts for confirmation unless `--force` or `-y` is passed.
+- After a TUI pull (`o` / `O`), `staged undo` restores the staged file instead of the workspace, with the same guard for staged edits made since.
 
 ---
 
