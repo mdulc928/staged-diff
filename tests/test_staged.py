@@ -3398,6 +3398,48 @@ class TestTuiAndFeedback(unittest.TestCase):
         state.handle_key('ESC')
         self.assertIsNone(state.panel)
 
+    def test_tui_shift_tab_and_focus_markers(self):
+        (self.workspace / 'a.txt').write_text('one\n', encoding='utf-8')
+        (self.session.staging / 'a.txt').write_text('ONE\n', encoding='utf-8')
+        state = staged.TuiState(self.session, target_file='a.txt')
+        self.assertEqual(staged.TuiState.normalize_key('\x1b[Z'), 'BTAB')
+        state.handle_key('BTAB')
+        self.assertEqual(state.focus_pane, 'files')
+        self.assertIn('File list focused', state.status_message)
+        frame = state.render_frame(width=120, height=20)
+        self.assertTrue(any(' ▶ a.txt' in line for line in frame))  # focused file list
+        self.assertTrue(any('▷' in line.split('│', 1)[1] for line in frame if '│' in line))  # idle diff cursor
+        state.handle_key('BTAB')
+        self.assertEqual(state.focus_pane, 'diff')
+        state.handle_key('TAB')
+        self.assertEqual(state.focus_pane, 'files')
+        state.handle_key('b')
+        state.handle_key('BTAB')  # a hidden file list is shown and focused
+        self.assertTrue(state.show_sidebar)
+        self.assertEqual(state.focus_pane, 'files')
+
+    def test_tui_wraps_long_comments_and_comment_input(self):
+        (self.workspace / 'a.txt').write_text('one\n', encoding='utf-8')
+        (self.session.staging / 'a.txt').write_text('ONE\n', encoding='utf-8')
+        state = staged.TuiState(self.session, target_file='a.txt')
+        words = ' '.join('word{}'.format(i) for i in range(60))
+        state.handle_key('c')
+        for ch in words:
+            state.handle_key(ch)
+        frame = state.render_frame(width=80, height=24)
+        self.assertEqual(len(frame), 24)
+        self.assertTrue(all(len(line) == 80 for line in frame))
+        footer = '\n'.join(frame[-4:])
+        self.assertIn('word59█', footer)  # the end of the text, where typing happens, stays visible
+        self.assertIn('Comment (', '\n'.join(frame))
+        state.handle_key('ENTER')
+        frame = state.render_frame(width=80, height=40)
+        comment = [line for line in frame if 'word' in line]
+        self.assertGreater(len(comment), 2)
+        self.assertIn('word0', comment[0])
+        self.assertIn('word59', comment[-1])
+        self.assertEqual(''.join(line.split()[-1] for line in comment).count('word59'), 1)
+
     def test_hunk_apply_preserves_crlf_and_missing_final_newline(self):
         (self.workspace / 'crlf.txt').write_bytes(b'a\r\nb\r\nc')
         (self.session.staging / 'crlf.txt').write_bytes(b'a\r\nB\r\nc')
