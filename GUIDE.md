@@ -552,6 +552,7 @@ The TUI remembers your view between runs: the tree or status-grouped file list (
 | `v` (Space) | Start / clear a multi-line selection |
 | `w` | Select a token or expression on the line (`snippet_focus`) |
 | `c` | Comment on the selection; saved to `feedback.json`. Long comments wrap, both while typing and inline in the diff |
+| `e` | Edit the comment at the cursor: the input starts with its text, `Ctrl-U` clears it, `Enter` saves, `Esc` keeps the old text |
 | `r` | Resolve / reopen the comment at the cursor |
 | `x` | Delete the comment at the cursor (asks first) |
 | `y` | Copy open comments to the clipboard as an agent prompt |
@@ -584,6 +585,9 @@ staged feedback --copy                    # Copy prompt directly to system clipb
 # Add a comment anchored to lines 10-14 and specific expression
 staged feedback --add -f src/app.py --start-line 10 --end-line 14 --select 'return 42' -m 'Avoid magic number 42'
 
+# Edit a comment's text (lines, side and status stay as they are)
+staged feedback --edit fb-1 -m 'Name the constant instead'
+
 # Resolve comments
 staged feedback --resolve fb-1            # Mark comment fb-1 resolved
 staged feedback --resolve-all             # Mark all comments resolved
@@ -593,7 +597,7 @@ staged feedback --delete fb-1             # Remove comment fb-1
 staged feedback --clear                   # Delete all comments
 ```
 
-`feedback` uses action flags rather than subcommands: `--add`, `--resolve`, `--resolve-all`, `--delete` and `--clear` are exclusive, and with none of them it lists comments (`--prompt` and `--copy` format them for an agent). Line numbers are one-based like `read` and `write`, so 0 and negative values are rejected. Comment IDs complete after `--resolve` (open comments) and `--delete` (all comments).
+`feedback` uses action flags rather than subcommands: `--add`, `--edit`, `--resolve`, `--resolve-all`, `--delete` and `--clear` are exclusive, and with none of them it lists comments (`--prompt` and `--copy` format them for an agent). Line numbers are one-based like `read` and `write`, so 0 and negative values are rejected. Comment IDs complete after `--resolve` (open comments), `--edit` and `--delete` (all comments).
 
 ---
 

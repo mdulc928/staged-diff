@@ -3820,6 +3820,19 @@ def resolve_feedback(session, comment_id=None, resolve_all=False, toggle=False):
     return updated
 
 
+def edit_feedback(session, comment_id, comment):
+    """Replace the text of one feedback comment; its lines, side and status stay as they were."""
+    if not isinstance(comment, str) or not comment.strip():
+        raise StagedError('Feedback comment cannot be empty.')
+    data = load_feedback(session)
+    for item in data['comments']:
+        if item['id'] == comment_id:
+            item['comment'] = comment.strip()
+            save_feedback(session, data)
+            return item
+    raise StagedError('Unknown feedback comment ID: {}'.format(comment_id))
+
+
 def delete_feedback(session, comment_id=None, clear_all=False):
     """Delete a single feedback comment by ID or clear all comments in the session."""
     data = load_feedback(session)
@@ -3977,8 +3990,10 @@ def configure_feedback_parser(parser):
     parser.add_argument('--side', choices=list(VALID_SIDES), default='staged',
                         help='target side for --add (default: staged)')
     parser.add_argument('--select', dest='snippet_focus', help='specific substring/token within the line range to highlight')
-    parser.add_argument('-m', '--message', help='review comment text for --add')
+    parser.add_argument('-m', '--message', help='review comment text for --add or --edit')
     parser.add_argument('--stdin', action='store_true', help='read review comment text from standard input')
+
+    parser.add_argument('--edit', metavar='ID', help='replace the text of a feedback comment ID (with -m or --stdin)')
 
     parser.add_argument('--resolve', metavar='ID', help='mark a feedback comment ID as resolved')
     parser.add_argument('--resolve-all', action='store_true', help='mark all feedback comments in this session as resolved')
@@ -3995,10 +4010,10 @@ def configure_tui_parser(parser):
 
 def handle_feedback(ctx, session, args, clipboard_runner=None):
     """Execute the `staged feedback` command."""
+    edit_id = getattr(args, 'edit', None)
     add_requested = bool(
         getattr(args, 'add', False)
-        or getattr(args, 'message', None) is not None
-        or getattr(args, 'stdin', False)
+        or (not edit_id and (getattr(args, 'message', None) is not None or getattr(args, 'stdin', False)))
     )
     resolve_id = getattr(args, 'resolve', None)
     resolve_all = bool(getattr(args, 'resolve_all', False))
@@ -4007,24 +4022,39 @@ def handle_feedback(ctx, session, args, clipboard_runner=None):
 
     actions = sum([
         1 if add_requested else 0,
+        1 if edit_id else 0,
         1 if (resolve_id or resolve_all) else 0,
         1 if (delete_id or clear_all) else 0,
     ])
     if actions > 1:
-        raise StagedError('Choose only one feedback action (--add, --resolve/--resolve-all, or --delete/--clear).')
+        raise StagedError('Choose only one feedback action (--add, --edit, --resolve/--resolve-all, or --delete/--clear).')
+
+    def comment_text_arg():
+        text = getattr(args, 'message', None)
+        if getattr(args, 'stdin', False):
+            if sys.stdin.isatty():
+                raise StagedError('--stdin requires piped or redirected input; use -m/--message for inline text.')
+            text = sys.stdin.read()
+        if not text or not text.strip():
+            raise StagedError('Provide a non-empty comment with -m/--message or --stdin.')
+        return text
+
+    if edit_id:
+        item = edit_feedback(session, edit_id, comment_text_arg())
+        if getattr(args, 'json', False):
+            print(json.dumps(item))
+        else:
+            print('Edited feedback {} on {} ({} {}): {}'.format(
+                item['id'], item['file'], item['side'], format_line_range(item['start_line'], item['end_line']),
+                item['comment']))
+        return item
 
     if add_requested:
         if not getattr(args, 'file', None):
             raise StagedError('--add requires -f/--file <file>.')
         if getattr(args, 'start_line', None) is None:
             raise StagedError('--add requires --start-line <line>.')
-        comment_text = getattr(args, 'message', None)
-        if getattr(args, 'stdin', False):
-            if sys.stdin.isatty():
-                raise StagedError('--stdin requires piped or redirected input; use -m/--message for inline text.')
-            comment_text = sys.stdin.read()
-        if not comment_text or not comment_text.strip():
-            raise StagedError('Provide a non-empty comment with -m/--message or --stdin.')
+        comment_text = comment_text_arg()
         target_file = args.file
         available = session.paths(fresh=True)
         if target_file not in available and available:
@@ -4453,6 +4483,7 @@ TUI_KEYS = [
         ('v  (Space)', 'Start or clear a multi-line selection'),
         ('w', 'Select a token or expression on the current line'),
         ('c  (Enter with a selection)', 'Comment on the selection (saved to feedback.json)'),
+        ('e', 'Edit the comment at the cursor (Ctrl-U clears the text)'),
         ('r', 'Resolve or reopen the comment at the cursor'),
         ('x', 'Delete the comment at the cursor (asks first)'),
         ('y', 'Copy open comments to the clipboard as an agent prompt'),
@@ -4475,6 +4506,8 @@ TUI_HINTS = {
               ('B', 'full width'), ('a', 'apply file'), ('Tab', 'diff'), ('q', 'quit')],
     'diff': [('?', 'all keys'), ('j/k', 'line'), ('n/p', 'hunk'), ('J/K', 'file'), ('v', 'select'),
              ('c', 'comment'), ('a', 'apply hunk'), ('z', 'fold'), ('Tab', 'files'), ('q', 'quit')],
+    'comment': [('?', 'all keys'), ('e', 'edit comment'), ('r', 'resolve/reopen'), ('x', 'delete comment'),
+                ('j/k', 'line'), ('c', 'comment'), ('Tab', 'files'), ('q', 'quit')],
     'help': [('j/k', 'scroll'), ('Ctrl-d/u', 'page'), ('g/G', 'top/bottom'), ('i', 'info'), ('?/Esc', 'close')],
     'info': [('j/k', 'scroll'), ('Ctrl-d/u', 'page'), ('i/Esc', 'close')],
 }
@@ -5059,7 +5092,7 @@ class TuiState:
         return result
 
     # Keys that work on diff lines; pressed while the diff is hidden, they bring it back first.
-    DIFF_ONLY_KEYS = frozenset(('n', 'p', 'v', ' ', 'w', 'c', 'r', 'x', 'u', 'z', 'W'))
+    DIFF_ONLY_KEYS = frozenset(('n', 'p', 'v', ' ', 'w', 'c', 'e', 'r', 'x', 'u', 'z', 'W'))
 
     def _dispatch_view_key(self, key):
         if self.panel is not None:
@@ -5382,6 +5415,21 @@ class TuiState:
         self.set_status('Marked {} as {}.'.format(target['id'], updated[0]['status'] if updated else target['status']))
         return 'toggle_resolve'
 
+    def _key_edit_comment(self, key):
+        target = self._comment_at_cursor()
+        if target is None:
+            self.set_status('No comment on this line to edit.')
+            return 'noop'
+        self.input_mode = True
+        # The input line is single-line, so line breaks from a --stdin comment become spaces.
+        self.input_buffer = ' '.join(target['comment'].split('\n'))
+        self.pending_comment_meta = {'edit_id': target['id'], 'original': target['comment'], 'file': target['file'],
+                                     'side': target['side'], 'start_line': target['start_line'],
+                                     'end_line': target['end_line'], 'snippet_focus': target.get('snippet_focus')}
+        self.set_status('Editing {} on {} {} {}'.format(target['id'], target['file'], target['side'],
+                                                       format_line_range(target['start_line'], target['end_line'])))
+        return 'start_edit'
+
     def _key_delete_comment(self, key):
         target = self._comment_at_cursor()
         if target is None:
@@ -5444,21 +5492,27 @@ class TuiState:
         return action
 
     def _handle_input_key(self, key):
+        editing = (self.pending_comment_meta or {}).get('edit_id')
         if key == 'ESC':
             self.input_mode = False
             self.input_buffer = ''
             self.pending_comment_meta = None
-            self.set_status('Comment cancelled.')
+            self.set_status('Edit cancelled; {} unchanged.'.format(editing) if editing else 'Comment cancelled.')
             return 'cancel_comment'
         if key == 'BACKSPACE':
             self.input_buffer = self.input_buffer[:-1]
             return 'input_backspace'
+        if key == 'CTRL_U':
+            self.input_buffer = ''
+            return 'input_clear'
         if key == 'ENTER':
             text = self.input_buffer.strip()
             meta = self.pending_comment_meta
             self.input_mode = False
             self.input_buffer = ''
             self.pending_comment_meta = None
+            if editing:
+                return self._save_edit(meta, text)
             if not text or not meta:
                 self.set_status('Empty comment discarded.')
                 return 'discard_comment'
@@ -5478,6 +5532,19 @@ class TuiState:
             return 'input_char'
         return 'noop'
 
+    def _save_edit(self, meta, text):
+        if not text:
+            self.set_status('Empty text: {} unchanged (x deletes it).'.format(meta['edit_id']))
+            return 'discard_edit'
+        if text == ' '.join(meta['original'].split('\n')).strip():
+            self.set_status('No change to {}.'.format(meta['edit_id']))
+            return 'discard_edit'
+        edited = edit_feedback(self.session, meta['edit_id'], text)
+        self.refresh_inventory()
+        self.set_status('Edited {} on {} ({}).'.format(
+            edited['id'], edited['file'], format_line_range(edited['start_line'], edited['end_line'])))
+        return 'save_edit'
+
     KEY_HANDLERS = {
         '?': _key_help, 'h': _key_help, 'i': _key_info, 'q': _key_quit, 'ESC': _key_quit,
         'b': _key_sidebar, 'B': _key_files_only, 't': _key_tree, 'TAB': _key_tab, 'BTAB': _key_tab, 'u': _key_mode, 'z': _key_fold, 'W': _key_wrap,
@@ -5488,7 +5555,7 @@ class TuiState:
         'J': _key_file, 'K': _key_file, 'n': _key_hunk, 'p': _key_hunk,
         '[': _key_side, 'LEFT': _key_side, ']': _key_side, 'RIGHT': _key_side,
         'v': _key_visual, ' ': _key_visual, 'w': _key_token, 'c': _key_comment,
-        'r': _key_resolve, 'x': _key_delete_comment, 'a': _key_apply, 'A': _key_apply, 'y': _key_yank,
+        'e': _key_edit_comment, 'r': _key_resolve, 'x': _key_delete_comment, 'a': _key_apply, 'A': _key_apply, 'y': _key_yank,
     }
 
     # ----- rendering ----------------------------------------------------
@@ -5792,10 +5859,10 @@ class TuiState:
     def _input_lines(self, width, max_lines):
         """The comment being typed, wrapped onto as many footer lines as it needs (the latest `max_lines`)."""
         meta = self.pending_comment_meta or {}
-        label = ' Comment ({} {}{}): '.format(
-            meta.get('side', 'staged'), format_line_range(meta.get('start_line', 1), meta.get('end_line', 1)),
+        label = ' {} ({} {}{}): '.format(
+            'Edit ' + meta['edit_id'] if meta.get('edit_id') else 'Comment', meta.get('side', 'staged'), format_line_range(meta.get('start_line', 1), meta.get('end_line', 1)),
             ' [{}]'.format(meta['snippet_focus']) if meta.get('snippet_focus') else '')
-        hint = '   Enter save · Esc cancel'
+        hint = '   Enter save · Ctrl-U clear · Esc cancel'
         text = label + self.input_buffer + '█'
         wrap_w = max(10, width - 1)  # the bottom-right cell cannot be drawn
         starts = wrap_points(text, wrap_w, len(text))
@@ -5824,7 +5891,10 @@ class TuiState:
             return [StyledLine(' ' + self.pending_confirm['question'] + ' [y/N]', 'prompt').fit(width, 'footer')]
         usable = width - 1  # the bottom-right cell cannot be drawn
         status_style = 'error' if self.status_is_error else 'footer'
-        hints = TUI_HINTS[self.panel or self.focus_pane]
+        hint_set = self.panel or self.focus_pane
+        if hint_set == 'diff' and self.visual_anchor_row is None and self._comment_at_cursor() is not None:
+            hint_set = 'comment'
+        hints = TUI_HINTS[hint_set]
         pieces = []
         for combo, desc in hints:
             piece = StyledLine(combo, 'footer_key').add(' ' + desc, 'footer_dim')
@@ -6920,12 +6990,13 @@ MANUAL = {
     'tui': {'name': 'review, comment on and apply changes in a terminal diff viewer',
             'more': ['Side-by-side by default. Press ? inside for keys. Applies ask first, honour branch '
                      'protection and record a backup for staged undo.']},
-    'feedback': {'name': 'view, add, resolve and export review comments for the agent',
-                 'more': ['With no action, prints every comment. The actions --add, --resolve, --resolve-all, '
+    'feedback': {'name': 'view, add, edit, resolve and export review comments for the agent',
+                 'more': ['With no action, prints every comment. The actions --add, --edit, --resolve, --resolve-all, '
                           '--delete and --clear are exclusive. --prompt formats open comments as instructions '
                           'for an agent; --copy puts that on the clipboard.'],
                  'examples': [('staged feedback --add -f src/app.py --start-line 10 --end-line 14 -m "Explain this branch."', None),
                               ('staged feedback --prompt', 'open comments as an agent prompt'),
+                              ('staged feedback --edit fb-3 -m "Explain the early return too."', None),
                               ('staged feedback --resolve fb-3', None)],
                  'see_also': ['tui']},
     'apply': {'name': 'apply proposed files, renames and deletions to the workspace',
@@ -6984,7 +7055,7 @@ def _arg_name(action):
              'session_message': 'text', 'compare_session': 'id', 'offset': 'n', 'length': 'n',
              'delete_count': 'n', 'expect_sha256': 'hash', 'default_session': 'id', 'source': 'id',
              'protected_branch': 'pattern', 'session_root': 'dir', 'target_dir': 'dir', 'cmd': 'template',
-             'diff_cmd': 'template', 'open_cmd': 'template', 'resolve': 'id', 'delete': 'id', 'to': 'path',
+             'diff_cmd': 'template', 'open_cmd': 'template', 'resolve': 'id', 'delete': 'id', 'edit': 'id', 'to': 'path',
              'file': 'file', 'target': 'path', 'cwd': 'dir', 'clean_session': 'id', 'id': 'id', 'name': 'name'}
     name = action.metavar or plain.get(action.dest, action.dest)
     if isinstance(name, tuple):
@@ -7373,7 +7444,7 @@ def make_parser():
         'init': 'Create an isolated session and record its workspace and branch.',
         'diff': 'Review proposed files, apply with -a, clean with -c, or apply then clean with -ac.',
         'tui': 'Launch the built-in 2-pane interactive terminal diff viewer and inline comment reviewer.',
-        'feedback': 'View, add, resolve, or export inline code-selection review comments for agents.',
+        'feedback': 'View, add, edit, resolve, or export inline code-selection review comments for agents.',
         'apply': 'Apply proposed files, renames and deletions to the workspace with conflict protection.',
         'undo': 'Atomically roll back the most recent apply operation in this session.',
         'fmt': 'Format staged files in-place using virtual workspace buffers (zero workspace replication).',
@@ -7627,7 +7698,8 @@ def completion_values(action, command):
         return [str(choice) for choice in action.choices]
     dynamic = {'remove_ref': lambda session: session.intent()['refs'],
                'resolve': lambda session: [c['id'] for c in load_feedback(session)['comments'] if c['status'] == 'open'],
-               'delete': lambda session: [c['id'] for c in load_feedback(session)['comments']]}
+               'delete': lambda session: [c['id'] for c in load_feedback(session)['comments']],
+               'edit': lambda session: [c['id'] for c in load_feedback(session)['comments']]}
     if action.dest in dynamic and (action.dest == 'remove_ref' or command.prog == 'staged feedback'):
         try:
             return dynamic[action.dest](Context(argparse.Namespace()).active(notify=False))
