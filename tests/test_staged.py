@@ -3765,6 +3765,104 @@ class TestTuiAndFeedback(unittest.TestCase):
         staged.apply_hunk(self.session, 'tail.txt', 0)
         self.assertEqual((self.workspace / 'tail.txt').read_bytes(), b'a\nb\n')
 
+    def _undo(self, **kwargs):
+        ctx = SafetyDummyContext(self.workspace, self.staging_root, **kwargs)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            staged.undo_apply(ctx, self.session)
+        return out.getvalue()
+
+    def test_pull_hunk_takes_the_workspace_side_and_undo_restores_the_proposal(self):
+        ws_before = (self.workspace / 'src/example.py').read_bytes()
+        staged_file = self.session.staging / 'src/example.py'
+        proposal = staged_file.read_bytes()
+        # Pull only the second hunk ("new" -> "old"); the first stays proposed.
+        self.assertTrue(staged.pull_hunk(self.session, 'src/example.py', hunk_index=1))
+        pulled = staged_file.read_text(encoding='utf-8')
+        self.assertIn('value = x + 42', pulled)
+        self.assertIn('return "old"', pulled)
+        self.assertEqual((self.workspace / 'src/example.py').read_bytes(), ws_before)  # workspace untouched
+        hunks = staged.compute_diff_hunks(staged.read_side_lines(self.session, 'src/example.py', 'workspace'),
+                                          staged.read_side_lines(self.session, 'src/example.py', 'staged'))
+        self.assertEqual(len(hunks), 1)
+        # The backup targets staging, so undo restores the proposal and leaves the workspace alone.
+        meta = json.loads((staged.list_backups(self.session)[-1] / 'backup.json').read_text(encoding='utf-8'))
+        self.assertEqual(meta['target'], 'staging')
+        self.assertIn('[UNDONE]', self._undo())
+        self.assertEqual(staged_file.read_bytes(), proposal)
+        self.assertEqual((self.workspace / 'src/example.py').read_bytes(), ws_before)
+        self.assertFalse(staged.list_backups(self.session))
+
+    def test_pull_hunk_preserves_crlf_and_missing_final_newline(self):
+        (self.workspace / 'crlf.txt').write_bytes(b'a\r\nb\r\nc')
+        (self.session.staging / 'crlf.txt').write_bytes(b'a\r\nB\r\nc')
+        staged.pull_hunk(self.session, 'crlf.txt', 0)
+        self.assertEqual((self.session.staging / 'crlf.txt').read_bytes(), b'a\r\nb\r\nc')
+        (self.workspace / 'tail.txt').write_bytes(b'a\nb\n')
+        (self.session.staging / 'tail.txt').write_bytes(b'a')
+        staged.pull_hunk(self.session, 'tail.txt', 0)
+        self.assertEqual((self.session.staging / 'tail.txt').read_bytes(), b'a\nb\n')
+
+    def test_pull_file_copies_the_workspace_and_refuses_new_files_and_deletions(self):
+        staged_file = self.session.staging / 'src/example.py'
+        proposal = staged_file.read_bytes()
+        self.assertTrue(staged.pull_file(self.session, 'src/example.py'))
+        self.assertEqual(staged_file.read_bytes(), (self.workspace / 'src/example.py').read_bytes())
+        self.assertEqual(self.session.status('src/example.py'), 'APPLIED')
+        self.assertFalse(staged.pull_file(self.session, 'src/example.py'))  # already equal: no extra backup
+        self.assertEqual(len(staged.list_backups(self.session)), 1)
+        # A pulled file edited again in staging is drift that undo asks about.
+        staged_file.write_text('edited after pull\n', encoding='utf-8')
+        old_stdin = sys.stdin
+        try:
+            sys.stdin = io.StringIO('n\n')
+            with self.assertRaisesRegex(staged.StagedError, 'Staged file'):
+                staged.undo_apply(SafetyDummyContext(self.workspace, self.staging_root, yes=False), self.session)
+        finally:
+            sys.stdin = old_stdin
+        self._undo(force=True)
+        self.assertEqual(staged_file.read_bytes(), proposal)
+
+        with self.assertRaisesRegex(staged.StagedError, 'no workspace file'):
+            staged.pull_file(self.session, 'src/new_mod.py')
+        self.session.deletions = ['src/gone.py']
+        (self.workspace / 'src/gone.py').write_text('x\n', encoding='utf-8')
+        with self.assertRaisesRegex(staged.StagedError, 'proposed deletion'):
+            staged.pull_hunk(self.session, 'src/gone.py', 0)
+
+    def test_pull_reads_the_original_of_a_rename(self):
+        (self.workspace / 'old_name.txt').write_text('one\ntwo\n', encoding='utf-8')
+        (self.session.staging / 'new_name.txt').write_text('one\nTWO\n', encoding='utf-8')
+        self.session.manifest['new_name.txt'] = 'old_name.txt'
+        staged.pull_hunk(self.session, 'new_name.txt', 0)
+        self.assertEqual((self.session.staging / 'new_name.txt').read_text(encoding='utf-8'), 'one\ntwo\n')
+        self.assertFalse((self.workspace / 'new_name.txt').exists())
+
+    def test_tui_pull_keys_ask_first_and_report(self):
+        state = staged.TuiState(self.session, target_file='src/example.py')
+        state.render_frame(width=120, height=30)
+        staged_file = self.session.staging / 'src/example.py'
+        proposal = staged_file.read_bytes()
+        state.focus_pane = 'diff'
+        state.handle_key('n')
+        self.assertEqual(state.handle_key('o'), 'confirm_pull_hunk')
+        self.assertIn('Pull hunk', state.status_message)
+        self.assertEqual(state.handle_key('n'), 'cancel_confirm')
+        self.assertEqual(staged_file.read_bytes(), proposal)
+        state.handle_key('o')
+        self.assertEqual(state.handle_key('y'), 'pull_hunk')
+        self.assertIn('Pulled hunk', state.status_message)
+        self.assertNotEqual(staged_file.read_bytes(), proposal)
+        self.assertEqual(state.handle_key('O'), 'confirm_pull_file')
+        self.assertEqual(state.handle_key('y'), 'pull_file')
+        self.assertEqual(staged_file.read_bytes(), (self.workspace / 'src/example.py').read_bytes())
+        # A new file has nothing to pull: the footer says so without asking.
+        state = staged.TuiState(self.session, target_file='src/new_mod.py')
+        state.render_frame(width=120, height=30)
+        self.assertEqual(state.handle_key('O'), 'error')
+        self.assertIsNone(state.pending_confirm)
+        self.assertIn('no workspace file', state.status_message)
+
 
 class SafetyDummyContext:
     def __init__(self, workspace, staging_root, **kwargs):

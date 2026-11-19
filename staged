@@ -1548,12 +1548,23 @@ def create_backup_dir(session):
     return backup_id, bdir
 
 
-def begin_backup(session, rels):
-    """Snapshot workspace paths before an apply so `staged undo` can restore them."""
+BACKUP_TARGETS = ('workspace', 'staging')
+
+
+def backup_target_root(session, target):
+    """The tree a backup restores: the workspace (applies) or the session's staging (TUI pulls)."""
+    if target not in BACKUP_TARGETS:
+        raise StagedError('Invalid backup target: {!r}'.format(target))
+    return session.staging if target == 'staging' else session.workspace
+
+
+def begin_backup(session, rels, target='workspace'):
+    """Snapshot paths before an apply (or a pull into staging) so `staged undo` can restore them."""
+    root = backup_target_root(session, target)
     backup_id, bdir = create_backup_dir(session)
     entries = []
     for p_rel in dict.fromkeys(rels):
-        ws_path = safe_path(session.workspace, p_rel)
+        ws_path = safe_path(root, p_rel)
         existed = ws_path.is_file()
         if existed:
             copy_atomic(ws_path, safe_path(bdir / 'files', p_rel))
@@ -1567,11 +1578,15 @@ def begin_backup(session, rels):
     return backup_id, bdir, entries
 
 
-def finish_backup(session, backup_id, bdir, entries):
+def finish_backup(session, backup_id, bdir, entries, target='workspace'):
+    root = backup_target_root(session, target)
     for entry in entries:
-        ws_path = safe_path(session.workspace, entry['path'])
+        ws_path = safe_path(root, entry['path'])
         entry['sha256_after'] = file_sha256(ws_path) if ws_path.is_file() else None
-    save_json(bdir / 'backup.json', {'id': backup_id, 'created_at': time.time(), 'entries': entries})
+    meta = {'id': backup_id, 'created_at': time.time(), 'entries': entries}
+    if target != 'workspace':
+        meta['target'] = target  # older backups have no target and restore the workspace
+    save_json(bdir / 'backup.json', meta)
 
 
 def apply_changes(ctx, session, target):
@@ -1636,7 +1651,8 @@ def list_backups(session):
 
 
 def undo_apply(ctx, session):
-    """Restore workspace files from the latest backup in <session>/.backups/."""
+    """Restore files from the latest backup in <session>/.backups/: workspace files after an apply,
+    or staged files after a TUI pull from the workspace."""
     backups = list_backups(session)
     if not backups:
         raise StagedError('No applied changes to undo in session {}.'.format(session.id))
@@ -1645,6 +1661,9 @@ def undo_apply(ctx, session):
     entries = meta.get('entries', [])
     if not isinstance(entries, list):
         raise StagedError('Invalid backup metadata in {}'.format(latest_dir))
+    target = meta.get('target', 'workspace')
+    root = backup_target_root(session, target)
+    to_staging = target == 'staging'
 
     force = bool(getattr(ctx.args, 'force', False))
     yes = bool(getattr(ctx.args, 'yes', False))
@@ -1653,14 +1672,15 @@ def undo_apply(ctx, session):
     drifted = []
     for entry in entries:
         rel = entry['path']
-        ws_path = safe_path(session.workspace, rel)
+        ws_path = safe_path(root, rel)
         current_sha = file_sha256(ws_path) if ws_path.is_file() else None
         if current_sha != entry.get('sha256_after'):
             drifted.append(rel)
 
     if drifted and not force:
         confirm(
-            "Workspace file(s) modified after apply ({}). Overwrite and undo anyway?".format(', '.join(drifted)),
+            "{} file(s) modified after {} ({}). Overwrite and undo anyway?".format(
+                'Staged' if to_staging else 'Workspace', 'pull' if to_staging else 'apply', ', '.join(drifted)),
             yes
         )
 
@@ -1668,7 +1688,7 @@ def undo_apply(ctx, session):
     restored_paths = []
     for entry in entries:
         rel = entry['path']
-        ws_path = safe_path(session.workspace, rel)
+        ws_path = safe_path(root, rel)
         if entry.get('existed'):
             src = safe_path(backup_files_root, rel)
             if not src.is_file():
@@ -1676,10 +1696,9 @@ def undo_apply(ctx, session):
             copy_atomic(src, ws_path)
             if entry.get('mode') is not None:
                 os.chmod(ws_path, entry['mode'])
-            record_base_snapshot(session, rel, reset=True)
-        else:
-            if ws_path.is_file():
-                ws_path.unlink()
+        elif ws_path.is_file():
+            ws_path.unlink()
+        if not to_staging:  # a pull leaves the workspace, and so the merge baseline, alone
             record_base_snapshot(session, rel, reset=True)
         restored_paths.append(rel)
 
@@ -1695,6 +1714,7 @@ def undo_apply(ctx, session):
             'operation': 'undo',
             'session': session.id,
             'backup_id': meta.get('id', latest_dir.name),
+            'target': target,
             'restored': restored_paths,
         }))
     else:
@@ -4445,6 +4465,62 @@ def apply_file_from_tui(session, rel_path, ctx=None):
     return status or session.status(rel_path)
 
 
+def pull_sources(session, rel_path):
+    """The staged file and the workspace file it is compared with, for a pull into staging."""
+    staged_file = safe_path(session.staging, rel_path)
+    if rel_path in session.deletions:
+        raise StagedError('{} is a proposed deletion; clean it to keep the workspace file.'.format(rel_path))
+    if not staged_file.is_file():
+        raise StagedError('Missing staged file: {}'.format(rel_path))
+    source = session.original(rel_path)
+    if not source.is_file():
+        raise StagedError('{} has no workspace file to pull from; clean the proposal to drop it.'.format(rel_path))
+    return staged_file, source
+
+
+def pull_hunk(session, rel_path, hunk_index=0):
+    """Replace one diff hunk of a staged file with the workspace side, recording a backup for `staged undo`.
+
+    The inverse of apply_hunk: the workspace is never touched."""
+    staged_file, source = pull_sources(session, rel_path)
+    try:
+        orig_raw = source.read_bytes().decode('utf-8')
+        staged_raw = staged_file.read_bytes().decode('utf-8')
+    except UnicodeDecodeError:
+        raise StagedError('Hunk pull needs UTF-8 text; pull the whole file instead: ' + rel_path) from None
+    hunks = compute_diff_hunks(orig_raw.splitlines(), staged_raw.splitlines())
+    if not hunks:
+        return False
+    if hunk_index < 0 or hunk_index >= len(hunks):
+        raise StagedError('Hunk index {} out of range (0..{}).'.format(hunk_index, len(hunks) - 1))
+    hunk = hunks[hunk_index]
+    orig_keep = orig_raw.splitlines(keepends=True)
+    staged_keep = staged_raw.splitlines(keepends=True)
+    content = _join_line_pieces(staged_keep[:hunk['staged_start']]
+                                + orig_keep[hunk['orig_start']:hunk['orig_end']]
+                                + staged_keep[hunk['staged_end']:])
+    backup_id, bdir, entries = begin_backup(session, [rel_path], target='staging')
+    write_bytes_atomic(staged_file, content.encode('utf-8'), mode=file_mode(staged_file))
+    finish_backup(session, backup_id, bdir, entries, target='staging')
+    session.refresh_index()
+    return True
+
+
+def pull_file(session, rel_path):
+    """Replace a staged file with its workspace copy, recording a backup for `staged undo`.
+
+    The inverse of applying the file. For a rename, the original workspace file is copied to the new path,
+    so the rename itself stays proposed."""
+    staged_file, source = pull_sources(session, rel_path)
+    if equal_files(source, staged_file):
+        return False
+    backup_id, bdir, entries = begin_backup(session, [rel_path], target='staging')
+    copy_atomic(source, staged_file)
+    finish_backup(session, backup_id, bdir, entries, target='staging')
+    session.refresh_index()
+    return True
+
+
 def branch_drift_note(session):
     """Describe a change from the session's original branch, for apply prompts."""
     branch = get_git_branch(session.workspace)
@@ -4488,10 +4564,12 @@ TUI_KEYS = [
         ('x', 'Delete the comment at the cursor (asks first)'),
         ('y', 'Copy open comments to the clipboard as an agent prompt'),
     ]),
-    ('APPLY TO WORKSPACE', [
+    ('APPLY TO WORKSPACE / PULL INTO SESSION', [
         ('a', 'Apply the hunk at the cursor (the whole file from the file list); asks first'),
         ('A', 'Apply the whole current file; asks first'),
-        ('', 'Applies keep a backup: run staged undo to roll back the latest one'),
+        ('o', 'Pull the workspace side of the hunk at the cursor into the session (the whole file from the file list); asks first'),
+        ('O', 'Replace the whole current proposal with the workspace copy; asks first'),
+        ('', 'Applies and pulls keep a backup: run staged undo to roll back the latest one'),
     ]),
     ('GENERAL', [
         ('?', 'Show or hide this reference'),
@@ -4503,9 +4581,9 @@ TUI_KEYS = [
 # and `?` comes first so the full key reference is always one key away.
 TUI_HINTS = {
     'files': [('?', 'all keys'), ('j/k', 'move'), ('Enter', 'open/fold'), ('←/→', 'fold'), ('t', 'tree'),
-              ('B', 'full width'), ('a', 'apply file'), ('Tab', 'diff'), ('q', 'quit')],
+              ('B', 'full width'), ('a', 'apply file'), ('o', 'pull file'), ('Tab', 'diff'), ('q', 'quit')],
     'diff': [('?', 'all keys'), ('j/k', 'line'), ('n/p', 'hunk'), ('J/K', 'file'), ('v', 'select'),
-             ('c', 'comment'), ('a', 'apply hunk'), ('z', 'fold'), ('Tab', 'files'), ('q', 'quit')],
+             ('c', 'comment'), ('a', 'apply hunk'), ('o', 'pull hunk'), ('z', 'fold'), ('Tab', 'files'), ('q', 'quit')],
     'comment': [('?', 'all keys'), ('e', 'edit comment'), ('r', 'resolve/reopen'), ('x', 'delete comment'),
                 ('j/k', 'line'), ('c', 'comment'), ('Tab', 'files'), ('q', 'quit')],
     'help': [('j/k', 'scroll'), ('Ctrl-d/u', 'page'), ('g/G', 'top/bottom'), ('i', 'info'), ('?/Esc', 'close')],
@@ -5457,6 +5535,25 @@ class TuiState:
         return self._ask('apply_hunk', 'Apply hunk {}/{} of {} to the workspace?{}'.format(
             hunk_idx + 1, len(self.hunks), rel, drift), rel=rel, hunk=hunk_idx)
 
+    def _key_pull(self, key):
+        rel = self.current_file
+        if not rel:
+            return 'noop'
+        if self.focus_pane == 'files':
+            item = self._sidebar_item_at_cursor()
+            if item is not None and item['kind'] != 'file':
+                self.set_status('Move to a file to pull it.')
+                return 'noop'
+        pull_sources(self.session, rel)  # refuse deletions and new files before asking
+        if key == 'O' or self.focus_pane == 'files':
+            return self._ask('pull_file', 'Replace the proposal for {} with the workspace copy?'.format(rel), rel=rel)
+        hunk_idx = self.current_hunk_index()
+        if hunk_idx is None:
+            self.set_status('No hunk to pull in {}.'.format(rel))
+            return 'noop'
+        return self._ask('pull_hunk', 'Pull hunk {}/{} of {} from the workspace into the session?'.format(
+            hunk_idx + 1, len(self.hunks), rel), rel=rel, hunk=hunk_idx)
+
     def _key_yank(self, key):
         ok, tool_name = copy_to_clipboard(format_feedback_prompt(self.session, only_open=True),
                                           runner=self.clipboard_runner)
@@ -5489,6 +5586,16 @@ class TuiState:
             status = apply_file_from_tui(self.session, pending['rel'], ctx=self.ctx)
             self.refresh_inventory()
             self.set_status('{} {}. Undo with staged undo.'.format(status.capitalize(), pending['rel']))
+        elif action == 'pull_hunk':
+            pull_hunk(self.session, pending['rel'], pending['hunk'])
+            self.refresh_inventory()
+            self.set_status('Pulled hunk {} of {} into the session. Undo with staged undo.'.format(
+                pending['hunk'] + 1, pending['rel']))
+        elif action == 'pull_file':
+            changed = pull_file(self.session, pending['rel'])
+            self.refresh_inventory()
+            self.set_status('Pulled {} into the session. Undo with staged undo.'.format(pending['rel']) if changed
+                            else '{} already matches the workspace.'.format(pending['rel']))
         return action
 
     def _handle_input_key(self, key):
@@ -5555,7 +5662,8 @@ class TuiState:
         'J': _key_file, 'K': _key_file, 'n': _key_hunk, 'p': _key_hunk,
         '[': _key_side, 'LEFT': _key_side, ']': _key_side, 'RIGHT': _key_side,
         'v': _key_visual, ' ': _key_visual, 'w': _key_token, 'c': _key_comment,
-        'e': _key_edit_comment, 'r': _key_resolve, 'x': _key_delete_comment, 'a': _key_apply, 'A': _key_apply, 'y': _key_yank,
+        'e': _key_edit_comment, 'r': _key_resolve, 'x': _key_delete_comment, 'a': _key_apply, 'A': _key_apply,
+        'o': _key_pull, 'O': _key_pull, 'y': _key_yank,
     }
 
     # ----- rendering ----------------------------------------------------
@@ -6989,7 +7097,8 @@ MANUAL = {
              'see_also': ['tui', 'apply', 'clean']},
     'tui': {'name': 'review, comment on and apply changes in a terminal diff viewer',
             'more': ['Side-by-side by default. Press ? inside for keys. Applies ask first, honour branch '
-                     'protection and record a backup for staged undo.']},
+                     'protection and record a backup for staged undo. o / O pull the workspace side of a hunk '
+                     'or file into the session instead, also undoable.']},
     'feedback': {'name': 'view, add, edit, resolve and export review comments for the agent',
                  'more': ['With no action, prints every comment. The actions --add, --edit, --resolve, --resolve-all, '
                           '--delete and --clear are exclusive. --prompt formats open comments as instructions '
@@ -7007,7 +7116,10 @@ MANUAL = {
                        'workspace files are restored to --base; staged apply --all brings them back. '
                        'Add --keep to copy them into the session and leave the workspace as is.'],
               'see_also': ['undo', 'diff']},
-    'undo': {'name': 'restore the workspace from the most recent apply backup', 'see_also': ['apply']},
+    'undo': {'name': 'roll back the most recent apply, or TUI pull into the session',
+             'more': ['An apply backup restores workspace files; a pull backup (o / O in staged tui) restores '
+                      'staged files.'],
+             'see_also': ['apply', 'tui']},
     'fmt': {'name': 'format staged files in place without touching the workspace', 'see_also': ['check']},
     'check': {'name': 'lint, typecheck and verify imports of staged files', 'see_also': ['fmt', 'exec']},
     'exec': {'name': 'run a command against the staged proposal in a disposable sandbox',
@@ -7446,7 +7558,7 @@ def make_parser():
         'tui': 'Launch the built-in 2-pane interactive terminal diff viewer and inline comment reviewer.',
         'feedback': 'View, add, edit, resolve, or export inline code-selection review comments for agents.',
         'apply': 'Apply proposed files, renames and deletions to the workspace with conflict protection.',
-        'undo': 'Atomically roll back the most recent apply operation in this session.',
+        'undo': 'Atomically roll back the most recent apply, or TUI pull into staging, in this session.',
         'fmt': 'Format staged files in-place using virtual workspace buffers (zero workspace replication).',
         'check': 'Lint, typecheck, and verify imports on staged files using virtual workspace overlays.',
         'exec': 'Run a build or test command inside an ephemeral copy-on-write overlay sandbox.',

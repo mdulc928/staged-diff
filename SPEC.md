@@ -298,6 +298,13 @@ If a query matches multiple files at any step, resolution halts and outputs all 
 - Moved paths are reset to `HEAD` in the git index. Undo does not restore the previous index state.
 - Refuses unmerged paths, paths that already have a proposal or are rename sources in the session, `--force`, and `--no-merge`. Symlinks, submodules, type changes, and `.staged.json` are skipped. Requires confirmation or `--yes`.
 
+### TUI Pull (`o` / `O`)
+
+- The inverse of the TUI's hunk and file apply, for files the session already proposes. `o` replaces the hunk at the cursor in the staged file with the workspace side; `O` (or `o` in the file list) replaces the whole staged file with its workspace copy. Both ask first.
+- The workspace, the git index and base snapshots are never touched. The source is the file's original workspace path, so a rename stays proposed.
+- Each pull records a backup with `"target": "staging"` in `backup.json`; `staged undo` restores the staged file from it, guarding against staged edits made after the pull. Backups without a target restore the workspace, as before.
+- Refuses proposed deletions and new files (no workspace file to pull). Hunk pulls need UTF-8 text and keep each line's terminator. A file pull that would change nothing records no backup.
+
 ### Clean Guarantees
 
 - `clean` operations **never** modify or revert workspace files.
