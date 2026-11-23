@@ -35,12 +35,27 @@ DATA_DIR = Path(os.environ.get('XDG_DATA_HOME', Path(HOME) / '.local/share')) / 
 if os.name == 'nt':
     CONFIG_DIR = Path(os.environ.get('APPDATA', HOME)) / 'staged'
     DATA_DIR = Path(os.environ.get('LOCALAPPDATA', HOME)) / 'staged'
+
+
+def highlighting_dir():
+    """Where install-highlighting puts pygments when staged's Python is not a virtual environment."""
+    return DATA_DIR / '.vendor'
+
+
+def add_highlighting_path():
+    # Appended, so a pygments the interpreter already has takes precedence.
+    target = str(highlighting_dir())
+    if target not in sys.path and os.path.isdir(target):
+        sys.path.append(target)
+
+
+add_highlighting_path()
 GLOBAL_STATE_FILE = CONFIG_DIR / 'state.json'
 DEFAULT_PROTECTED_BRANCHES = []
 STATUS_COLORS = {'APPLIED': '32', 'MERGED': '1;32', 'UNDONE': '1;36', 'MODIFIED': '33', 'NEW FILE': '36',
                  'RENAMED': '35', 'RELOCATED': '35', 'DELETED': '31', 'MISSING': '1;31'}
 STATUS_ORDER = ('MISSING', 'NEW FILE', 'MODIFIED', 'RENAMED', 'RELOCATED', 'DELETED', 'APPLIED')
-COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'intent', 'init', 'diff', 'tui', 'feedback', 'apply', 'undo', 'fmt', 'check', 'exec', 'sandbox', 'link', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'uninstall']
+COMMANDS = ['read', 'write', 'create', 'copy', 'rename', 'delete', 'summarize', 'intent', 'init', 'diff', 'tui', 'feedback', 'apply', 'undo', 'fmt', 'check', 'exec', 'sandbox', 'link', 'clean', 'path', 'open', 'use', 'set', 'set-tool', 'migrate', 'install-skill', 'install-completion', 'install-launcher', 'install-highlighting', 'uninstall']
 
 
 def is_reserved_windows_name(name):
@@ -4785,11 +4800,7 @@ class TuiState:
 
     @staticmethod
     def _pygments_available():
-        try:
-            import pygments  # noqa: F401
-        except ImportError:
-            return False
-        return True
+        return pygments_available()
 
     # View choices remembered between runs (see load_tui_prefs): pref name -> attribute.
     VIEW_PREFS = {'tree': 'sidebar_tree', 'diff_mode': 'diff_mode', 'wrap': 'wrap_lines',
@@ -5279,7 +5290,7 @@ class TuiState:
     def _key_syntax(self, key):
         if not self.has_pygments:
             self.syntax_highlight = False
-            self.set_status("Syntax highlighting needs pygments: pip install pygments")
+            self.set_status('Syntax highlighting needs pygments: quit and run staged install-highlighting')
             return 'syntax_unavailable'
         self.syntax_highlight = not self.syntax_highlight
         self.set_status('Syntax highlighting {}.'.format('on' if self.syntax_highlight else 'off'))
@@ -6303,6 +6314,7 @@ def save_tui_prefs(prefs, previous, initial=None):
 
 def run_tui(ctx, session, target=None):
     """Entry point for `staged tui` and `staged diff --tui`."""
+    offer_highlighting_install()
     prefs = load_tui_prefs()
     state = TuiState(session, target_file=target, ctx=ctx, prefs=prefs)
     initial = state.view_prefs()
@@ -7058,7 +7070,8 @@ COMMAND_GROUPS = [
     ('Review', ('diff', 'tui')),
     ('Validation', ('fmt', 'check', 'exec', 'sandbox', 'link')),
     ('Apply and discard', ('apply', 'undo', 'clean')),
-    ('Setup', ('set', 'set-tool', 'install-skill', 'install-completion', 'install-launcher', 'uninstall')),
+    ('Setup', ('set', 'set-tool', 'install-skill', 'install-completion', 'install-launcher', 'install-highlighting',
+               'uninstall')),
 ]
 
 # One-line NAME summaries plus any longer description, examples and cross-references per command.
@@ -7173,6 +7186,10 @@ MANUAL = {
     'install-skill': {'name': 'install the /stage skill for an agent harness'},
     'install-completion': {'name': 'install shell completions for bash, zsh or PowerShell'},
     'install-launcher': {'name': 'install the standalone Windows command launcher'},
+    'install-highlighting': {'name': 'install pygments so staged tui can highlight syntax',
+                             'more': ['pygments goes into the Python staged runs on (STAGED_PYTHON when set). '
+                                      'A virtual environment gets it directly; any other Python gets it in a '
+                                      'folder only staged uses, so the system Python is not changed.']},
     'uninstall': {'name': 'remove installed integrations and, optionally, all sessions'},
 }
 
@@ -7434,12 +7451,13 @@ def command_lines(parser, width, paint=True):
     names = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
     choices = names[0].choices if names else {}
     lines = []
+    column = max(len(name) for _, members in COMMAND_GROUPS for name in members) + 1
     for title_text, members in COMMAND_GROUPS:
         lines.append('     ' + style(title_text, '1'))
         for name in members:
             summary = MANUAL.get(name, {}).get('name', choices[name].description if name in choices else '')
-            body = _wrap(summary, ' ' * 26, width)
-            lines.append('       ' + style(name, '1;36') + ' ' * (19 - len(name)) + body.lstrip())
+            body = _wrap(summary, ' ' * (7 + column), width)
+            lines.append('       ' + style(name, '1;36') + ' ' * (column - len(name)) + body.lstrip())
         lines.append('')
     return lines
 
@@ -7490,8 +7508,8 @@ COMMON_OPTION_COMMANDS = {
     'verbose': ('diff',),
 }
 NO_SESSION_COMMANDS = ('init', 'clean', 'set', 'set-tool', 'install-skill', 'install-completion',
-                       'install-launcher', 'uninstall')
-NO_ROOT_COMMANDS = ('set-tool', 'install-completion', 'install-launcher', 'uninstall', 'set')
+                       'install-launcher', 'install-highlighting', 'uninstall')
+NO_ROOT_COMMANDS = ('set-tool', 'install-completion', 'install-launcher', 'install-highlighting', 'uninstall', 'set')
 # Proposal-only commands accept --meta with -f so agents can use one syntax everywhere; it changes nothing.
 META_NOOP_COMMANDS = ('summarize', 'diff', 'apply', 'clean', 'migrate', 'tui', 'feedback', 'fmt', 'check')
 
@@ -7605,6 +7623,7 @@ def make_parser():
         'install-skill': 'Install /stage for an agent harness.',
         'install-completion': 'Install shell completions for bash, zsh, or powershell.',
         'install-launcher': 'Install the standalone Windows command launcher (PATH unchanged).',
+        'install-highlighting': 'Install pygments for syntax highlighting in staged tui.',
         'uninstall': 'Remove installed integrations and CLI; optionally delete all known sessions.',
     }
     for name in COMMANDS:
@@ -7908,6 +7927,82 @@ def completion_installed(shell):
 def setup_prompts_enabled():
     return (not os.environ.get('CI') and not os.environ.get('STAGED_NO_PROMPT')
             and all(stream.isatty() for stream in (sys.stdin, sys.stdout, sys.stderr)))
+
+
+def pygments_available():
+    try:
+        import pygments  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def in_virtualenv():
+    return sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+
+
+def highlighting_python():
+    """The interpreter staged runs on, named the way the user chose it."""
+    source = ' (STAGED_PYTHON)' if os.environ.get('STAGED_PYTHON') else ''
+    return sys.executable + source
+
+
+def highlighting_destination():
+    return 'its virtual environment' if in_virtualenv() else '{}, used only by staged'.format(highlighting_dir())
+
+
+def install_highlighting():
+    python = highlighting_python()
+    if pygments_available():
+        print('Syntax highlighting is already available: pygments imports in ' + python)
+        return
+    retry = ('Install pygments for that Python yourself, or set STAGED_PYTHON to a Python that has it, '
+             'then run staged install-highlighting.')
+    probe = subprocess.run([sys.executable, '-m', 'pip', '--version'], capture_output=True, text=True)
+    if probe.returncode != 0:
+        raise StagedError('pip is not available for {}. {}'.format(python, retry))
+    command = [sys.executable, '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check']
+    if not in_virtualenv():
+        # --target leaves the system Python alone and skips pip's externally-managed (PEP 668) refusal.
+        highlighting_dir().mkdir(parents=True, exist_ok=True)
+        command += ['--upgrade', '--target', str(highlighting_dir())]
+    print('Installing pygments for {} into {}...'.format(python, highlighting_destination()), flush=True)
+    result = subprocess.run(command + ['pygments'], capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = '\n'.join((result.stderr or result.stdout).strip().splitlines()[-5:])
+        raise StagedError('pip could not install pygments for {}:\n{}\n{}'.format(python, detail, retry))
+    import importlib
+    importlib.invalidate_caches()
+    add_highlighting_path()
+    if not pygments_available():
+        raise StagedError('pygments installed but does not import in {}. {}'.format(python, retry))
+    print('Syntax highlighting is on. Press H in staged tui to toggle it.')
+
+
+def offer_highlighting_install():
+    """Offer pygments once, on first interactive runs and before the TUI opens."""
+    if not setup_prompts_enabled():
+        return
+    state_path = CONFIG_DIR / 'highlighting-setup.json'
+    try:
+        if pygments_available() or load_json(state_path).get('answered'):
+            return
+        print('Turn on syntax highlighting in staged tui? Installs pygments for {} into {}. [y/N] '.format(
+            highlighting_python(), highlighting_destination()), end='', file=sys.stderr, flush=True)
+        answer = sys.stdin.readline()
+        if not answer:  # No answer is not a saved preference.
+            return
+        if answer.strip().lower() in ('y', 'yes'):
+            install_highlighting()
+            save_json(state_path, {'answered': 'installed'})
+        else:
+            print('You can turn it on later: staged install-highlighting', file=sys.stderr)
+            save_json(state_path, {'answered': 'declined'})
+    except (OSError, StagedError, ValueError) as exc:
+        # Optional onboarding must never prevent the requested command from running.
+        print('Highlighting setup skipped: {}'.format(exc), file=sys.stderr)
+        if not isinstance(exc, StagedError):
+            print('Run staged install-highlighting to retry.', file=sys.stderr)
 
 
 def offer_completion_install(shell=None):
@@ -8250,7 +8345,12 @@ def uninstall(ctx):
         for directory in sessions:
             rmtree_ignoring_races(directory)
             print('Deleted session: ' + str(directory))
-    for name in ('state.json', 'tui.json', 'completion-setup.json', 'launcher-setup.json', 'installations.json'):
+    vendor = highlighting_dir()
+    if vendor.is_dir() and not vendor.is_symlink():
+        shutil.rmtree(str(vendor))
+        print('Removed: ' + str(vendor))
+    for name in ('state.json', 'tui.json', 'completion-setup.json', 'launcher-setup.json',
+                 'highlighting-setup.json', 'installations.json'):
         path = CONFIG_DIR / name
         if path.is_file() or path.is_symlink():
             path.unlink()
@@ -8352,8 +8452,12 @@ def main(argv=None):
     if args.command == 'install-launcher':
         install_launcher()
         return
+    if args.command == 'install-highlighting':
+        install_highlighting()
+        return
     if not argv or (args.command == 'init' and not args.json):
         offer_completion_install(args.shell)
+        offer_highlighting_install()
     ctx = Context(args)
     if args.command == 'uninstall':
         uninstall(ctx)

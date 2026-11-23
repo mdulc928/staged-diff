@@ -86,6 +86,16 @@ staged install-completion --shell bash       # Linux / Git Bash
 staged install-completion --shell powershell # Windows (PowerShell)
 ```
 
+### Syntax Highlighting (Optional)
+
+`staged tui` highlights syntax when `pygments` is available (also offered on first run):
+
+```bash
+staged install-highlighting
+```
+
+It installs pygments for the Python staged runs on (`STAGED_PYTHON` when set). A virtual environment gets it directly; any other Python gets it in a folder only staged uses, so the system Python is not changed.
+
 ### Install Agent Skill
 
 Install the `/stage` skill into your AI agent harness (e.g. Cursor, Antigravity, Claude Code, Windsurf, Codex, Zed):

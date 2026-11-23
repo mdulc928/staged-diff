@@ -1009,9 +1009,10 @@ class CLI(unittest.TestCase):
         self.assertIn('\nCOMMANDS\n', result.stderr)
         for name in staged.COMMANDS:
             self.assertIn('       ' + name + ' ', result.stderr)
-        self.assertIn('install-completion install shell completions', result.stderr)
-        self.assertIn("staged: unknown command 'install'; did you mean install-skill, install-completion "
-                      'or install-launcher?', result.stderr)
+        self.assertIn('install-completion   install shell completions', result.stderr)
+        self.assertIn('install-highlighting install pygments', result.stderr)  # the column fits the longest name
+        self.assertIn("staged: unknown command 'install'; did you mean install-skill, install-completion, "
+                      'install-launcher or install-highlighting?', result.stderr)
         self.assertNotIn('choose from', result.stderr)
         self.assertIn("unknown command 'aply'; did you mean apply?", self.run_cli('aply', ok=False).stderr)
         # Command usage stays short; only the top-level usage carries the list.
@@ -2515,6 +2516,123 @@ class CompletionOnboarding(unittest.TestCase):
         self.assertTrue(any('read-only profile' in str(call) for call in self.streams[2].write.call_args_list))
 
 
+class HighlightingSetup(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='staged-highlight-test-')
+        self.addCleanup(temporary.cleanup)
+        base = Path(temporary.name)
+        self.config = base / 'config'
+        self.data = base / 'data'
+        self.vendor = self.data / '.vendor'
+        self.state = self.config / 'highlighting-setup.json'
+        self.available = [False]
+        for patcher in [patch.object(staged, 'CONFIG_DIR', self.config),
+                        patch.object(staged, 'DATA_DIR', self.data),
+                        patch.object(staged, 'in_virtualenv', return_value=False),
+                        patch.object(staged, 'pygments_available', side_effect=lambda: self.available[0]),
+                        patch.dict(os.environ, {'CI': '', 'STAGED_NO_PROMPT': '', 'STAGED_PYTHON': ''})]:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.streams = []
+        for name in ('stdin', 'stdout', 'stderr'):
+            patcher = patch.object(staged.sys, name)
+            stream = patcher.start()
+            stream.isatty.return_value = True
+            self.streams.append(stream)
+            self.addCleanup(patcher.stop)
+        self.streams[0].readline.return_value = 'n\n'
+        self.commands = []
+        self.pip_results = {}
+        patcher = patch.object(staged.subprocess, 'run', side_effect=self.fake_run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fake_run(self, command, **kwargs):
+        self.commands.append(command)
+        step = 'probe' if command[3:4] == ['--version'] else 'install'
+        code, err = self.pip_results.get(step, (0, ''))
+        if step == 'install' and code == 0:
+            self.available[0] = True
+        return subprocess.CompletedProcess(command, code, '', err)
+
+    def stderr_text(self):
+        return ''.join(str(call.args[0]) for call in self.streams[2].write.call_args_list if call.args)
+
+    def test_decline_is_remembered(self):
+        staged.offer_highlighting_install()
+        staged.offer_highlighting_install()
+        self.streams[0].readline.assert_called_once()
+        self.assertEqual(json.loads(self.state.read_text()), {'answered': 'declined'})
+        self.assertEqual(self.commands, [])
+        self.assertIn('staged install-highlighting', self.stderr_text())
+
+    def test_accept_installs_into_staged_folder_outside_a_virtualenv(self):
+        self.streams[0].readline.return_value = 'y\n'
+        staged.offer_highlighting_install()
+        self.assertIn(str(self.vendor), self.stderr_text())  # the question says where it goes
+        install = self.commands[-1]
+        self.assertEqual(install[:3], [sys.executable, '-m', 'pip'])
+        self.assertEqual(install[install.index('--target') + 1], str(self.vendor))
+        self.assertEqual(install[-1], 'pygments')
+        self.assertEqual(json.loads(self.state.read_text()), {'answered': 'installed'})
+        staged.offer_highlighting_install()
+        self.streams[0].readline.assert_called_once()
+
+    def test_virtualenv_from_staged_python_gets_pygments_directly(self):
+        self.streams[0].readline.return_value = 'y\n'
+        with patch.object(staged, 'in_virtualenv', return_value=True), \
+                patch.dict(os.environ, {'STAGED_PYTHON': '/venv/bin/python'}):
+            staged.offer_highlighting_install()
+        self.assertIn(sys.executable + ' (STAGED_PYTHON) into its virtual environment', self.stderr_text())
+        self.assertNotIn('--target', self.commands[-1])
+        self.assertFalse(self.vendor.exists())
+
+    def test_never_asks_when_pygments_imports_or_not_interactive(self):
+        self.available[0] = True
+        staged.offer_highlighting_install()
+        self.available[0] = False
+        for stream in self.streams:
+            stream.isatty.return_value = False
+            staged.offer_highlighting_install()
+            stream.isatty.return_value = True
+        for variable in ('CI', 'STAGED_NO_PROMPT'):
+            with patch.dict(os.environ, {variable: '1'}):
+                staged.offer_highlighting_install()
+        self.streams[0].readline.assert_not_called()
+        self.assertFalse(self.state.exists())
+
+    def test_missing_pip_or_failed_install_is_nonfatal_and_retried(self):
+        self.streams[0].readline.return_value = 'y\n'
+        self.pip_results['probe'] = (1, 'No module named pip')
+        staged.offer_highlighting_install()
+        self.assertIn('pip is not available for ' + sys.executable, self.stderr_text())
+        self.assertIn('STAGED_PYTHON', self.stderr_text())
+        self.assertFalse(self.state.exists())
+        self.pip_results = {'install': (1, 'ERROR: network unreachable')}
+        with self.assertRaises(staged.StagedError) as caught:
+            staged.install_highlighting()
+        self.assertIn('network unreachable', str(caught.exception))
+
+    def test_command_reports_existing_pygments(self):
+        self.available[0] = True
+        with patch('builtins.print') as printed:
+            staged.install_highlighting()
+        self.assertIn('already available', printed.call_args.args[0])
+        self.assertEqual(self.commands, [])
+
+    def test_vendor_folder_joins_the_import_path(self):
+        (self.vendor / 'staged_vendor_probe').mkdir(parents=True)
+        (self.vendor / 'staged_vendor_probe/__init__.py').write_text('VALUE = 1\n')
+        self.addCleanup(lambda: sys.path.remove(str(self.vendor)) if str(self.vendor) in sys.path else None)
+        self.addCleanup(sys.modules.pop, 'staged_vendor_probe', None)
+        staged.add_highlighting_path()
+        staged.add_highlighting_path()
+        self.assertEqual(sys.path.count(str(self.vendor)), 1)
+        self.assertEqual(sys.path[-1], str(self.vendor))
+        import staged_vendor_probe
+        self.assertEqual(staged_vendor_probe.VALUE, 1)
+
+
 class LauncherOnboarding(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='staged-launcher-test-')
@@ -2660,8 +2778,14 @@ class Uninstall(unittest.TestCase):
         rc.write_text('export KEEP=1\n')
         self.run_cli('install-completion', '--shell', 'bash')
         self.run_cli('use', '--session', 'session-a')
+        data = self.home / ('AppData/Local/staged' if os.name == 'nt' else '.local/share/staged')
+        (data / '.vendor/pygments').mkdir(parents=True)
+        (data / '.vendor/pygments/__init__.py').write_text('')
+        (self.config / 'highlighting-setup.json').write_text('{"answered": "installed"}')
         result = self.run_cli('uninstall', '--yes', '--keep-sessions')
         self.assertIn('Kept 1 sessions', result.stdout)
+        self.assertFalse((data / '.vendor').exists())
+        self.assertFalse((self.config / 'highlighting-setup.json').exists())
         self.assertTrue(proposal.exists())
         self.assertEqual(rc.read_text().strip(), 'export KEEP=1')
         self.assertFalse((custom / 'SKILL.md').exists())

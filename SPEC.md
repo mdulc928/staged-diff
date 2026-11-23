@@ -179,6 +179,7 @@ Global selection options (`-s`, `-t`, `--root`, `-v`, `-h`) are accepted before 
 | `install-completion`     | Install Shell Completion | Configure Bash, Zsh, or PowerShell tab-completion; no launcher installation |
 | `uninstall` | Uninstall | Confirm tool/integration removal; separately opt into deleting sessions across known roots and repositories. `--yes` alone keeps sessions in noninteractive runs. |
 | `install-launcher`       | Install Windows Launcher | Write `staged.cmd`; leave PATH unchanged                                    |
+| `install-highlighting`   | Install Highlighting     | Install pygments into staged's Python: directly in a virtual environment, otherwise with `pip --target` into `<data>/.vendor`, which the engine adds to `sys.path` |
 
 ---
 
@@ -365,6 +366,7 @@ The bundled `SKILL.md` requires agents to:
 - **Completions**: Public options follow the CLI parser. Bash, Zsh, and PowerShell support session/tool IDs and case-insensitive substring completion on `-f`. When `--meta` is present, `-f` and `--to` complete session metadata names instead of proposal paths, and `--workspace` / `--from-workspace` are not offered. In Zsh, the first Tab on an ambiguous file query lists matches while preserving the input; subsequent Tabs start menu selection and cycle through matches. Unique matches complete immediately.
 - **Completion Setup**: Interactive `staged` and `init` offer missing completion setup once per shell. Bash/Zsh update startup files; PowerShell prints a profile loader.
 - **Launcher Setup**: On Windows, explicit `--shell powershell` offers `staged.cmd` once when no launcher is available. Installation requires acceptance or `install-launcher`; PATH is unchanged.
+- **Highlighting Setup**: Interactive `staged`, `init` and the TUI offer pygments once when it does not import. The offer names the interpreter (marked `STAGED_PYTHON` when set) and where pygments will go. A missing pip or failed install prints how to retry and never stops the command. `uninstall` removes `<data>/.vendor`; pygments installed into a virtual environment stays.
 - **Setup Prompts**: Remember declines. Skip help, machine output, CI, redirected streams, and `STAGED_NO_PROMPT=1`.
 - **Subprocesses**: Argument vector execution. Windows batch scripts execute via `cmd.exe` with safe metacharacter quoting. WSL translates paths for Windows binaries via `wslpath`.
 - **Distribution**: Packaged as `@melchi/staged` with a Node binary launcher wrapping the Python engine. The engine runs standalone with Python 3.8+.
