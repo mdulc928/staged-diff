@@ -2058,6 +2058,23 @@ source "$1"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['session'], 'npm-session')
 
+    def test_npm_launcher_keeps_shell_binding_between_commands(self):
+        if not shutil.which('node'):
+            self.skipTest('Node is optional')
+        self.propose('bound')
+        self.propose('newest')
+        launcher = str(SCRIPT.parent / 'bin/staged.cjs')
+        env = {k: v for k, v in self.env.items() if k != 'STAGED_SHELL_ID'}
+        # Each call starts a new Node process; the binding must follow the shared parent instead.
+        result = subprocess.run(['node', launcher, 'use', '--session', 'bound'],
+                                env=env, cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = subprocess.run(['node', launcher, 'path', '-f', 'existing.txt'],
+                                env=env, cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.root / 'bound/staging/existing.txt'))
+        self.assertTrue((self.config / 'shell_sessions' / (str(os.getpid()) + '.json')).is_file())
+
     def test_npm_launcher_honors_staged_python(self):
         if not shutil.which('node'):
             self.skipTest('Node is optional')
@@ -3732,6 +3749,58 @@ class TestTuiAndFeedback(unittest.TestCase):
             self.assertEqual(staged.load_tui_prefs(), {})
             keys[:] = []
             self.assertFalse(staged.run_tui(None, self.session).sidebar_tree)
+
+    def test_tui_comment_input_moves_cursor(self):
+        (self.workspace / 'a.txt').write_text('one\n', encoding='utf-8')
+        (self.session.staging / 'a.txt').write_text('ONE\n', encoding='utf-8')
+        state = staged.TuiState(self.session, target_file='a.txt')
+        state.handle_key('c')
+        for ch in 'fix tis':
+            state.handle_key(ch)
+        state.handle_key('LEFT')
+        state.handle_key('LEFT')
+        state.handle_key('h')  # inserts before the cursor
+        self.assertEqual((state.input_buffer, state.input_cursor), ('fix this', 6))
+        frame = state.render_frame(width=80, height=24)
+        self.assertIn('fix this', frame[-1])
+        self.assertNotIn('█', frame[-1])  # the glyph only marks the end; mid-text the cell under the cursor is styled
+        self.assertIn((frame[-1].index('fix this') + 6, 1, 'input_cursor'), state.frame_styles[-1])
+        state.handle_key('BACKSPACE')
+        self.assertEqual((state.input_buffer, state.input_cursor), ('fix tis', 5))
+        state.handle_key('DELETE')
+        self.assertEqual((state.input_buffer, state.input_cursor), ('fix ts', 5))
+        for key in ('HOME', 'CTRL_A'):
+            state.handle_key(key)
+            self.assertEqual(state.input_cursor, 0)
+        state.handle_key('LEFT')
+        state.handle_key('BACKSPACE')  # nothing before the start
+        self.assertEqual((state.input_buffer, state.input_cursor), ('fix ts', 0))
+        state.handle_key(staged.TuiState.normalize_key('\x05'))
+        self.assertEqual(state.input_cursor, 6)
+        state.handle_key('RIGHT')
+        state.handle_key('DELETE')  # nothing after the end
+        self.assertEqual((state.input_buffer, state.input_cursor), ('fix ts', 6))
+        state.handle_key('HOME')
+        state.handle_key('END')
+        self.assertEqual(state.input_cursor, 6)
+        self.assertIn('fix ts█', state.render_frame(width=80, height=24)[-1])
+        state.handle_key('ENTER')
+        self.assertEqual(state.file_comments()[0]['comment'], 'fix ts')
+
+        # A cursor moved back in long text stays on screen
+        words = ' '.join('word{}'.format(i) for i in range(60))
+        state.handle_key('c')
+        for ch in words:
+            state.handle_key(ch)
+        footer = '\n'.join(state.render_frame(width=80, height=12)[-3:])  # room for 3 of about 7 lines
+        self.assertIn('word59█', footer)
+        self.assertNotIn('word0 ', footer)
+        state.handle_key('HOME')
+        footer = '\n'.join(state.render_frame(width=80, height=12)[-3:])
+        self.assertIn('word0 ', footer)
+        self.assertNotIn('word59', footer)
+        state.handle_key('ESC')
+        self.assertEqual(state.input_cursor, 0)
 
     def test_tui_wraps_long_comments_and_comment_input(self):
         (self.workspace / 'a.txt').write_text('one\n', encoding='utf-8')

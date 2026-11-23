@@ -551,7 +551,7 @@ The TUI remembers your view between runs: the tree or status-grouped file list (
 | `R` | Reload files, summaries, intent and comments from disk (for example after the agent revises) |
 | `v` (Space) | Start / clear a multi-line selection |
 | `w` | Select a token or expression on the line (`snippet_focus`) |
-| `c` | Comment on the selection; saved to `feedback.json`. Long comments wrap, both while typing and inline in the diff |
+| `c` | Comment on the selection; saved to `feedback.json`. Long comments wrap, both while typing and inline in the diff. While typing, `←`/`→` move the cursor, `Home`/`End` (or `Ctrl-A`/`Ctrl-E`) jump to the start or end, and `Backspace`/`Delete` remove the character before or under the cursor |
 | `e` | Edit the comment at the cursor: the input starts with its text, `Ctrl-U` clears it, `Enter` saves, `Esc` keeps the old text |
 | `r` | Resolve / reopen the comment at the cursor |
 | `x` | Delete the comment at the cursor (asks first) |

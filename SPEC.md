@@ -115,7 +115,7 @@ Additional discovery roots are configured via `session_roots`. Discovery is expl
 
 ### Shell Bindings
 
-- `staged use --session <id>` binds to the parent PID of the invoking shell process.
+- `staged use --session <id>` binds to the PID of the invoking shell. The npm launcher passes its own parent PID (the shell) as `STAGED_SHELL_ID`, since the Python engine's parent is the short-lived Node process.
 - The binding persists until explicitly changed or cleared via `staged use --clear`.
 - Setting `STAGED_SHELL_ID` shares bindings across fresh subprocesses spawned by agent runners.
 - Prefix matching resolves exact matches first, then unique prefixes. Ambiguous prefixes list candidate matches and fail safely.

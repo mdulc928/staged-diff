@@ -11,7 +11,9 @@ const candidates = override
 for (const [python, ...prefix] of candidates) {
   const probe = spawnSync(python, [...prefix, '-c', 'import sys; sys.exit(sys.version_info < (3, 8))'], { stdio: 'ignore' });
   if (probe.error || probe.status !== 0) continue;
-  const result = spawnSync(python, [...prefix, join(__dirname, '..', 'staged'), ...process.argv.slice(2)], { stdio: 'inherit' });
+  // Python's parent is this short-lived Node process, so pass the shell's PID for staged use bindings.
+  const env = { ...process.env, STAGED_SHELL_ID: process.env.STAGED_SHELL_ID || String(process.ppid) };
+  const result = spawnSync(python, [...prefix, join(__dirname, '..', 'staged'), ...process.argv.slice(2)], { stdio: 'inherit', env });
   if (result.error) {
     console.error(`Could not start staged: ${result.error.message}`);
     process.exit(1);

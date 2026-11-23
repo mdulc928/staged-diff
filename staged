@@ -4559,7 +4559,7 @@ TUI_KEYS = [
         ('v  (Space)', 'Start or clear a multi-line selection'),
         ('w', 'Select a token or expression on the current line'),
         ('c  (Enter with a selection)', 'Comment on the selection (saved to feedback.json)'),
-        ('e', 'Edit the comment at the cursor (Ctrl-U clears the text)'),
+        ('e', 'Edit the comment at the cursor (←/→, Home/End move in the text; Ctrl-U clears it)'),
         ('r', 'Resolve or reopen the comment at the cursor'),
         ('x', 'Delete the comment at the cursor (asks first)'),
         ('y', 'Copy open comments to the clipboard as an agent prompt'),
@@ -4762,6 +4762,7 @@ class TuiState:
 
         self.input_mode = False
         self.input_buffer = ''
+        self.input_cursor = 0  # insertion point in input_buffer
         self.pending_comment_meta = None
         self.pending_confirm = None
 
@@ -5129,7 +5130,7 @@ class TuiState:
                 for attr, name in (('KEY_DOWN', 'DOWN'), ('KEY_UP', 'UP'), ('KEY_LEFT', 'LEFT'), ('KEY_RIGHT', 'RIGHT'),
                                    ('KEY_NPAGE', 'PGDN'), ('KEY_PPAGE', 'PGUP'), ('KEY_HOME', 'HOME'),
                                    ('KEY_END', 'END'), ('KEY_BACKSPACE', 'BACKSPACE'), ('KEY_ENTER', 'ENTER'),
-                                   ('KEY_RESIZE', 'RESIZE'), ('KEY_BTAB', 'BTAB')):
+                                   ('KEY_RESIZE', 'RESIZE'), ('KEY_BTAB', 'BTAB'), ('KEY_DC', 'DELETE')):
                     if hasattr(curses, attr):
                         named[getattr(curses, attr)] = name
             if key in named:
@@ -5143,7 +5144,7 @@ class TuiState:
             else:
                 return 'UNKNOWN'
         return {'\t': 'TAB', '\x1b[Z': 'BTAB', '\n': 'ENTER', '\r': 'ENTER', '\x1b': 'ESC', 'Escape': 'ESC', '\x7f': 'BACKSPACE',
-                '\x08': 'BACKSPACE', '\x04': 'CTRL_D', '\x15': 'CTRL_U'}.get(key, key)
+                '\x08': 'BACKSPACE', '\x04': 'CTRL_D', '\x15': 'CTRL_U', '\x01': 'CTRL_A', '\x05': 'CTRL_E'}.get(key, key)
 
     def set_status(self, message, error=False):
         self.status_message = message
@@ -5459,6 +5460,7 @@ class TuiState:
         side, s_line, e_line, sel_text, focus = self.current_selection_range()
         self.input_mode = True
         self.input_buffer = ''
+        self.input_cursor = 0
         self.pending_comment_meta = {'file': self.current_file, 'side': side, 'start_line': s_line,
                                      'end_line': e_line, 'selected_text': sel_text, 'snippet_focus': focus}
         self.set_status('Comment on {} {} {}'.format(self.current_file, side, format_line_range(s_line, e_line)))
@@ -5501,6 +5503,7 @@ class TuiState:
         self.input_mode = True
         # The input line is single-line, so line breaks from a --stdin comment become spaces.
         self.input_buffer = ' '.join(target['comment'].split('\n'))
+        self.input_cursor = len(self.input_buffer)
         self.pending_comment_meta = {'edit_id': target['id'], 'original': target['comment'], 'file': target['file'],
                                      'side': target['side'], 'start_line': target['start_line'],
                                      'end_line': target['end_line'], 'snippet_focus': target.get('snippet_focus')}
@@ -5603,20 +5606,34 @@ class TuiState:
         if key == 'ESC':
             self.input_mode = False
             self.input_buffer = ''
+            self.input_cursor = 0
             self.pending_comment_meta = None
             self.set_status('Edit cancelled; {} unchanged.'.format(editing) if editing else 'Comment cancelled.')
             return 'cancel_comment'
+        buffer, cursor = self.input_buffer, min(self.input_cursor, len(self.input_buffer))
         if key == 'BACKSPACE':
-            self.input_buffer = self.input_buffer[:-1]
+            if cursor:
+                self.input_buffer = buffer[:cursor - 1] + buffer[cursor:]
+                self.input_cursor = cursor - 1
             return 'input_backspace'
+        if key == 'DELETE':
+            self.input_buffer = buffer[:cursor] + buffer[cursor + 1:]
+            return 'input_delete'
+        moves = {'LEFT': cursor - 1, 'RIGHT': cursor + 1, 'HOME': 0, 'CTRL_A': 0,
+                 'END': len(buffer), 'CTRL_E': len(buffer)}
+        if key in moves:
+            self.input_cursor = max(0, min(len(buffer), moves[key]))
+            return 'input_move'
         if key == 'CTRL_U':
             self.input_buffer = ''
+            self.input_cursor = 0
             return 'input_clear'
         if key == 'ENTER':
             text = self.input_buffer.strip()
             meta = self.pending_comment_meta
             self.input_mode = False
             self.input_buffer = ''
+            self.input_cursor = 0
             self.pending_comment_meta = None
             if editing:
                 return self._save_edit(meta, text)
@@ -5635,7 +5652,8 @@ class TuiState:
                 created['id'], created['file'], format_line_range(created['start_line'], created['end_line'])))
             return 'save_comment'
         if isinstance(key, str) and len(key) == 1 and key.isprintable():
-            self.input_buffer += key
+            self.input_buffer = buffer[:cursor] + key + buffer[cursor:]
+            self.input_cursor = cursor + 1
             return 'input_char'
         return 'noop'
 
@@ -5970,11 +5988,15 @@ class TuiState:
         label = ' {} ({} {}{}): '.format(
             'Edit ' + meta['edit_id'] if meta.get('edit_id') else 'Comment', meta.get('side', 'staged'), format_line_range(meta.get('start_line', 1), meta.get('end_line', 1)),
             ' [{}]'.format(meta['snippet_focus']) if meta.get('snippet_focus') else '')
-        hint = '   Enter save · Ctrl-U clear · Esc cancel'
-        text = label + self.input_buffer + '█'
+        hint = '   ←→ move · Enter save · Ctrl-U clear · Esc cancel'
+        cursor = min(self.input_cursor, len(self.input_buffer))
+        # At the end a block glyph marks where typing goes; inside the text the character under it is inverted.
+        text = label + self.input_buffer + ('█' if cursor == len(self.input_buffer) else '')
+        cursor_at = len(label) + cursor
         wrap_w = max(10, width - 1)  # the bottom-right cell cannot be drawn
         starts = wrap_points(text, wrap_w, len(text))
         lines = []
+        cursor_line = len(starts) - 1
         for index, start in enumerate(starts):
             stop = starts[index + 1] if index + 1 < len(starts) else len(text)
             line = StyledLine()
@@ -5982,10 +6004,17 @@ class TuiState:
             if start < label_end:
                 line.add(text[start:label_end], 'prompt')
             line.add(text[max(start, len(label)):stop], 'input')
+            if start <= cursor_at < stop:
+                cursor_line = index
+                if cursor < len(self.input_buffer):
+                    line.mark(cursor_at - start, 1, 'input_cursor')
             lines.append(line)
         if len(lines[-1].text) + len(hint) <= wrap_w:
             lines[-1].add(hint, 'footer_dim')
-        return [line.fit(width, 'footer') for line in lines[-max(1, max_lines):]]
+        # Show the latest lines, or the lines up to the cursor when it has moved further back.
+        shown = max(1, max_lines)
+        end = min(len(lines), max(cursor_line + 1, shown))
+        return [line.fit(width, 'footer') for line in lines[max(0, end - shown):end]]
 
     def _footer_lines(self, width, max_lines=1):
         """The status message on the bottom line and the key hints, wrapped rather than cut off.
@@ -6084,6 +6113,8 @@ class TuiApp:
         'footer': (None, None, ('A_REVERSE',)), 'footer_dim': (None, None, ('A_REVERSE', 'A_DIM')),
         'footer_key': (None, None, ('A_REVERSE', 'A_BOLD')),
         'prompt': ('YELLOW', None, ('A_REVERSE', 'A_BOLD')), 'input': (None, None, ('A_REVERSE',)),
+        # Attributes replace the line's A_REVERSE, so this cell stands out as the cursor.
+        'input_cursor': (None, None, ('A_BOLD',)),
         'error': ('RED', None, ('A_REVERSE', 'A_BOLD')),
         'title': (None, None, ('A_BOLD',)), 'title_focus': ('CYAN', None, ('A_BOLD',)),
         'col': (None, None, ('A_DIM',)), 'col_active': ('CYAN', None, ('A_BOLD',)),
