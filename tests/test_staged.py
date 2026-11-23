@@ -3338,6 +3338,22 @@ class TestTuiAndFeedback(unittest.TestCase):
         state.tinted_changes = False  # 8-colour terminals mark changes by text colour
         self.assertEqual(syntax_spans(), [])
 
+    def test_comments_on_changed_lines_use_the_lighter_comment_style(self):
+        (self.workspace / 'c.py').write_text('# kept\nx = 1\n', encoding='utf-8')
+        (self.session.staging / 'c.py').write_text('# kept\nx = 2\n# added\n', encoding='utf-8')
+        comment = lambda text, filename: [(0, len(text), 'comment')] if text.startswith('#') else []
+        with patch.object(staged, '_cached_syntax_spans', side_effect=comment):
+            state = staged.TuiState(self.session, target_file='c.py')
+            state.syntax_highlight = True
+            frame = state.render_frame(width=120, height=20)
+        styles = {}
+        for line, spans in zip(frame, state.frame_styles):
+            for word in ('# kept', '# added'):
+                if word in line:
+                    styles[word] = {span[2] for span in spans if span[2].startswith('syn_')}
+        self.assertEqual(styles, {'# kept': {'syn_comment'}, '# added': {'syn_comment_changed'}})
+        self.assertEqual(staged.TuiApp.STYLE_COLORS_256['syn_comment_changed'], (250, None, ('A_ITALIC',)))
+
     def test_curses_styles_layer_text_colour_over_background(self):
         app = staged.TuiApp(None)
         app.specs = {'add': (None, 22, 0), 'syn_string': (179, None, 0), 'add_em': (None, 28, 0),

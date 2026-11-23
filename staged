@@ -5703,6 +5703,10 @@ class TuiState:
         syntax = []
         if self.syntax_highlight and text and (base_style is None or self.tinted_changes):
             syntax = [(start, end, 'syn_' + kind) for start, end, kind in _cached_syntax_spans(text, self.current_file)]
+            if base_style:
+                # The dim comment gray nearly vanishes on the add/del tints, so changed lines use a lighter one.
+                syntax = [(start, end, 'syn_comment_changed' if style == 'syn_comment' else style)
+                          for start, end, style in syntax]
         emphasis = [(start, end, base_style + '_em') for start, end in change_spans] if base_style else []
         limit = len(text) if self.wrap_lines else min(len(text), width)
         starts = wrap_points(text, width, limit)
@@ -6139,6 +6143,7 @@ class TuiApp:
         'comment': ('YELLOW', None, ('A_BOLD',)), 'summary': ('CYAN', None, ()),
         'intent': ('MAGENTA', None, ()), 'ref': ('BLUE', None, ('A_UNDERLINE',)),
         'syn_keyword': ('MAGENTA', None, ()), 'syn_string': ('YELLOW', None, ()), 'syn_comment': (None, None, ('A_DIM',)),
+        'syn_comment_changed': (None, None, ('A_DIM',)),
         'syn_number': ('CYAN', None, ()), 'syn_name': (None, None, ()),
         'status_MODIFIED': ('YELLOW', None, ('A_BOLD',)), 'status_NEW_FILE': ('CYAN', None, ('A_BOLD',)),
         'status_RENAMED': ('MAGENTA', None, ('A_BOLD',)), 'status_RELOCATED': ('MAGENTA', None, ('A_BOLD',)),
@@ -6160,6 +6165,8 @@ class TuiApp:
         'summary': (110, None, ()), 'intent': (176, None, ()), 'ref': (75, None, ('A_UNDERLINE',)),
         'dim': (243, None, ()), 'key': (221, None, ('A_BOLD',)),
         'syn_keyword': (176, None, ()), 'syn_string': (179, None, ()), 'syn_comment': (243, None, ()),
+        # 243 is about 1.8:1 on the add tint; 250 reaches about 4:1 there, and italics keep it reading as a comment.
+        'syn_comment_changed': (250, None, ('A_ITALIC',)),
         'syn_number': (110, None, ()), 'syn_name': (None, None, ()),
     }
 
