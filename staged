@@ -120,7 +120,7 @@ def write_text_file(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix='.staged-', dir=str(path.parent))
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as stream:
             stream.write(content)
         os.replace(name, path)
     finally:
@@ -3096,6 +3096,40 @@ def clone_file(source, target):
     shutil.copy2(source, target)
 
 
+def readlink_normalized(link):
+    target = os.readlink(str(link))
+    if os.name == 'nt':
+        if target.startswith('\\\\?\\UNC\\'):
+            return '\\\\' + target[8:]
+        if target.startswith('\\\\?\\'):
+            return target[4:]
+    return target
+
+
+def _clone_tree_walk(source, target):
+    os.makedirs(target, exist_ok=True)
+    with os.scandir(source) as it:
+        entries = list(it)
+    for entry in entries:
+        src_path = entry.path
+        dst_path = os.path.join(target, entry.name)
+        is_symlink = entry.is_symlink()
+        if is_symlink and os.name == 'nt':
+            lstat = entry.stat(follow_symlinks=False)
+            if getattr(lstat, 'st_reparse_tag', 0) == getattr(stat, 'IO_REPARSE_TAG_MOUNT_POINT', -1):
+                is_symlink = False
+        if is_symlink:
+            os.symlink(readlink_normalized(src_path), dst_path, target_is_directory=os.path.isdir(src_path))
+        elif entry.is_dir():
+            _clone_tree_walk(src_path, dst_path)
+        else:
+            clone_file(src_path, dst_path)
+    try:
+        shutil.copystat(source, target)
+    except OSError:
+        pass
+
+
 def clone_tree(source, target):
     """Clone a directory without sharing storage: one clonefile() call on APFS, otherwise a
     per-file copy that still uses reflinks where the filesystem supports them."""
@@ -3103,7 +3137,7 @@ def clone_tree(source, target):
         return
     if os.path.lexists(str(target)):
         shutil.rmtree(str(target), ignore_errors=True)
-    shutil.copytree(str(source), str(target), symlinks=True, copy_function=clone_file)
+    _clone_tree_walk(str(source), str(target))
 
 
 def delete_detached(path):
@@ -3111,9 +3145,13 @@ def delete_detached(path):
     path = str(path)
     if not hasattr(os, 'fork'):
         try:
-            subprocess.Popen([sys.executable, '-c', 'import shutil, sys; shutil.rmtree(sys.argv[1], ignore_errors=True)', path],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+            proc = subprocess.Popen(
+                [sys.executable, '-c', 'import shutil, sys; shutil.rmtree(sys.argv[1], ignore_errors=True)', path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                cwd=tempfile.gettempdir(), close_fds=True,
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+            proc._child_created = False
         except OSError:
             remove_sandbox(path)
         return
@@ -3171,12 +3209,17 @@ def rmtree_ignoring_races(path):
 
 
 def sandbox_link_target(link, workspace, sandbox_dir):
-    target = os.readlink(str(link))
+    target = readlink_normalized(link)
     if os.path.isabs(target):
         try:
-            return str(sandbox_dir / Path(target).relative_to(workspace))
+            rel = Path(target).relative_to(workspace)
         except ValueError:
-            pass
+            try:
+                rel = Path(os.path.realpath(target)).relative_to(Path(os.path.realpath(str(workspace))))
+            except ValueError:
+                rel = None
+        if rel is not None:
+            return str(sandbox_dir / rel)
     return target
 
 
@@ -3212,7 +3255,7 @@ def materialize_sandbox(session, sandbox_dir=None):
 
             if ws_subdir.is_symlink():
                 sb_subdir.parent.mkdir(parents=True, exist_ok=True)
-                os.symlink(sandbox_link_target(ws_subdir, workspace, sandbox_dir), str(sb_subdir))
+                os.symlink(sandbox_link_target(ws_subdir, workspace, sandbox_dir), str(sb_subdir), target_is_directory=True)
                 continue
 
             if d in HEAVY_CLONE_DIRS and dir_rel_posix not in touched_dir_prefixes:
@@ -3231,7 +3274,7 @@ def materialize_sandbox(session, sandbox_dir=None):
             sb_file = sandbox_dir / file_rel_posix
             sb_file.parent.mkdir(parents=True, exist_ok=True)
             if ws_file.is_symlink():
-                os.symlink(sandbox_link_target(ws_file, workspace, sandbox_dir), str(sb_file))
+                os.symlink(sandbox_link_target(ws_file, workspace, sandbox_dir), str(sb_file), target_is_directory=ws_file.is_dir())
             else:
                 clone_file(ws_file, sb_file)
 
@@ -3515,13 +3558,13 @@ def anchor_escaping_links(clone, origin):
             link = os.path.join(directory, name)
             if not os.path.islink(link):
                 continue
-            target = os.readlink(link)
+            target = readlink_normalized(link)
             if os.path.isabs(target):
                 continue
             resolved = os.path.normpath(os.path.join(source_dir, target))
             if resolved != origin_root and not resolved.startswith(origin_root + os.sep):
                 os.unlink(link)
-                os.symlink(resolved, link)
+                os.symlink(resolved, link, target_is_directory=os.path.isdir(resolved))
 
 
 def write_sandbox_file(session, rel, data):
