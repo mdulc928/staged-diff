@@ -6,6 +6,7 @@ import json
 import marshal
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -109,9 +110,8 @@ class _Support:
 class CLI(unittest.TestCase):
     def setUp(self):
         support = _Support.ensure()
-        self.tmp = tempfile.TemporaryDirectory(prefix='staged-test-')
-        self.addCleanup(self.tmp.cleanup)
-        self.base = Path(self.tmp.name).resolve()
+        self.base = Path(tempfile.mkdtemp(prefix='staged-test-')).resolve()
+        self.addCleanup(shutil.rmtree, str(self.base), True)
         self.home = self.base / 'home'
         self.repo = self.base / 'repo'
         self.root = self.base / 'proposals'
@@ -1087,7 +1087,7 @@ class CLI(unittest.TestCase):
 
     def test_rename_removes_source_even_when_destination_matches(self):
         self.propose(rel='renamed.txt')
-        (self.repo / 'renamed.txt').write_text('proposed\n')
+        (self.repo / 'renamed.txt').write_bytes(b'proposed\n')
         self.manifest({'renamed.txt': 'existing.txt'})
         self.assertIn('RENAMED', self.run_cli().stdout)
         self.run_cli('apply', '--all')
@@ -1312,7 +1312,7 @@ class CLI(unittest.TestCase):
         recorder = self.base / 'record_open.py'
         log = self.base / 'open_args.json'
         recorder.write_text('import json,sys\nfrom pathlib import Path\nPath(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))\n')
-        command = '{} {} {}'.format(sys.executable, recorder, log)
+        command = '{} {} {}'.format(shlex.quote(sys.executable), shlex.quote(str(recorder)), shlex.quote(str(log)))
         self.run_cli('set-tool', 'rec', '--name', 'Rec', '--diff-cmd', command + ' {orig} {staged}',
                      '--open-cmd', command + ' {staged}')
         for args, expected in ((['-w', '-f', 'exist'], self.repo / 'existing.txt'),
@@ -2145,13 +2145,13 @@ source "$1"
         self.assertEqual(data_after['comments'], [])
 
     def test_cli_3way_merge_conflict_protection_and_undo(self):
-        (self.repo / 'shared.py').write_text('line1\nline2\nline3\nline4\nline5\n')
+        (self.repo / 'shared.py').write_bytes(b'line1\nline2\nline3\nline4\nline5\n')
         self.init('session-a')
         self.file_api('copy', '--workspace', '-f', 'shared.py')
         self.file_api('write', '-f', 'shared.py', '--text', 'line1\nline2\nline3\nline4\nline5_agent\n')
 
         # User edits line 1 in workspace concurrently
-        (self.repo / 'shared.py').write_text('line1_user\nline2\nline3\nline4\nline5\n')
+        (self.repo / 'shared.py').write_bytes(b'line1_user\nline2\nline3\nline4\nline5\n')
 
         # Apply performs a clean 3-way merge automatically!
         out = self.run_cli('apply', '-f', 'shared.py').stdout
@@ -4122,11 +4122,15 @@ class TestSafetyAndUndo(unittest.TestCase):
     def test_base_snapshot_first_touch_only(self):
         ws_file = self.workspace / 'app.py'
         staged.write_text_file(ws_file, 'line1\nline2\n')
-        os.chmod(ws_file, 0o755)
+        if os.name != 'nt':
+            os.chmod(ws_file, 0o755)
 
         entry1 = staged.record_base_snapshot(self.session, 'app.py')
         self.assertTrue(entry1['existed'])
-        self.assertEqual(entry1['mode'], 0o755)
+        if os.name != 'nt':
+            self.assertEqual(entry1['mode'], 0o755)
+        else:
+            self.assertEqual(entry1['mode'], stat.S_IMODE(ws_file.stat().st_mode))
         orig_hash = entry1['sha256']
 
         # Modify workspace file later and call record_base_snapshot again without reset
@@ -4253,7 +4257,8 @@ class TestSafetyAndUndo(unittest.TestCase):
         # 1. Existing file to modify
         f_mod = self.workspace / 'mod.txt'
         staged.write_text_file(f_mod, 'before mod\n')
-        os.chmod(f_mod, 0o750)
+        if os.name != 'nt':
+            os.chmod(f_mod, 0o750)
 
         # 2. Existing file to delete
         f_del = self.workspace / 'del.txt'
@@ -4303,7 +4308,8 @@ class TestSafetyAndUndo(unittest.TestCase):
 
         self.assertIn('[UNDONE]', undo_buf.getvalue())
         self.assertEqual(f_mod.read_text(encoding='utf-8'), 'before mod\n')
-        self.assertEqual(stat.S_IMODE(f_mod.stat().st_mode), 0o750)
+        if os.name != 'nt':
+            self.assertEqual(stat.S_IMODE(f_mod.stat().st_mode), 0o750)
         self.assertFalse((self.workspace / 'created.txt').exists())
         self.assertTrue(f_del.is_file())
         self.assertEqual(f_del.read_text(encoding='utf-8'), 'before del\n')
@@ -4515,28 +4521,38 @@ class TestTier1VirtualBufferFormatting(unittest.TestCase):
         staged.write_text_file(self.workspace / '.prettierrc', '{"semi": true}\n')
         bin_dir = self.workspace / 'node_modules' / '.bin'
         bin_dir.mkdir(parents=True)
-        prettier_script = bin_dir / 'prettier'
-        prettier_script.write_text(
-            '#!{}\n'
+        mock_py = self.tmp / 'mock_prettier.py'
+        mock_py.write_text(
             'import json, os, sys\n'
-            'assert os.getcwd() == {!r}, f"wrong cwd: {{os.getcwd()}}"\n'
+            'assert os.path.normcase(os.path.abspath(os.getcwd())) == {!r}, f"wrong cwd: {{os.getcwd()}}"\n'
             'assert "--stdin-filepath" in sys.argv\n'
             'fp = sys.argv[sys.argv.index("--stdin-filepath") + 1]\n'
-            'assert fp == {!r}, f"wrong stdin-filepath: {{fp}}"\n'
-            'cfg = json.loads(open(".prettierrc").read())\n'
-            'data = sys.stdin.read()\n'
+            'assert os.path.normcase(os.path.abspath(fp)) == {!r}, f"wrong stdin-filepath: {{fp}}"\n'
+            'cfg = json.loads(open(".prettierrc", encoding="utf-8").read())\n'
+            'data = sys.stdin.buffer.read().decode("utf-8")\n'
             'if cfg.get("semi"):\n'
             '    lines = [l.rstrip() + (";" if l.strip() and not l.rstrip().endswith(";") else "") for l in data.splitlines()]\n'
-            '    sys.stdout.write("\\n".join(lines) + "\\n")\n'
+            '    out = ("\\n".join(lines) + "\\n").encode("utf-8")\n'
             'else:\n'
-            '    sys.stdout.write(data)\n'.format(
-                sys.executable,
-                str(self.workspace),
-                str(self.workspace / 'src/app.js'),
+            '    out = data.encode("utf-8")\n'
+            'sys.stdout.buffer.write(out)\n'.format(
+                os.path.normcase(os.path.abspath(str(self.workspace))),
+                os.path.normcase(os.path.abspath(str(self.workspace / 'src/app.js'))),
             ),
             encoding='utf-8',
         )
-        prettier_script.chmod(0o755)
+        if os.name == 'nt':
+            prettier_script = bin_dir / 'prettier.cmd'
+            prettier_script.write_bytes(
+                '@echo off\r\n"{}" "{}" %*\r\n'.format(sys.executable, mock_py).encode('utf-8')
+            )
+        else:
+            prettier_script = bin_dir / 'prettier'
+            prettier_script.write_text(
+                '#!/bin/sh\nexec {} {} "$@"\n'.format(shlex.quote(sys.executable), shlex.quote(str(mock_py))),
+                encoding='utf-8',
+            )
+            prettier_script.chmod(0o755)
 
         staged_file = self.session.staging / 'src/app.js'
         staged.write_text_file(staged_file, 'const x = 1\nconst y = 2\n')
@@ -4788,7 +4804,11 @@ class TestTier3OverlaySandboxExec(unittest.TestCase):
         staged.write_text_file(package, 'ORIGINAL\n')
         staged.write_text_file(self.workspace / 'dist/out.js', 'ORIGINAL\n')
         (self.workspace / 'apps/web/node_modules').mkdir(parents=True)
-        os.symlink('../../../node_modules/pkg', str(self.workspace / 'apps/web/node_modules/pkg'))
+        os.symlink(
+            os.path.join('..', '..', '..', 'node_modules', 'pkg'),
+            str(self.workspace / 'apps/web/node_modules/pkg'),
+            target_is_directory=True,
+        )
         cmd = [
             sys.executable, '-c',
             'for p in ("node_modules/pkg/index.js", "dist/out.js", "apps/web/node_modules/pkg/index.js"):\n'
@@ -4967,17 +4987,19 @@ class TestSandboxEntries(unittest.TestCase):
             self.skipTest('symlinks unavailable')
         staged.write_text_file(self.workspace / 'packages/shared/index.ts', 'export {};\n')
         staged.write_text_file(self.workspace / 'node_modules/.pnpm/dep@1/node_modules/dep/index.js', 'ORIG\n')
-        os.symlink('.pnpm/dep@1/node_modules/dep', str(self.workspace / 'node_modules/dep'))
+        dep_target = os.path.join('.pnpm', 'dep@1', 'node_modules', 'dep')
+        shared_target = os.path.join('..', '..', 'packages', 'shared')
+        os.symlink(dep_target, str(self.workspace / 'node_modules/dep'), target_is_directory=True)
         (self.workspace / 'node_modules/@vs').mkdir()
-        os.symlink('../../packages/shared', str(self.workspace / 'node_modules/@vs/shared'))
+        os.symlink(shared_target, str(self.workspace / 'node_modules/@vs/shared'), target_is_directory=True)
         staged.write_text_file(self.session.staging / 'src/a.ts', 'export {};\n')
 
         self.assertEqual(sorted(staged.auto_sandbox(self.session, clone=True)), ['node_modules'])
         clone = self.session.staging / 'node_modules'
         self.assertFalse(clone.is_symlink())
         self.assertEqual(self.session.sandbox_entries()['node_modules']['kind'], 'copy')
-        self.assertEqual(os.readlink(str(clone / 'dep')), '.pnpm/dep@1/node_modules/dep')
-        self.assertEqual(os.readlink(str(clone / '@vs/shared')), str(self.workspace / 'packages/shared'))
+        self.assertEqual(staged.readlink_normalized(clone / 'dep'), dep_target)
+        self.assertEqual(staged.readlink_normalized(clone / '@vs/shared'), str(self.workspace / 'packages/shared'))
         self.assertTrue((clone / '@vs/shared/index.ts').is_file())
 
         staged.write_text_file(clone / 'dep/index.js', 'EDITED\n')
@@ -4993,6 +5015,13 @@ class TestSandboxEntries(unittest.TestCase):
         self.assertEqual(sorted(self.session.files(fresh=True)), ['src/a.ts'])
         self.assertTrue((self.workspace / 'node_modules/@vs/shared/index.ts').is_file())
         self.assertEqual((self.workspace / 'node_modules/dep/index.js').read_text(), 'ORIG\n')
+
+    def test_readlink_normalized_strips_windows_extended_prefix(self):
+        with patch.object(staged.os, 'name', 'nt'), \
+                patch.object(staged.os, 'readlink', side_effect=[r'\\?\C:\foo\bar', r'\\?\UNC\server\share\file', r'..\rel']):
+            self.assertEqual(staged.readlink_normalized('a'), r'C:\foo\bar')
+            self.assertEqual(staged.readlink_normalized('b'), r'\\server\share\file')
+            self.assertEqual(staged.readlink_normalized('c'), r'..\rel')
 
     def test_clean_session_removes_link_without_following_it(self):
         package = self.workspace / 'node_modules/pkg/index.js'
