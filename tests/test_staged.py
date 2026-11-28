@@ -2892,7 +2892,12 @@ class Uninstall(unittest.TestCase):
             staged.install_launcher()
         launcher = self.config / 'bin/staged.cmd'
         self.assertTrue(launcher.exists())
+        content = launcher.read_bytes()
         (self.config / 'installations.json').unlink()  # Legacy launcher without a receipt.
+        self.run_cli('uninstall', '-y', '--keep-sessions')
+        self.assertFalse(launcher.exists())
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        launcher.write_bytes(content.replace(b'\n', b'\r\n'))
         self.run_cli('uninstall', '-y', '--keep-sessions')
         self.assertFalse(launcher.exists())
 

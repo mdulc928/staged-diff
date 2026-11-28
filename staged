@@ -8293,7 +8293,12 @@ def uninstall(ctx):
     launcher = CONFIG_DIR / 'bin/staged.cmd'
     legacy_launcher = '@echo off\n"{}" "{}" %*\n'.format(
         sys.executable.replace('%', '%%'), str(REPO_ROOT / 'staged').replace('%', '%%'))
-    files.setdefault(str(launcher), hashlib.sha256(legacy_launcher.replace('\n', os.linesep).encode()).hexdigest())
+    launcher_digest = hashlib.sha256(legacy_launcher.encode('utf-8')).hexdigest()
+    if str(launcher) not in files and launcher.is_file():
+        actual = hashlib.sha256(launcher.read_bytes()).hexdigest()
+        if actual in (launcher_digest, hashlib.sha256(legacy_launcher.replace('\n', '\r\n').encode('utf-8')).hexdigest()):
+            launcher_digest = actual
+    files.setdefault(str(launcher), launcher_digest)
     removable = []
     for value, digest in files.items():
         path = Path(value)
